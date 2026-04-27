@@ -1,0 +1,65 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 2 * * *'   # every day at 2:00 AM UTC
+  workflow_dispatch:        # allow manual trigger
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/thClaws/thClaws.git
+          git fetch upstream main
+
+      - name: Check for differences
+        id: diff
+        run: |
+          COUNT=$(git rev-list HEAD..upstream/main --count)
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+
+      - name: Create sync branch
+        if: steps.diff.outputs.count != '0'
+        run: |
+          BRANCH="sync/upstream-$(date +%Y%m%d-%H%M%S)"
+          echo "BRANCH=$BRANCH" >> $GITHUB_ENV
+          git checkout -b $BRANCH upstream/main
+          git push origin $BRANCH
+
+      - name: Create Pull Request
+        if: steps.diff.outputs.count != '0'
+        id: create_pr
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ env.BRANCH }}
+          base: main
+          title: "chore: sync upstream thClaws/thClaws"
+          body: |
+            Automated daily sync from [thClaws/thClaws](https://github.com/thClaws/thClaws) main branch.
+            
+            Triggered by: scheduled workflow at 02:00 UTC
+          labels: sync, automated
+
+      - name: Auto-merge Pull Request
+        if: steps.diff.outputs.count != '0' && steps.create_pr.outputs.pull-request-number != ''
+        run: |
+          gh pr merge ${{ steps.create_pr.outputs.pull-request-number }} \
+            --merge \
+            --auto \
+            --delete-branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
