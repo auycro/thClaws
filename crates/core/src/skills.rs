@@ -146,11 +146,47 @@ pub async fn install_from_url(
     override_name: Option<&str>,
     project_scope: bool,
 ) -> Result<Vec<String>> {
+    // Org-policy gate (Phase 2): when policies.plugins.enabled, the
+    // URL must match allowed_hosts. Single guard covers both .zip and
+    // git dispatch paths below. Open-core builds without a policy fall
+    // through unchanged (AllowDecision::NoPolicy).
+    if let crate::policy::AllowDecision::Denied { reason } = crate::policy::check_url(url) {
+        return Err(Error::Tool(format!(
+            "skill install blocked by org policy: {reason}"
+        )));
+    }
     if is_zip_url(url) {
         install_from_zip(url, override_name, project_scope).await
     } else {
         install_from_git(url, override_name, project_scope)
     }
+}
+
+/// Reject skills carrying executable scripts when the active org policy
+/// has `policies.plugins.allow_external_scripts: false`. Returns
+/// `Ok(())` when no policy is active, when the policy permits scripts,
+/// or when the skill has no `scripts/` directory at all. Used at every
+/// install rename point so the rejection happens before the skill
+/// reaches its final location.
+fn enforce_scripts_policy(skill_dir: &std::path::Path) -> Result<()> {
+    if !crate::policy::external_scripts_disallowed() {
+        return Ok(());
+    }
+    let scripts = skill_dir.join("scripts");
+    if !scripts.exists() {
+        return Ok(());
+    }
+    let has_entries = std::fs::read_dir(&scripts)
+        .ok()
+        .and_then(|mut d| d.next())
+        .is_some();
+    if has_entries {
+        return Err(Error::Tool(format!(
+            "skill at {:?} ships a scripts/ directory; org policy disallows external scripts",
+            skill_dir.file_name().unwrap_or_default()
+        )));
+    }
+    Ok(())
 }
 
 fn is_zip_url(url: &str) -> bool {
@@ -222,6 +258,10 @@ pub async fn install_from_zip(
 
     // Single-skill case: root (or wrapper's content) has SKILL.md.
     if source.join("SKILL.md").exists() {
+        if let Err(e) = enforce_scripts_policy(&source) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
         if let Err(e) = std::fs::rename(&source, &final_dir) {
             let _ = std::fs::remove_dir_all(&staging);
             return Err(Error::Tool(format!(
@@ -259,6 +299,10 @@ pub async fn install_from_zip(
         let dest = target_root.join(&sub_name);
         if dest.exists() {
             conflicts.push(sub_name);
+            continue;
+        }
+        if let Err(e) = enforce_scripts_policy(&skill_dir) {
+            conflicts.push(format!("{sub_name} (policy: {e})"));
             continue;
         }
         match std::fs::rename(&skill_dir, &dest) {
@@ -461,6 +505,10 @@ pub fn install_from_git(
 
     // Single skill: clone root itself has SKILL.md.
     if clone_dir.join("SKILL.md").exists() {
+        if let Err(e) = enforce_scripts_policy(&clone_dir) {
+            let _ = std::fs::remove_dir_all(&clone_dir);
+            return Err(e);
+        }
         report.push(format!("installed skill '{derived}' (single)"));
         return Ok(report);
     }
@@ -488,6 +536,10 @@ pub fn install_from_git(
         let dest = target_root.join(&sub_name);
         if dest.exists() {
             conflicts.push(sub_name);
+            continue;
+        }
+        if let Err(e) = enforce_scripts_policy(&skill_dir) {
+            conflicts.push(format!("{sub_name} (policy: {e})"));
             continue;
         }
         match std::fs::rename(&skill_dir, &dest) {

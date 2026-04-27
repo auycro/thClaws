@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod agent_defs;
+pub mod branding;
 pub mod commands;
 pub mod compaction;
 pub mod config;
@@ -23,6 +24,7 @@ pub mod model_catalogue;
 pub mod oauth;
 pub mod permissions;
 pub mod plugins;
+pub mod policy;
 pub mod prompts;
 pub mod providers;
 pub mod repl;

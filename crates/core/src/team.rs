@@ -1422,9 +1422,7 @@ impl Tool for SpawnTeammateTool {
             let log_err = log_file
                 .try_clone()
                 .map_err(|e| Error::Tool(format!("clone log: {e}")))?;
-            std::process::Command::new("/bin/sh")
-                .arg("-c")
-                .arg(&agent_cmd)
+            crate::util::shell_command_sync(&agent_cmd)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::from(log_file))
                 .stderr(std::process::Stdio::from(log_err))

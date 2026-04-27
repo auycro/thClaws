@@ -154,6 +154,13 @@ pub enum ViewEvent {
     /// Emitted after `/kms new | use | off` so the sidebar reflects
     /// the new state without waiting for the next full session_update.
     KmsUpdate(String),
+    /// Open the GUI's interactive model picker — pre-built JSON payload
+    /// shaped like `{type: "model_picker_open", provider, current,
+    /// models: [{id, context, max_output}, ...]}`. Emitted by the
+    /// `/model` slash command when invoked without arguments (#25).
+    /// The CLI renderer ignores this — a CLI TUI picker is a future
+    /// follow-up.
+    ModelPickerOpen(String),
     /// The session's on-disk JSONL has crossed the fork threshold.
     /// Frontend renders a dismissible banner with a "Fork into new
     /// session with summary" action. Fired once per session.
@@ -1454,6 +1461,13 @@ fn format_tool_label(name: &str, input: &serde_json::Value) -> String {
             .get("query")
             .and_then(|v| v.as_str())
             .map(|q| format!("({q})")),
+        "AskUserQuestion" => input.get("question").and_then(|v| v.as_str()).map(|q| {
+            let first: String = q.chars().take(60).collect();
+            format!(
+                "({first}{})",
+                if q.chars().count() > 60 { "..." } else { "" }
+            )
+        }),
         _ => None,
     }
     .unwrap_or_default();

@@ -22,8 +22,12 @@ use base64::Engine;
 use std::borrow::Cow;
 use std::sync::Arc;
 use tao::dpi::LogicalSize;
+#[cfg(target_os = "macos")]
+use tao::event::ElementState;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
+#[cfg(target_os = "macos")]
+use tao::keyboard::{Key, ModifiersState};
 use tao::window::WindowBuilder;
 use wry::http::Response;
 use wry::WebViewBuilder;
@@ -65,6 +69,7 @@ enum UserEvent {
     SessionListRefresh(String),
     FileTree(String),
     FileContent(String),
+    QuitRequested,
 }
 
 const MAX_RECENT_DIRS: usize = 3;
@@ -179,6 +184,7 @@ fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
         ViewEvent::SessionListRefresh(json) => vec![json.clone()],
         ViewEvent::ProviderUpdate(json) => vec![json.clone()],
         ViewEvent::KmsUpdate(json) => vec![json.clone()],
+        ViewEvent::ModelPickerOpen(json) => vec![json.clone()],
         ViewEvent::ContextWarning { file_size_mb } => vec![serde_json::json!({
             "type": "chat_context_warning",
             "file_size_mb": file_size_mb,
@@ -373,6 +379,7 @@ fn render_terminal_ansi(ev: &ViewEvent) -> Option<String> {
         ViewEvent::SessionListRefresh(_) => None,
         ViewEvent::ProviderUpdate(_) => None,
         ViewEvent::KmsUpdate(_) => None,
+        ViewEvent::ModelPickerOpen(_) => None,
         ViewEvent::ContextWarning { file_size_mb } => Some(format!(
             "\r\n\x1b[33m[ session {:.1} MB — /fork to continue in a new session with summary ]\x1b[0m\r\n",
             file_size_mb
@@ -709,13 +716,21 @@ fn kind_has_credentials(kind: Option<crate::providers::ProviderKind>) -> bool {
     match kind {
         // Agent SDK uses Claude Code's own auth — assume present.
         ProviderKind::AgentSdk => true,
-        // Ollama variants don't need auth; reachability is surfaced
-        // on first prompt, not here.
-        ProviderKind::Ollama | ProviderKind::OllamaAnthropic => true,
-        // Every other provider's readiness == "its env var is set".
+        // Ollama variants and LMStudio don't need auth; reachability is
+        // surfaced on first prompt, not here.
+        ProviderKind::Ollama | ProviderKind::OllamaAnthropic | ProviderKind::LMStudio => true,
+        // Every other provider's readiness == "its env var is set to a
+        // non-empty value". std::env::var returns Ok("") for an exported-
+        // but-empty var — which a stale shell rc / VS Code env injection
+        // can produce — so we explicitly require a non-blank value here.
+        // Otherwise the sidebar shows "ready" for a provider with no real
+        // credentials, and auto_fallback_model refuses to switch off it
+        // after the user pastes a key for a different provider (#13/#15
+        // root cause).
         other => other
             .api_key_env()
-            .map(|v| std::env::var(v).is_ok())
+            .and_then(|v| std::env::var(v).ok())
+            .map(|val| !val.trim().is_empty())
             .unwrap_or(false),
     }
 }
@@ -740,6 +755,7 @@ fn auto_fallback_model(cfg: &AppConfig) -> Option<String> {
         ProviderKind::OpenRouter,
         ProviderKind::Gemini,
         ProviderKind::DashScope,
+        ProviderKind::ZAi,
         // Local providers omitted here: if the user explicitly
         // configured one of them, they're already "ready" above; we
         // don't want to auto-fall-back to Ollama for a user who has
@@ -794,6 +810,26 @@ fn escape_for_js(s: &str) -> String {
         .replace('\r', "\\r")
 }
 
+#[cfg(target_os = "macos")]
+fn is_macos_close_shortcut(event: &tao::event::KeyEvent, modifiers: ModifiersState) -> bool {
+    if event.state != ElementState::Pressed || !modifiers.super_key() {
+        return false;
+    }
+    match event.key_without_modifiers() {
+        Key::Character(ch) => ch.eq_ignore_ascii_case("q") || ch.eq_ignore_ascii_case("w"),
+        _ => false,
+    }
+}
+
+fn request_gui_shutdown(shared: &SharedSessionHandle, control_flow: &mut ControlFlow) {
+    let _ = shared.input_tx.send(ShellInput::SaveAndQuit);
+    // Kill any spawned teammate processes.
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", "team-agent"])
+        .status();
+    *control_flow = ControlFlow::Exit;
+}
+
 pub fn run_gui() {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
@@ -807,7 +843,7 @@ pub fn run_gui() {
         })
         .unwrap_or((1200.0, 800.0));
     let window = WindowBuilder::new()
-        .with_title("thClaws")
+        .with_title(&crate::branding::current().name)
         .with_inner_size(LogicalSize::new(win_w, win_h))
         .build(&event_loop)
         .expect("window build");
@@ -830,6 +866,39 @@ pub fn run_gui() {
     spawn_event_translator(&shared, proxy.clone());
     let shared_for_ipc = shared.clone();
     let shared_for_events = shared.clone();
+    let (ask_tx, mut ask_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::tools::AskUserRequest>();
+    crate::tools::set_gui_ask_sender(Some(ask_tx));
+    let pending_asks = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+        u64,
+        tokio::sync::oneshot::Sender<String>,
+    >::new()));
+    let pending_asks_for_ipc = pending_asks.clone();
+
+    // Forwarder: AskUserQuestion tool calls -> frontend composer handoff.
+    let proxy_for_ask = proxy.clone();
+    let pending_asks_for_forwarder = pending_asks.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("ask-user forwarder runtime");
+        rt.block_on(async move {
+            while let Some(req) = ask_rx.recv().await {
+                let id = req.id;
+                let question = req.question.clone();
+                if let Ok(mut pending) = pending_asks_for_forwarder.lock() {
+                    pending.insert(id, req.response);
+                }
+                let payload = serde_json::json!({
+                    "type": "ask_user_question",
+                    "id": id,
+                    "question": question,
+                });
+                let _ = proxy_for_ask.send_event(UserEvent::Dispatch(payload.to_string()));
+            }
+        });
+    });
 
     // Forwarder: approval requests → frontend dispatches. Spawned on a
     // dedicated tokio runtime thread so we can `await` the mpsc without
@@ -967,6 +1036,112 @@ pub fn run_gui() {
             let ty = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
             match ty {
+                "app_close" => {
+                    let _ = proxy_for_ipc.send_event(UserEvent::QuitRequested);
+                }
+                "model_set" => {
+                    // Frontend-driven model change (e.g. ModelPickerModal
+                    // pick after api_key_set, or any future picker UI).
+                    // Routes through the same persistence path as the
+                    // /model slash command: project config write +
+                    // ReloadConfig nudge to the worker + provider_update
+                    // broadcast so the sidebar reflects the new state.
+                    let model = msg
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if !model.is_empty() {
+                        let mut project = crate::config::ProjectConfig::load()
+                            .unwrap_or_default();
+                        project.set_model(&model);
+                        let _ = project.save();
+                        let new_cfg = AppConfig::load().unwrap_or_default();
+                        let provider_name =
+                            new_cfg.detect_provider().unwrap_or("unknown");
+                        let ready = provider_has_credentials(&new_cfg);
+                        let broadcast = serde_json::json!({
+                            "type": "provider_update",
+                            "provider": provider_name,
+                            "model": new_cfg.model,
+                            "provider_ready": ready,
+                        });
+                        let _ = proxy_for_ipc.send_event(UserEvent::SessionLoaded(
+                            broadcast.to_string(),
+                        ));
+                        let _ = shared_for_ipc.input_tx.send(ShellInput::ReloadConfig);
+                    }
+                }
+                "ask_user_response" => {
+                    let id = msg.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let text = msg
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let responder = pending_asks_for_ipc
+                        .lock()
+                        .ok()
+                        .and_then(|mut pending| pending.remove(&id));
+                    if let Some(responder) = responder {
+                        let _ = responder.send(text);
+                    }
+                }
+                "slash_commands_list" => {
+                    // Build the autocomplete catalogue for the chat-tab
+                    // `/` popup. Three sources:
+                    //   1. built-in commands (hard-coded in repl.rs so
+                    //      the parser and the popup stay in lock-step),
+                    //   2. user commands from .claude/commands/ etc.,
+                    //   3. installed skills (also reachable as /<name>).
+                    let mut entries: Vec<serde_json::Value> = Vec::new();
+                    for c in crate::repl::built_in_commands() {
+                        entries.push(serde_json::json!({
+                            "name": c.name,
+                            "description": c.description,
+                            "category": c.category,
+                            "usage": c.usage,
+                            "source": "builtin",
+                        }));
+                    }
+                    let user_cmds = crate::commands::CommandStore::discover();
+                    let mut user_names: Vec<&str> = user_cmds.commands.keys()
+                        .map(String::as_str)
+                        .collect();
+                    user_names.sort();
+                    for name in user_names {
+                        if let Some(cmd) = user_cmds.get(name) {
+                            entries.push(serde_json::json!({
+                                "name": cmd.name,
+                                "description": cmd.description,
+                                "category": "Custom",
+                                "usage": "",
+                                "source": "user",
+                            }));
+                        }
+                    }
+                    let skill_store = crate::skills::SkillStore::discover();
+                    let mut skill_entries: Vec<&crate::skills::SkillDef> =
+                        skill_store.skills.values().collect();
+                    skill_entries.sort_by(|a, b| a.name.cmp(&b.name));
+                    for s in skill_entries {
+                        entries.push(serde_json::json!({
+                            "name": s.name,
+                            "description": s.description,
+                            "category": "Skills",
+                            "usage": "",
+                            "source": "skill",
+                        }));
+                    }
+                    let payload = serde_json::json!({
+                        "type": "slash_commands",
+                        "commands": entries,
+                    });
+                    let _ = proxy_for_ipc.send_event(UserEvent::SessionLoaded(
+                        payload.to_string(),
+                    ));
+                }
                 "get_cwd" => {
                     let cwd = std::env::current_dir()
                         .map(|p| p.to_string_lossy().to_string())
@@ -1100,7 +1275,18 @@ pub fn run_gui() {
                     // data is the base64 of the raw image bytes (no
                     // data: prefix). Only the chat tab emits this
                     // field; the terminal tab never has attachments.
-                    let attachments: Vec<(String, String)> = msg
+                    //
+                    // Caps below are defense-in-depth against a
+                    // malicious / buggy frontend bypassing the
+                    // ChatView per-image 10 MB cap. With both caps,
+                    // the worst-case payload is bounded at ~67 MB
+                    // base64 (50 MB raw) per IPC message, which the
+                    // agent can ingest without OOM on common dev
+                    // hardware.
+                    const MAX_ATTACHMENTS_PER_MESSAGE: usize = 10;
+                    const MAX_ATTACHMENTS_TOTAL_B64_BYTES: usize = 67 * 1024 * 1024;
+
+                    let mut attachments: Vec<(String, String)> = msg
                         .get("attachments")
                         .and_then(|v| v.as_array())
                         .map(|arr| {
@@ -1121,6 +1307,24 @@ pub fn run_gui() {
                                 .collect()
                         })
                         .unwrap_or_default();
+
+                    if attachments.len() > MAX_ATTACHMENTS_PER_MESSAGE {
+                        eprintln!(
+                            "[ipc chat_user_message] dropping {} attachments over the {}-per-message cap",
+                            attachments.len() - MAX_ATTACHMENTS_PER_MESSAGE,
+                            MAX_ATTACHMENTS_PER_MESSAGE,
+                        );
+                        attachments.truncate(MAX_ATTACHMENTS_PER_MESSAGE);
+                    }
+                    let total_b64: usize =
+                        attachments.iter().map(|(_, d)| d.len()).sum();
+                    if total_b64 > MAX_ATTACHMENTS_TOTAL_B64_BYTES {
+                        eprintln!(
+                            "[ipc chat_user_message] attachments total {} bytes (b64) exceed {} cap; dropping all",
+                            total_b64, MAX_ATTACHMENTS_TOTAL_B64_BYTES,
+                        );
+                        attachments.clear();
+                    }
 
                     if !attachments.is_empty() {
                         let _ = shared_for_ipc.input_tx.send(ShellInput::LineWithImages {
@@ -1620,6 +1824,43 @@ pub fn run_gui() {
                             let _ = proxy_for_ipc.send_event(UserEvent::SessionLoaded(
                                 broadcast.to_string()
                             ));
+                            // Post-key-entry model picker (closes #13).
+                            // For providers with a non-trivial catalogue
+                            // (OpenRouter has dozens; OpenAI/Anthropic/Gemini
+                            // each have several variants), open a modal so
+                            // the user picks a default rather than landing
+                            // on whatever auto_fallback_model chose. Skipped
+                            // for tiny catalogues (single model = no choice
+                            // to make) and for runtime-loaded backends
+                            // (Ollama / LMStudio — their model list comes
+                            // from the running runtime, not the catalogue).
+                            let cat = crate::model_catalogue::EffectiveCatalogue::load();
+                            let models = cat.list_models_for_provider(provider);
+                            let runtime_loaded = matches!(
+                                provider,
+                                "ollama" | "ollama-anthropic" | "lmstudio",
+                            );
+                            if models.len() >= 3 && !runtime_loaded {
+                                let model_rows: Vec<serde_json::Value> = models
+                                    .iter()
+                                    .map(|(id, e)| {
+                                        serde_json::json!({
+                                            "id": id,
+                                            "context": e.context,
+                                            "max_output": e.max_output,
+                                        })
+                                    })
+                                    .collect();
+                                let picker = serde_json::json!({
+                                    "type": "model_picker_open",
+                                    "provider": provider,
+                                    "current": new_cfg.model,
+                                    "models": model_rows,
+                                });
+                                let _ = proxy_for_ipc.send_event(
+                                    UserEvent::SessionLoaded(picker.to_string()),
+                                );
+                            }
                         } else {
                             // No auto-switch needed, but readiness may
                             // have flipped for the current provider —
@@ -2008,6 +2249,9 @@ pub fn run_gui() {
         .build_gtk(window.default_vbox().unwrap())
         .expect("webview build (gtk)");
 
+    #[cfg(target_os = "macos")]
+    let mut macos_modifiers = ModifiersState::empty();
+
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
 
@@ -2078,17 +2322,28 @@ pub fn run_gui() {
                 );
                 let _ = webview.evaluate_script(&js);
             }
+            Event::UserEvent(UserEvent::QuitRequested) => {
+                request_gui_shutdown(&shared_for_events, control_flow);
+            }
+            #[cfg(target_os = "macos")]
+            Event::WindowEvent {
+                event: WindowEvent::ModifiersChanged(modifiers),
+                ..
+            } => {
+                macos_modifiers = modifiers;
+            }
+            #[cfg(target_os = "macos")]
+            Event::WindowEvent {
+                event: WindowEvent::KeyboardInput { event, .. },
+                ..
+            } if is_macos_close_shortcut(&event, macos_modifiers) => {
+                request_gui_shutdown(&shared_for_events, control_flow);
+            }
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
-                // Save the shared session before exit.
-                let _ = shared_for_events.input_tx.send(ShellInput::SaveAndQuit);
-                // Kill any spawned teammate processes.
-                let _ = std::process::Command::new("pkill")
-                    .args(["-f", "team-agent"])
-                    .status();
-                *control_flow = ControlFlow::Exit;
+                request_gui_shutdown(&shared_for_events, control_flow);
             }
             _ => {}
         }

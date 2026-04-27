@@ -208,6 +208,24 @@ fn is_blocked_key(key: &str) -> bool {
     false
 }
 
+/// Walk up from `start` to the filesystem root, loading the first `.env`
+/// file found. Stops at the first match or when no parent remains. Used
+/// by operator tools (catalogue-seed) where the binary is invoked from a
+/// nested crate dir but the canonical `.env` lives at the workspace
+/// root. Idempotent: already-set env vars are preserved (same semantics
+/// as `load_dotenv`).
+pub fn load_dotenv_walking_up(start: &Path) {
+    let mut dir = Some(start.to_path_buf());
+    while let Some(d) = dir {
+        let candidate = d.join(".env");
+        if candidate.is_file() {
+            load_file(&candidate);
+            return;
+        }
+        dir = d.parent().map(|p| p.to_path_buf());
+    }
+}
+
 fn load_file(path: &Path) {
     let Ok(contents) = std::fs::read_to_string(path) else {
         return;

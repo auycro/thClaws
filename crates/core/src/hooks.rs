@@ -14,7 +14,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::process::Command;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -63,8 +62,7 @@ pub enum HookEvent {
 pub fn fire(config: &HooksConfig, event: HookEvent, env: &HashMap<String, String>) {
     let Some(cmd) = config.get(event) else { return };
 
-    let mut command = Command::new("/bin/sh");
-    command.arg("-c").arg(cmd);
+    let mut command = crate::util::shell_command_sync(cmd);
 
     // Standard env vars for all hooks.
     command.env("THCLAWS_HOOK_EVENT", format!("{event:?}"));

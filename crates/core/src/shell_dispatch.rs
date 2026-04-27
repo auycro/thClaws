@@ -194,6 +194,54 @@ pub async fn dispatch(
             }
             emit(events_tx, out);
         }
+        SlashCommand::ModelsSetContext { key, size, project } => {
+            let scope = if project {
+                crate::model_catalogue::OverrideScope::Project
+            } else {
+                crate::model_catalogue::OverrideScope::User
+            };
+            let entry = crate::model_catalogue::ModelEntry {
+                context: Some(size),
+                max_output: None,
+                source: Some("override".into()),
+                verified_at: None,
+            };
+            let cat = crate::model_catalogue::EffectiveCatalogue::load();
+            let warn = cat.lookup_exact(&key).map(|n| size > n).unwrap_or(false);
+            match crate::model_catalogue::save_override(&key, Some(entry), scope) {
+                Ok(path) => {
+                    emit(
+                        events_tx,
+                        format!(
+                            "override → {key}: {size} tokens (saved to {})",
+                            path.display()
+                        ),
+                    );
+                    if warn {
+                        emit(
+                            events_tx,
+                            "warning: override exceeds catalogue value — provider may reject"
+                                .into(),
+                        );
+                    }
+                }
+                Err(e) => emit(events_tx, format!("set-context failed: {e}")),
+            }
+        }
+        SlashCommand::ModelsUnsetContext { key, project } => {
+            let scope = if project {
+                crate::model_catalogue::OverrideScope::Project
+            } else {
+                crate::model_catalogue::OverrideScope::User
+            };
+            match crate::model_catalogue::save_override(&key, None, scope) {
+                Ok(path) => emit(
+                    events_tx,
+                    format!("override removed for {key} (in {})", path.display()),
+                ),
+                Err(e) => emit(events_tx, format!("unset-context failed: {e}")),
+            }
+        }
         SlashCommand::ModelsRefresh => {
             emit(events_tx, "refreshing model catalogue…".into());
             match crate::model_catalogue::refresh_from_remote().await {
@@ -324,10 +372,43 @@ pub async fn dispatch(
             let arg = arg.trim();
             if arg.is_empty() {
                 let prov = state.config.detect_provider().unwrap_or("unknown");
+                // Always print the current model — keeps `/model` useful
+                // as an introspection command and degrades gracefully on
+                // CLI where the picker isn't (yet) rendered.
                 emit(
                     events_tx,
                     format!("model: {} (provider: {})", state.config.model, prov),
                 );
+                // GUI side: also broadcast a model_picker_open event so
+                // the existing ModelPickerModal opens with the active
+                // provider's catalogue. Skipped for tiny catalogues
+                // (<3 entries — no choice to make) and runtime-loaded
+                // backends (Ollama / LMStudio) whose model lists come
+                // from the live runtime, not the catalogue. Closes #25.
+                let runtime_loaded = matches!(prov, "ollama" | "ollama-anthropic" | "lmstudio");
+                if !runtime_loaded {
+                    let cat = crate::model_catalogue::EffectiveCatalogue::load();
+                    let models = cat.list_models_for_provider(prov);
+                    if models.len() >= 3 {
+                        let model_rows: Vec<serde_json::Value> = models
+                            .iter()
+                            .map(|(id, e)| {
+                                serde_json::json!({
+                                    "id": id,
+                                    "context": e.context,
+                                    "max_output": e.max_output,
+                                })
+                            })
+                            .collect();
+                        let payload = serde_json::json!({
+                            "type": "model_picker_open",
+                            "provider": prov,
+                            "current": state.config.model,
+                            "models": model_rows,
+                        });
+                        let _ = events_tx.send(ViewEvent::ModelPickerOpen(payload.to_string()));
+                    }
+                }
             } else {
                 // Strict mode: user named a specific model. A typo
                 // should abort so they don't end up on the wrong one.
@@ -1276,9 +1357,9 @@ async fn switch_model(
     //   the result into the user cache so it sticks.
     // - Everyone else: emit the "run /models refresh" nudge.
     let cat = crate::model_catalogue::EffectiveCatalogue::load();
-    let (ctx, known) =
+    let (ctx, src) =
         crate::model_catalogue::effective_context_window_with(&cat, &state.config.model);
-    if !known {
+    if !src.is_known() {
         let is_ollama = matches!(
             new_kind,
             Some(crate::providers::ProviderKind::Ollama)

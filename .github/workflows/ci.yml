@@ -9,6 +9,17 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Opt into Node 24 ahead of GitHub's 2026-06-02 forced switch, so we
+  # catch action-runtime breakage on our schedule, not theirs. Drop this
+  # once Node 24 is the runner default.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+# Least privilege: CI only needs to read the repo + download the
+# frontend-dist artifact between jobs. Override per-job if a future
+# step needs more (e.g. caching a coverage upload).
+permissions:
+  contents: read
+  actions: read
 
 jobs:
   # Formatting check — fast, runs on every PR
@@ -20,8 +31,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - working-directory: crates/core
-        run: cargo fmt --all -- --check
+      - run: cargo fmt --all -- --check
 
   # Frontend build + typecheck (needs to run before clippy/test so frontend/dist exists)
   frontend:
@@ -61,7 +71,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: crates/core
+          workspaces: .
       - name: Install Linux GUI dependencies
         run: |
           sudo apt-get update
@@ -70,9 +80,8 @@ jobs:
         with:
           name: frontend-dist
           path: frontend/dist/
-      - working-directory: crates/core
-        # Warnings logged but not fatal — cleanup tracked separately from launch
-        run: cargo clippy --features gui
+      # Warnings logged but not fatal — cleanup tracked separately from launch
+      - run: cargo clippy --features gui
 
   # Test matrix across major platforms
   test:
@@ -92,7 +101,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: crates/core
+          workspaces: .
       - name: Install Linux GUI dependencies
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -102,9 +111,7 @@ jobs:
         with:
           name: frontend-dist
           path: frontend/dist/
-      - working-directory: crates/core
-        run: cargo build --features gui
-      - working-directory: crates/core
-        run: cargo test --features gui
+      - run: cargo build --features gui
+      - run: cargo test --features gui
         env:
           THCLAWS_DISABLE_KEYCHAIN: "1"

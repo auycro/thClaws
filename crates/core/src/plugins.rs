@@ -235,6 +235,15 @@ pub fn read_manifest(root: &Path) -> Result<PluginManifest> {
 /// Install a plugin from a git URL or a `.zip` URL into the given scope.
 /// Returns the installed [`Plugin`] record.
 pub async fn install(url: &str, user: bool) -> Result<Plugin> {
+    // Org-policy gate: when `policies.plugins.enabled: true`, the URL
+    // must match `allowed_hosts`. Open-core builds with no policy hit
+    // `AllowDecision::NoPolicy` and pass through unchanged.
+    if let crate::policy::AllowDecision::Denied { reason } = crate::policy::check_url(url) {
+        return Err(Error::Config(format!(
+            "plugin install blocked by org policy: {reason}"
+        )));
+    }
+
     let dest_parent = plugins_dir(user)?;
     std::fs::create_dir_all(&dest_parent)?;
 

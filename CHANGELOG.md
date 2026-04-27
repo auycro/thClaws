@@ -7,6 +7,495 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-04-27
+
+Minor release. Lands the **Enterprise Edition foundation** (Phases 0–3
+of `dev-plan/01-enterprise-edition.md`) — policy infrastructure,
+branded builds, plugin/skill/MCP allow-list, and gateway enforcement.
+
+**Open-core users see zero behavior change.** Every feature below is
+inert unless an Ed25519-signed organization policy file is present at
+`~/.config/thclaws/policy.json` or `/etc/thclaws/policy.json` *and*
+verifies against either an embedded public key (enterprise builds) or
+one supplied at runtime via env var / conventional file path.
+
+### Added — Enterprise Edition foundation
+
+- **Org policy file format** (Phase 0). New `policy/` module with a
+  versioned JSON schema covering four sub-policies (branding, plugins,
+  gateway, sso), Ed25519 signature verification using a hand-written
+  canonical-JSON serializer (no external `canonical-json` dep), expiry
+  checks, and optional `binding.binary_fingerprint` matching to prevent
+  lifting a customer's policy onto a non-customer build. Loader searches
+  `THCLAWS_POLICY_FILE` → `/etc/thclaws/policy.json` → `~/.config/thclaws/policy.json`.
+  Public key sources: compile-time embedded → `THCLAWS_POLICY_PUBLIC_KEY`
+  env var → `/etc/thclaws/policy.pub` → `~/.config/thclaws/policy.pub`.
+  Open-core release binaries embed no key; enterprise builds bake the
+  customer's public key at compile time via `THCLAWS_POLICY_PUBKEY_PATH`.
+  Refuses to start on signature failure, expiry, binding mismatch, or
+  missing verification key — fail-closed by design.
+
+- **`thclaws-policy-tool` operator CLI** (Phase 0). Subcommands:
+  `keygen` (generates Ed25519 keypair, chmods private key 0600 on Unix),
+  `sign` (signs a policy JSON file), `verify` (checks signature
+  against a public key), `inspect` (pretty-prints policy structure),
+  `fingerprint` (computes SHA-256 of a binary for `binding`). Signing
+  logic lives **only** in this tool — main runtime has zero signing
+  code, so a leaked source tree isn't a key-compromise vector.
+
+- **Branding config** (Phase 1). New `branding` module reads
+  `policies.branding` from the active policy with fallback to today's
+  defaults. Wired into the REPL banner, version header, `/doctor`
+  diagnostics title, GUI window title, and the system prompt
+  (`{product}` placeholder substituted at load time so the model
+  introduces itself as the org's product name). `{support_email}`
+  template substitution available for any prompt that needs it.
+
+- **Plugin/skill/MCP source allow-list** (Phase 2). New
+  `policy/allowlist.rs` matcher with host+path glob patterns,
+  segment wildcards, host-prefix wildcards (`*.acme.example`), and
+  mid-segment globs (`skill-*`). Strips scheme / query / fragment /
+  port / `.git` suffix before matching. Wired at:
+  - `plugins::install` — rejects URLs not in `allowed_hosts`
+  - `skills::install_from_url` — same gate, covers both git and zip
+    dispatch paths
+  - `skills::enforce_scripts_policy` — rejects skills with non-empty
+    `scripts/` dirs when `allow_external_scripts: false`. Bundle path
+    rejects scripted skills individually so declarative siblings still
+    install.
+  - `config::parse_mcp_json` — filters HTTP MCP servers whose URL host
+    isn't in `allowed_hosts` when `allow_external_mcp: false`. Logs
+    yellow `[mcp] '<name>' skipped: <reason>` to stderr. Stdio MCPs
+    pass through (admin's mcp.json content = admin's responsibility).
+
+- **Gateway enforcement** (Phase 3). When `policies.gateway.enabled:
+  true`, every cloud-provider call routes through the org's private
+  LLM gateway (LiteLLM, Portkey, Helicone, internal proxy). User's
+  per-provider API keys are ignored — gateway owns credentials.
+  Architecture: `build_provider` returns a single OpenAI-compatible
+  client pointing at the gateway URL when active, regardless of which
+  `ProviderKind` the user picked. Works because every common gateway
+  product speaks OpenAI Chat Completions and routes to upstream
+  providers via the `model` field.
+  - Auth header template supports `{{env:NAME}}` for env-var-injected
+    secrets (keeps gateway tokens out of the auditable signed policy
+    file). `{{sso_token}}` placeholder reserved for Phase 4.
+  - `read_only_local_models_allowed: true` escape valve lets local
+    providers (Ollama, OllamaAnthropic, LMStudio, AgentSdk) bypass
+    the gateway and run directly. Off by default (strict enterprise).
+  - Validation gate at policy load: refuses to start if
+    `gateway.enabled: true` with empty `url` (would otherwise
+    fail-open at provider construction). Same check for
+    `sso.enabled: true` with empty `issuer_url` / `client_id`.
+
+- **`ENTERPRISE.md`** admin guide added to the public repo. Covers
+  the open-core + signed-policy architecture, 10-minute quick-start
+  walkthrough, operational concerns (key rotation, expiry, binary
+  fingerprint binding, MDM deployment), troubleshooting all four
+  startup-refusal modes, and an FAQ.
+
+### Caveats
+
+- **OIDC SSO is not yet implemented.** Phase 4 lands in v0.6.0. Until
+  then, the gateway uses static-token / env-var auth via the
+  `{{env:NAME}}` template substitution. Works fine for LiteLLM-style
+  deployments where the gateway token is the only required credential.
+- **Frontend branding strings** (5 hardcoded "thClaws" literals in
+  `App.tsx`/`ChatView.tsx`, plus the embedded React-bundled logo
+  imports) are NOT yet routed through the branding module. They land
+  in a v0.5.x point release once the IPC `branding_get` bridge is
+  wired. The Rust-side branding (REPL banner, GUI title, system
+  prompt) is fully active in v0.5.0.
+- **HTTP-layer fail-closed** for the gateway is currently advisory.
+  The provider-replacement approach already eliminates bypass paths
+  inside the agent loop. A wrapper `reqwest::Client` for
+  defense-in-depth is a planned hardening pass.
+
+## [0.4.2] — 2026-04-26
+
+Small additive release in response to issue [#30](https://github.com/thClaws/thClaws/issues/30)
+from Chawasit Tengtrairatana — same reporter who filed the
+v0.4.1 Windows bug, with another high-quality writeup that
+mapped cleanly to the existing catalogue layering.
+
+### Added
+
+- **User-defined context-window overrides.** A new `modelOverrides`
+  block in `settings.json` (project + user, project wins per-key)
+  lets the user pin context windows above every catalogue layer.
+  Keyed by `provider/model` (e.g. `"anthropic/claude-sonnet-4-6"`).
+  Useful for: (a) capping a local Ollama / LMStudio model to fit
+  a smaller GPU than the model's native context, (b) per-provider
+  variants of the same id (Anthropic vs OpenRouter for the same
+  Claude model), (c) brand-new models not yet in the catalogue.
+  Override resolution honors aliases in both directions and the
+  same `vendor/` prefix-strip rules the catalogue uses.
+
+- **`/models set-context` and `/models unset-context` slash
+  commands.** Set: `/models set-context [--project] <provider/model>
+  <size>` (size accepts `128000`, `128k`, or `1m`). Unset: `/models
+  unset-context [--project] <provider/model>`. Default scope is
+  user-global (`~/.config/thclaws/settings.json`); `--project`
+  scopes to `.thclaws/settings.json`. Saves preserve every other
+  field in the target file (atomic write).
+
+- **`ContextSource` enum.** `effective_context_window_with` now
+  returns `(u32, ContextSource)` distinguishing override hits from
+  catalogue hits and from fallbacks. `/models` rendering marks
+  override rows with a `source: "override"` stamp. Old `(u32,
+  bool)` semantics remain available via `ContextSource::is_known()`.
+
+### Policy: trust + warn
+
+Overrides exceeding the catalogue value are accepted (the user
+intent always wins) but a yellow warning is printed at save-time
+so a typo doesn't silently produce upstream rejections at request
+time. No clamp, no validation against the upstream-reported max —
+matches the spirit of "user knows their hardware better than we do."
+
+## [0.4.1] — 2026-04-27
+
+Same-day patch release fixing a critical Windows-only bug surfaced
+within hours of v0.4.0 shipping.
+
+### Fixed
+
+- **Bash tool unusable on Windows** ([#29](https://github.com/thClaws/thClaws/issues/29),
+  Chawasit Tengtrairatana). `/bin/sh` was hardcoded at 4 sites
+  (`tools/bash.rs`, `team.rs`, `repl.rs`, `hooks.rs`) — Windows
+  doesn't have that path, so spawn returned `os error 3` (path
+  not found) and the agent was effectively crippled on Win11.
+  Centralized shell resolution into `util::shell_command_{sync,
+  async}()`, branching on `cfg!(windows)`. On Windows this is
+  `cmd.exe /C <cmd>`; on Unix `/bin/sh -c <cmd>`, unchanged.
+
+### Added
+
+- **`THCLAWS_SHELL` env override.** Power users with `bash` from
+  WSL / Git Bash, or who prefer `pwsh`, can set
+  `THCLAWS_SHELL="bash -c"` (or `"pwsh -Command"`, etc.). The
+  helper splits on whitespace into `(executable, flag)`. Useful on
+  Windows where `cmd.exe` doesn't parse bash-syntax commands the
+  same as `bash` does.
+
+### Caveats
+
+Bash-syntax commands the agent emits (`find . -name '*.rs'`,
+single-quoted args, complex pipelines) may not parse identically
+under `cmd.exe`. Set `THCLAWS_SHELL="bash -c"` if you have Git Bash
+or WSL `bash` on `PATH` for closer-to-Unix semantics on Windows.
+
+## [0.4.0] — 2026-04-27
+
+Minor release. Provider expansion + agent-loop UX polish + a class
+of bugs around credential detection. Substantial accumulated work
+from same-day batch PR processing across 7 community contributors.
+
+### Added — Providers (4 new)
+
+- **Z.ai (GLM Coding Plan).** OpenAI-compatible upstream at
+  `https://api.z.ai/api/coding/paas/v4`. Routes via `zai/<id>`
+  prefix, default `zai/glm-4.6`. API key in `ZAI_API_KEY`. Power
+  users on the BigModel SKU can override via `ZAI_BASE_URL`.
+  Closes [#14](https://github.com/thClaws/thClaws/issues/14).
+- **LMStudio.** Local OpenAI-compatible runtime at `/v1`, default
+  `http://localhost:1234/v1`. No auth. User-configurable base URL
+  via Settings (mirrors the Ollama UX); env override
+  `LMSTUDIO_BASE_URL`.
+- **Azure AI Foundry** ([#21](https://github.com/thClaws/thClaws/pull/21),
+  Parinya-chab / joparin). Anthropic-Claude-on-Azure via
+  `{resource}/anthropic/v1/messages` with `x-api-key` auth. Reuses
+  `AnthropicProvider` with a custom base URL — no duplicate stream
+  code. Default model placeholder `azure/<deployment>` (Azure
+  deployments are user-named); set via
+  `/model azure/<your-deployment>` once `AZURE_AI_FOUNDRY_ENDPOINT`
+  + `AZURE_AI_FOUNDRY_API_KEY` are configured. Forward-looking
+  hooks added to `OpenAIProvider` (`with_api_key_header`,
+  `with_list_models_url`) for a future Azure OpenAI provider.
+- **Ollama Cloud** ([#28](https://github.com/thClaws/thClaws/pull/28),
+  Av0cadoo). Hits `https://ollama.com/api/chat` with Bearer auth;
+  reuses local Ollama's NDJSON parser. Round-trips the cloud-
+  specific `thinking` field as a sibling on assistant messages
+  (DeepSeek V4, Kimi K2.5, GLM-5, etc. emit reasoning content
+  separately from the visible answer). 38 cloud-only models
+  auto-discovered via the new catalogue-seed probe — including
+  `deepseek-v4-flash`, `kimi-k2.5/2.6`, `glm-5/5.1`,
+  `qwen3-coder-next`, `mistral-large-3:675b`, `gpt-oss:20b/120b`.
+  Closes [#17](https://github.com/thClaws/thClaws/issues/17).
+
+### Added — Agent-loop UX
+
+- **AskUserQuestion GUI bridge** ([#16](https://github.com/thClaws/thClaws/pull/16),
+  Kinzen-dev). The agent's `AskUser` tool used to fall through to
+  invisible CLI stdin in the GUI — chat hung indefinitely. The
+  question now appears as a chat-composer reply prompt; user
+  reply routes back through a `oneshot` to the awaiting tool call.
+  Falls back to CLI readline when no GUI is registered.
+- **macOS Cmd+Q / Cmd+W shutdown shortcuts** ([#16](https://github.com/thClaws/thClaws/pull/16)).
+  Two-layer coverage (frontend keydown listener + tao native
+  KeyboardInput) so Cmd+Q reaches the SaveAndQuit save path even
+  in fullscreen / focus-edge cases.
+- **Post-key-entry model picker** ([#13](https://github.com/thClaws/thClaws/issues/13)).
+  After successfully saving an API key in Settings, if the
+  provider has a non-trivial catalogue (≥3 models, skipping
+  runtime-loaded backends), a searchable modal opens so the user
+  can pick a default model.
+- **`/model` interactive picker on no-args** ([#25](https://github.com/thClaws/thClaws/issues/25),
+  tkvision). Typing `/model` with no arguments now opens the
+  same picker modal in addition to printing the current model.
+  Reuses the post-key picker's UX. CLI-side TUI picker is a future
+  follow-up.
+- **Slash-command popup** ([#20](https://github.com/thClaws/thClaws/pull/20),
+  siharat-th). Typing `/` in chat or terminal opens an
+  autocomplete menu — built-in commands grouped by category
+  (Session / Model / Context / Extensions / Team / System), plus
+  user `.claude/commands/` and installed skills. Arrow keys
+  navigate, Tab/Enter accept, Esc cancels. Smart Enter: only
+  swallows Enter while composing the command name, falls through
+  to submit once arguments are being typed.
+- **Terminal caret-aware editing** ([#22](https://github.com/thClaws/thClaws/pull/22),
+  siharat-th). Left/Right arrow keys, Home/End, Ctrl-A/Ctrl-E
+  navigate the line buffer instead of echoing escape codes.
+  Backspace and printable-char insertion are caret-aware: the
+  fast `term.write(ch)` / `\b \b` path stays at end-of-line;
+  mid-line edits redraw so the tail shifts correctly.
+
+### Added — Catalogue
+
+- **`agent/claude-opus-4-7-1m`** in the agent-sdk catalogue
+  ([#26](https://github.com/thClaws/thClaws/issues/26), tkvision).
+  Max-subscription users on the `agent/*` provider can now
+  explicitly select the 1M-context Opus variant.
+- **Ollama Cloud auto-discovery** in `catalogue-seed`. Probes
+  `https://ollama.com/v1/models` when `OLLAMA_CLOUD_API_KEY` is
+  set; refreshes 38 cloud rows every run.
+- **`load_dotenv_walking_up()`** in `catalogue-seed` — walks up
+  from cwd to find a workspace-root `.env`, so the operator tool
+  picks up API keys regardless of which directory cargo is invoked
+  from.
+
+### Changed
+
+- **Default Gemini model** `gemini-2.0-flash` → `gemini-2.5-flash`
+  ([#27](https://github.com/thClaws/thClaws/pull/27), gokusenz).
+  Google's deprecation page lists 2.0-flash as deprecated with
+  shutdown 2026-06-01. Existing user configs that explicitly pin
+  2.0-flash still work.
+- **Read tool** now errors out clearly when bytes don't match any
+  supported image format (PNG/JPEG/WebP/GIF) instead of guessing
+  the MIME from the extension. Real images sniff fine; only the
+  wrong-extension/corrupted unhappy path changes.
+
+### Fixed
+
+- **Empty `ANTHROPIC_API_KEY=""` (or any provider key) was treated
+  as configured.** `std::env::var(...).is_ok()` returns true for
+  an exported-but-empty value, so a stale shell rc / VS Code env
+  injection blocked `auto_fallback_model` from switching when the
+  user added a Gemini/Z.ai/etc. key. Both `kind_has_credentials`
+  and `api_key_from_env` now require non-empty values; empty env
+  falls through to the keychain. Includes a regression test
+  `empty_env_var_treated_as_unset`.
+- **`/exit` / `/quit` / `/q` slash commands** route through
+  the backend `app_close` save path
+  ([#16](https://github.com/thClaws/thClaws/pull/16)) instead of
+  frontend-only `window.close()` after a 200 ms timeout.
+- **Tool-bubble finalizer** searches backwards for the most recent
+  unfinished tool bubble — handles text events arriving between
+  `tool_use` and `tool_done`
+  ([#16](https://github.com/thClaws/thClaws/pull/16)).
+- **Frontend security hardening** from a same-day audit pass:
+  10 MB cap on pasted/dropped images with inline error banner
+  (was: silent drop, multi-MB paste froze the UI during base64
+  encoding); 1 MB cap on terminal clipboard paste; explanatory
+  threat-model comment on the `ReactMarkdown` call site;
+  `ansiToHtml` documented invariant block.
+- **Backend security hardening:** IPC `chat_user_message`
+  attachment array bounded at `MAX_ATTACHMENTS_PER_MESSAGE = 10`
+  + 67 MB total b64.
+
+### Infrastructure
+
+- **Branch protection ruleset on `main`** — block force-push +
+  deletion (non-admin), require PR before merging, require status
+  checks (cargo fmt + clippy + test (ubuntu-latest) + audit) to
+  pass. Admin bypass for sync-from-private-workspace flow and
+  emergency corrections.
+- **Private Vulnerability Reporting (PVR)** enabled. SECURITY.md
+  refreshed: PVR primary, email alternate, supported versions
+  bumped 0.2.x → 0.3.x → 0.4.x.
+- **CodeQL default setup** for JavaScript/TypeScript + Actions.
+- **`cargo-audit` workflow** runs on PRs touching `Cargo.lock` +
+  weekly cron.
+- **Node 24 actions runtime opt-in** via
+  `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true` ahead of GitHub's
+  2026-06-02 forced switch.
+- **`ci.yml` permissions block** — `contents: read, actions: read`
+  at top level (was inheriting GITHUB_TOKEN's default write
+  scope; closes 4 CodeQL alerts).
+
+### Acknowledged but deferred
+
+- Copy-button-on-chat-bubble surface scope decision (toast / scope
+  restriction / pattern-redaction) — captured in the audit reports
+  under `dev-log/103-security-audit-frontend.md`.
+- IPC message types still stringly-typed; discriminated-union
+  refactor queued.
+- Transitive `glib` 0.18.5 / gtk-rs 0.18.x unmaintained warnings
+  remain pending the upstream `wry`/`webkit2gtk` GTK4 migration.
+- CLI TUI picker for `/model` no-args
+  ([#25](https://github.com/thClaws/thClaws/issues/25)) — GUI
+  side ships in this release; CLI is future work.
+- GitHub Copilot provider
+  ([#24](https://github.com/thClaws/thClaws/issues/24)) — needs
+  GitHub OAuth web flow; queued for a future minor.
+- `output.log` should record tool-call argument detail
+  ([#23](https://github.com/thClaws/thClaws/issues/23)).
+
+## [0.3.5] — 2026-04-26
+
+Same-day feature/fix follow-up to v0.3.4: two new providers, the
+post-key-entry model picker, plus a real bug fix for users whose
+shell rc / VS Code env injects a blank `ANTHROPIC_API_KEY`.
+
+### Added
+
+- **Z.ai (GLM Coding Plan) provider.** OpenAI-compatible upstream
+  at `https://api.z.ai/api/coding/paas/v4`. Models route via
+  `zai/<id>` prefix (default `zai/glm-4.6`). API key in
+  `ZAI_API_KEY`. Power users on the BigModel SKU can override the
+  endpoint via `ZAI_BASE_URL`. Closes [#14](https://github.com/thClaws/thClaws/issues/14).
+- **LMStudio provider.** Local-runtime, OpenAI-compatible at `/v1`.
+  No auth. User-configurable base URL via Settings (default
+  `http://localhost:1234/v1`); env override `LMSTUDIO_BASE_URL`.
+  Mirrors the Ollama UX so changing port doesn't require a
+  settings.json edit.
+- **Post-key-entry model picker** ([#13](https://github.com/thClaws/thClaws/issues/13)).
+  After successfully saving an API key in Settings, if the
+  provider has a non-trivial catalogue (≥3 models, skipping
+  runtime-loaded backends like Ollama/LMStudio), a searchable
+  modal opens so the user can pick a default model directly —
+  instead of landing on whatever `auto_fallback_model` chose.
+  Skip / Esc / click-outside leaves the auto-pick in place.
+- **AskUserQuestion GUI bridge** ([#16](https://github.com/thClaws/thClaws/pull/16),
+  Kinzen-dev). The agent's `AskUser` tool used to fall through to
+  invisible CLI stdin in the GUI — chat hung indefinitely. The
+  question now appears as a chat-composer reply prompt; user
+  reply routes back through a `oneshot` to the awaiting tool call.
+  Falls back to CLI readline when no GUI is registered.
+- **macOS Cmd+Q / Cmd+W shutdown shortcuts** ([#16](https://github.com/thClaws/thClaws/pull/16)).
+  Two-layer coverage (frontend keydown listener + tao native
+  KeyboardInput) so Cmd+Q reaches the SaveAndQuit save path even
+  in fullscreen / focus-edge cases.
+
+### Fixed
+
+- **Empty `ANTHROPIC_API_KEY=""` (or any provider key) was treated
+  as configured.** `std::env::var(...).is_ok()` returns true for an
+  exported-but-empty value, so a stale shell rc / VS Code env
+  injection blocked `auto_fallback_model` from switching when the
+  user added a Gemini/Z.ai/etc. key. Both `kind_has_credentials`
+  and `api_key_from_env` now require non-empty values; empty env
+  falls through to the keychain. Includes a regression test
+  (`empty_env_var_treated_as_unset`).
+- **`catalogue-seed` reads workspace-root `.env`.** When invoked
+  via `cargo run --bin catalogue-seed` from a nested crate dir,
+  the binary now walks up from cwd to find the workspace's `.env`
+  and load API keys from it. Added
+  `dotenv::load_dotenv_walking_up()`.
+- **Tool-bubble finalizer searches backwards for unfinished tools**
+  ([#16](https://github.com/thClaws/thClaws/pull/16)). Old code
+  assumed `messages[last]` was the matching tool bubble; failed
+  when text or other events arrived between `tool_use` and
+  `tool_done`.
+- **`/exit` / `/quit` / `/q` slash commands** now route through
+  the backend `app_close` save path ([#16](https://github.com/thClaws/thClaws/pull/16))
+  instead of frontend-only `window.close()` after a 200 ms timeout.
+
+### Internal
+
+- New `model_set` IPC handler — frontend-driven model change path,
+  used by the new picker; mirrors what `/model` does in the agent
+  loop. Available for any future picker UI.
+- Dotenv `load_dotenv_walking_up(start)` helper exposed for
+  operator-tool scenarios.
+
+## [0.3.4] — 2026-04-26
+
+Same-day hardening patch following an internal security audit of v0.3.3.
+No new features; all changes are defensive limits and clearer errors on
+the image-attachment and terminal-paste paths.
+
+### Added
+
+- **Inline error feedback on image attachment.** Pasting or dropping an
+  unsupported image type or an image larger than 10 MB now shows a
+  short auto-clearing banner ("Image too large: 17.3 MB (max 10 MB)")
+  instead of silently dropping. Same path covers
+  `image/svg+xml`/etc. → "Unsupported image type".
+
+### Changed
+
+- **Read tool errors cleanly on wrong-extension image files.** Files
+  like `screenshot.png` containing non-PNG bytes used to slip through
+  with a guessed MIME and get rejected by the provider with an opaque
+  400. They now fail at Read with a pointed error message
+  ("bytes don't match any supported image format despite extension
+  claiming image/png — file may be corrupted, encrypted, or saved
+  with the wrong extension"). Real images with these extensions are
+  unaffected.
+
+### Fixed (security hardening)
+
+- **ChatView image paste/drop:** 10 MB per-attachment cap. Above the
+  cap, the image is rejected with a visible error rather than ballooning
+  the IPC payload and freezing the UI during base64 encoding.
+- **TerminalView clipboard paste:** 1 MB cap. Multi-MB pastes used to
+  freeze the main thread during synchronous `atob()` + `TextDecoder`;
+  oversized pastes are now dropped with a console warning.
+- **Backend IPC `chat_user_message` attachment array:**
+  `MAX_ATTACHMENTS_PER_MESSAGE = 10` and a 67 MB combined-base64 cap.
+  Defense-in-depth against a malicious or buggy frontend bypassing
+  the per-image cap; worst-case payload now bounded at ~50 MB raw
+  per message rather than unbounded.
+- **`TeamView.tsx` `ansiToHtml`:** documented the escape-first
+  invariant in a JSDoc block. The function's output is consumed via
+  `dangerouslySetInnerHTML`; preserving HTML-escape-before-tag-build
+  ordering is what keeps it safe. Block lists three changes to NOT
+  make.
+- **Markdown rendering threat-model comment** added at the
+  `ReactMarkdown` call site documenting that `msg.content` is
+  untrusted model output and the configured plugin chain
+  (`remark-gfm`, `rehype-highlight`) is intentionally the safe stack
+  — no `allowDangerousHtml`, no `rehype-raw`.
+
+### CI / Infrastructure
+
+- **Workflow least-privilege.** `ci.yml` now declares an explicit
+  top-level `permissions: contents: read, actions: read`, instead of
+  inheriting the GITHUB_TOKEN's default write scope. Closes 4
+  CodeQL alerts (`actions/missing-workflow-permissions`).
+- **CodeQL Rust scan** actually runs now: added `libdbus-1-dev` +
+  `pkg-config` install before `cargo build`. The keychain crate's
+  transitive `libdbus-sys` was failing pkg_config detection, breaking
+  every prior CodeQL Rust run before extraction even started.
+- **Node 24 actions runtime opt-in** via
+  `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true` on both `release.yml`
+  and `ci.yml`. Surfaces any action-runtime breakage on our schedule
+  rather than at GitHub's 2026-06-02 forced cutover.
+
+### Known issues — acknowledged but deferred
+
+- Copy-button surface on chat bubbles (system/tool/assistant) doesn't
+  warn or filter when copying messages that may contain previously-
+  pasted secrets. Needs a design choice (toast confirmation vs.
+  scope restriction vs. pattern-based redaction); deferred to v0.3.5.
+- IPC message types are still stringly-typed; discriminated-union
+  refactor queued for a future maintenance pass.
+- Transitive `glib` 0.18.5 / gtk-rs 0.18.x unmaintained warnings
+  (12 RustSec entries) remain pending the upstream `wry`/`webkit2gtk`
+  GTK4 migration.
+
 ## [0.3.3] — 2026-04-26
 
 Feature release rolling up image attachment across providers, chat UI

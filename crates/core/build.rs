@@ -38,6 +38,135 @@ fn main() {
     println!("cargo:rustc-env=THCLAWS_GIT_DIRTY={dirty}");
     println!("cargo:rustc-env=THCLAWS_BUILD_TIME={build_time}");
     println!("cargo:rustc-env=THCLAWS_BUILD_PROFILE={profile}");
+
+    // Optional: enterprise-build embeds a customer-specific Ed25519 public key
+    // used to verify org policy files. Source-of-truth resolution at build time:
+    //
+    //   1. `THCLAWS_POLICY_PUBKEY_PATH` env var — explicit override, used by
+    //      per-customer CI builds to point at the right pubkey for each
+    //      enterprise SKU.
+    //   2. `~/.config/thclaws/policy.pub` — conventional default path. Solo
+    //      operators just drop the pubkey here and run `cargo build`; no env
+    //      var to remember. Same dir the runtime loader looks for `policy.json`.
+    //
+    // If neither is found, the build proceeds with no embedded key and the
+    // open-core binary ships unchanged. Runtime can still pick up a key via
+    // env var or `~/.config/thclaws/policy.pub` for testing / self-locking.
+    println!("cargo:rerun-if-env-changed=THCLAWS_POLICY_PUBKEY_PATH");
+    let pubkey_path: Option<String> = match std::env::var("THCLAWS_POLICY_PUBKEY_PATH") {
+        Ok(p) if !p.trim().is_empty() => Some(p),
+        _ => default_pubkey_path().filter(|p| std::path::Path::new(p).exists()),
+    };
+    let embedded_pubkey = match pubkey_path {
+        Some(path) => {
+            println!("cargo:rerun-if-changed={path}");
+            match std::fs::read(&path) {
+                Ok(bytes) => Some(decode_pubkey_bytes(&bytes, &path)),
+                Err(e) => panic!("policy pubkey at {path:?} unreadable: {e}"),
+            }
+        }
+        None => None,
+    };
+    let embedded_b64 = embedded_pubkey
+        .map(|b| base64_encode(&b))
+        .unwrap_or_default();
+    println!("cargo:rustc-env=THCLAWS_EMBEDDED_POLICY_PUBKEY={embedded_b64}");
+}
+
+/// Conventional path used at build time when `THCLAWS_POLICY_PUBKEY_PATH`
+/// isn't explicitly set. Mirrors the runtime loader's fallback so the
+/// solo-operator workflow is "drop the file once, both build and runtime
+/// pick it up."
+fn default_pubkey_path() -> Option<String> {
+    let home = std::env::var("HOME")
+        .ok()
+        .or_else(|| std::env::var("USERPROFILE").ok())?;
+    Some(format!("{home}/.config/thclaws/policy.pub"))
+}
+
+/// Accept either raw 32-byte Ed25519 key material or a PEM/base64-encoded
+/// equivalent. Anything else fails the build hard — a malformed pubkey at
+/// build time would silently break verification at runtime.
+fn decode_pubkey_bytes(raw: &[u8], path: &str) -> Vec<u8> {
+    if raw.len() == 32 {
+        return raw.to_vec();
+    }
+    let text = std::str::from_utf8(raw).unwrap_or_else(|_| {
+        panic!("policy pubkey at {path:?} is {} bytes and not valid UTF-8 — expected 32 raw bytes or base64/PEM text", raw.len())
+    });
+    let trimmed = text.trim();
+    // Strip PEM-style header/footer if present.
+    let inner: String = if trimmed.starts_with("-----BEGIN") {
+        trimmed
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect::<Vec<_>>()
+            .join("")
+    } else {
+        trimmed.replace('\n', "").replace('\r', "")
+    };
+    let decoded = base64_decode(&inner)
+        .unwrap_or_else(|e| panic!("policy pubkey at {path:?} is not valid base64: {e}"));
+    if decoded.len() != 32 {
+        panic!(
+            "policy pubkey at {path:?} decoded to {} bytes; expected 32 (raw Ed25519 public key)",
+            decoded.len()
+        );
+    }
+    decoded
+}
+
+/// Tiny self-contained base64 encoder so build.rs has no extra deps.
+fn base64_encode(input: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        out.push(T[(b0 >> 2) as usize] as char);
+        out.push(T[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(T[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(T[(b2 & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes: Vec<u8> = input.bytes().filter(|b| *b != b'=').collect();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    for chunk in bytes.chunks(4) {
+        let mut buf = [0u8; 4];
+        for (i, b) in chunk.iter().enumerate() {
+            buf[i] = val(*b).ok_or_else(|| format!("invalid base64 char {:?}", *b as char))?;
+        }
+        out.push((buf[0] << 2) | (buf[1] >> 4));
+        if chunk.len() > 2 {
+            out.push((buf[1] << 4) | (buf[2] >> 2));
+        }
+        if chunk.len() > 3 {
+            out.push((buf[2] << 6) | buf[3]);
+        }
+    }
+    Ok(out)
 }
 
 fn git(args: &[&str]) -> Option<String> {

@@ -65,8 +65,21 @@ function collapseToolRuns(lines: string[]): string[] {
   return out;
 }
 
+/**
+ * Render ANSI-escape-coded text to HTML span elements with inline color styles.
+ *
+ * SECURITY INVARIANT: HTML entities are escaped FIRST, before any tag-building.
+ * The ANSI-code regex below operates only on already-escaped text, so untrusted
+ * agent output cannot inject markup. The output of this function is consumed
+ * via dangerouslySetInnerHTML downstream — preserving the escape-first ordering
+ * is what keeps that safe. If you change this function, do NOT:
+ *   - move escaping after tag insertion
+ *   - introduce raw HTML pass-through (e.g., for URLs/emphasis in agent names)
+ *   - replace the regex match with code that interpolates `text` directly
+ * Any of those re-opens stored XSS via agent task names / output.
+ */
 function ansiToHtml(text: string, palette: Record<number, string>): string {
-  // Escape HTML entities first.
+  // Escape HTML entities first — see invariant above.
   const escaped = text
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")

@@ -197,11 +197,50 @@ impl Catalogue {
     }
 }
 
-/// Runtime layered view: user cache overrides baseline; baseline
-/// always loaded so fallbacks work even when the cache is empty.
+/// Runtime layered view. Lookup order, top wins:
+/// 1. **User overrides** loaded from `modelOverrides` in project /
+///    user `settings.json` (project wins per-key, layered into the
+///    same map at load time).
+/// 2. **User cache** at `~/.config/thclaws/model_catalogue.json`.
+/// 3. **Embedded baseline** compiled into the binary.
+/// 4. **Provider default** (from `default_context` on the matched
+///    provider catalogue).
+/// 5. **Global fallback** (`GLOBAL_FALLBACK`).
+///
+/// Override keys are `provider_name/model_id` (e.g.
+/// `anthropic/claude-sonnet-4-6`). Bare-model keys (`gpt-4o`) match
+/// too, after alias-resolve and `vendor/` prefix-strip on the
+/// candidate id — same matching rules the catalogue itself uses.
 pub struct EffectiveCatalogue {
     pub cache: Option<Catalogue>,
     pub baseline: Catalogue,
+    /// User overrides keyed by `provider/model`. `context` wins over
+    /// every catalogue layer; `max_output` wins over the same field
+    /// in catalogue rows.
+    pub overrides: HashMap<String, ModelEntry>,
+}
+
+/// Where `effective_context_window_with` resolved its return value.
+/// `Override` and `Catalogue` are both "known" sizes; `Fallback`
+/// signals the caller to consider nudging `/models refresh`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextSource {
+    /// User-defined override won — the size came from `modelOverrides`
+    /// in project or user settings.json.
+    Override,
+    /// Found in the user cache or embedded baseline catalogue.
+    Catalogue,
+    /// No catalogue match — using provider default or global fallback.
+    Fallback,
+}
+
+impl ContextSource {
+    /// `true` for sizes the user can trust (override or catalogue),
+    /// `false` for fallbacks. Used to gate the "no catalogue entry"
+    /// warning in the `/model` switch flow.
+    pub fn is_known(self) -> bool {
+        matches!(self, Self::Override | Self::Catalogue)
+    }
 }
 
 impl EffectiveCatalogue {
@@ -211,7 +250,12 @@ impl EffectiveCatalogue {
         let cache = cache_path()
             .and_then(|p| std::fs::read_to_string(&p).ok())
             .and_then(|s| Catalogue::from_json_str(&s));
-        Self { cache, baseline }
+        let overrides = load_overrides_from_settings();
+        Self {
+            cache,
+            baseline,
+            overrides,
+        }
     }
 
     /// Two-tier exact lookup. Returns `None` if neither layer has the
@@ -225,6 +269,73 @@ impl EffectiveCatalogue {
         self.baseline.lookup_context(model)
     }
 
+    /// Look up an override for `model`, applying the same alias and
+    /// prefix-strip rules the catalogue uses. Override keys may be
+    /// `provider/model` (preferred) or bare `model` — both forms are
+    /// tried for each candidate. Aliases resolve both directions:
+    /// forward (alias → canonical) when the user types an alias, and
+    /// reverse (canonical → alias) so an override keyed by the friendly
+    /// name still wins after a `/models refresh` rotates the canonical id.
+    pub fn lookup_override(&self, model: &str) -> Option<u32> {
+        if self.overrides.is_empty() {
+            return None;
+        }
+        let kind_name = crate::providers::ProviderKind::detect(model).map(provider_kind_name);
+        let mut candidates: Vec<String> = vec![model.to_string()];
+        // Forward alias: alias-keyed input → canonical id.
+        if let Some(c) = &self.cache {
+            let resolved = c.resolve_alias(model);
+            if resolved != model && !candidates.iter().any(|s| s == resolved) {
+                candidates.push(resolved.to_string());
+            }
+        }
+        let resolved = self.baseline.resolve_alias(model);
+        if resolved != model && !candidates.iter().any(|s| s == resolved) {
+            candidates.push(resolved.to_string());
+        }
+        // Reverse alias: canonical-keyed input → any alias whose value
+        // matches. Lets an override written as `anthropic/claude-sonnet-4-6`
+        // still apply to a config that's been pinned to the dated variant.
+        let cache_aliases = self.cache.as_ref().map(|c| &c.aliases);
+        for table in [Some(&self.baseline.aliases), cache_aliases]
+            .into_iter()
+            .flatten()
+        {
+            for (alias, canonical) in table {
+                if canonical == model && !candidates.iter().any(|s| s == alias) {
+                    candidates.push(alias.clone());
+                }
+            }
+        }
+        // Add prefix-stripped variants of every candidate, in order.
+        let mut all: Vec<String> = Vec::new();
+        for c in &candidates {
+            all.push(c.clone());
+            let mut rem = c.as_str();
+            while let Some(idx) = rem.find('/') {
+                rem = &rem[idx + 1..];
+                if !all.iter().any(|s| s == rem) {
+                    all.push(rem.to_string());
+                }
+            }
+        }
+        for id in &all {
+            if let Some(name) = kind_name {
+                if let Some(e) = self.overrides.get(&format!("{name}/{id}")) {
+                    if let Some(n) = e.context {
+                        return Some(n);
+                    }
+                }
+            }
+            if let Some(e) = self.overrides.get(id) {
+                if let Some(n) = e.context {
+                    return Some(n);
+                }
+            }
+        }
+        None
+    }
+
     pub fn provider_default(&self, provider: &str) -> Option<u32> {
         self.cache
             .as_ref()
@@ -234,6 +345,9 @@ impl EffectiveCatalogue {
 
     /// Merged model listing for one provider — baseline rows plus user-cache
     /// rows, with cache winning on metadata when the same id appears in both.
+    /// Override rows for the same provider are folded in last (override wins
+    /// on `context`, plus a synthetic `source: "override"` is stamped so
+    /// callers can render an override marker).
     /// Returns `(id, entry)` pairs sorted by id. Consumed by the `/models`
     /// slash command to render a catalogue-based list instead of hitting the
     /// provider's live `/v1/models` endpoint.
@@ -251,6 +365,34 @@ impl EffectiveCatalogue {
                 }
             }
         }
+        // Fold matching overrides on top. Keys are `provider/model_id`; a
+        // bare-id key without `/` doesn't get folded into a per-provider
+        // listing (it isn't scoped to one provider).
+        let prefix = format!("{provider}/");
+        for (key, entry) in &self.overrides {
+            let Some(id) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            let merged = match out.remove(id) {
+                Some(mut existing) => {
+                    if let Some(n) = entry.context {
+                        existing.context = Some(n);
+                    }
+                    if let Some(n) = entry.max_output {
+                        existing.max_output = Some(n);
+                    }
+                    existing.source = Some("override".to_string());
+                    existing
+                }
+                None => ModelEntry {
+                    context: entry.context,
+                    max_output: entry.max_output,
+                    source: Some("override".to_string()),
+                    verified_at: None,
+                },
+            };
+            out.insert(id.to_string(), merged);
+        }
         let mut rows: Vec<(String, ModelEntry)> = out.into_iter().collect();
         rows.sort_by(|a, b| a.0.cmp(&b.0));
         rows
@@ -265,28 +407,165 @@ impl EffectiveCatalogue {
     }
 }
 
-/// Resolve the effective context window for `model`. Falls back in
-/// order: user cache → baseline → provider default → global fallback.
-/// `known_in_catalogue` returns `false` when the value is a
-/// provider-default or global-fallback — callers can use that to
-/// nudge the user toward `/models refresh`.
+/// Resolve the effective context window for `model`. Layered fallback:
+/// user override → user cache → baseline → provider default → global
+/// fallback. The returned `ContextSource` distinguishes override hits
+/// from catalogue hits and from fallbacks — callers (e.g. `/models`
+/// rendering, the no-catalogue-entry warning) use it to decide when to
+/// nudge the user.
 pub fn effective_context_window(model: &str) -> u32 {
     effective_context_window_with(&EffectiveCatalogue::load(), model).0
 }
 
-pub fn effective_context_window_with(cat: &EffectiveCatalogue, model: &str) -> (u32, bool) {
+pub fn effective_context_window_with(
+    cat: &EffectiveCatalogue,
+    model: &str,
+) -> (u32, ContextSource) {
+    if let Some(n) = cat.lookup_override(model) {
+        return (n, ContextSource::Override);
+    }
     if let Some(n) = cat.lookup_exact(model) {
-        return (n, true);
+        return (n, ContextSource::Catalogue);
     }
     let provider_name = crate::providers::ProviderKind::detect(model)
         .map(|k| provider_kind_name(k))
         .unwrap_or("");
     if !provider_name.is_empty() {
         if let Some(n) = cat.provider_default(provider_name) {
-            return (n, false);
+            return (n, ContextSource::Fallback);
         }
     }
-    (cat.fallback(), false)
+    (cat.fallback(), ContextSource::Fallback)
+}
+
+/// Read `modelOverrides` blocks from project + user `settings.json`,
+/// project wins per-key. Standalone (no `crate::config` dep) so the
+/// catalogue stays leaf-level in the dep graph. Schema:
+///
+/// ```json
+/// {
+///   "modelOverrides": {
+///     "anthropic/claude-sonnet-4-6": { "context": 200000, "maxOutput": 32768 }
+///   }
+/// }
+/// ```
+pub fn load_overrides_from_settings() -> HashMap<String, ModelEntry> {
+    let mut out: HashMap<String, ModelEntry> = HashMap::new();
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Some(home) = crate::util::home_dir() {
+        paths.push(home.join(".config/thclaws/settings.json"));
+    }
+    let project_root = std::env::var("THCLAWS_PROJECT_ROOT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok());
+    if let Some(root) = project_root {
+        paths.push(root.join(".thclaws").join("settings.json"));
+    }
+    for path in &paths {
+        let Ok(s) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(v): std::result::Result<serde_json::Value, _> = serde_json::from_str(&s) else {
+            continue;
+        };
+        let Some(obj) = v.get("modelOverrides").and_then(|m| m.as_object()) else {
+            continue;
+        };
+        for (k, raw) in obj {
+            let entry = ModelEntry {
+                context: raw
+                    .get("context")
+                    .and_then(|c| c.as_u64())
+                    .map(|n| n as u32),
+                max_output: raw
+                    .get("maxOutput")
+                    .and_then(|c| c.as_u64())
+                    .map(|n| n as u32),
+                source: Some("override".to_string()),
+                verified_at: None,
+            };
+            // Project (read second) wins per-key.
+            out.insert(k.clone(), entry);
+        }
+    }
+    out
+}
+
+/// Write or remove a `modelOverrides` entry in project or user
+/// `settings.json`, preserving every other field. `entry: None` clears
+/// the key. Returns the path written to.
+pub fn save_override(
+    key: &str,
+    entry: Option<ModelEntry>,
+    scope: OverrideScope,
+) -> Result<PathBuf, RefreshError> {
+    let path = match scope {
+        OverrideScope::User => {
+            let home = crate::util::home_dir().ok_or(RefreshError::NoHome)?;
+            home.join(".config/thclaws/settings.json")
+        }
+        OverrideScope::Project => {
+            let root = std::env::var("THCLAWS_PROJECT_ROOT")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| std::env::current_dir().ok())
+                .ok_or(RefreshError::NoHome)?;
+            root.join(".thclaws").join("settings.json")
+        }
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| RefreshError::Io(e.to_string()))?;
+    }
+    let mut root: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !root.is_object() {
+        root = serde_json::json!({});
+    }
+    let overrides = root
+        .as_object_mut()
+        .unwrap()
+        .entry("modelOverrides".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !overrides.is_object() {
+        *overrides = serde_json::json!({});
+    }
+    let map = overrides.as_object_mut().unwrap();
+    match entry {
+        Some(e) => {
+            let mut row = serde_json::Map::new();
+            if let Some(n) = e.context {
+                row.insert("context".to_string(), serde_json::json!(n));
+            }
+            if let Some(n) = e.max_output {
+                row.insert("maxOutput".to_string(), serde_json::json!(n));
+            }
+            map.insert(key.to_string(), serde_json::Value::Object(row));
+        }
+        None => {
+            map.remove(key);
+            if map.is_empty() {
+                root.as_object_mut().unwrap().remove("modelOverrides");
+            }
+        }
+    }
+    let body = serde_json::to_string_pretty(&root).map_err(|e| RefreshError::Io(e.to_string()))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body).map_err(|e| RefreshError::Io(e.to_string()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| RefreshError::Io(e.to_string()))?;
+    Ok(path)
+}
+
+/// Where a `modelOverrides` write lands: user-global (most cases) or
+/// scoped to the current project's `.thclaws/settings.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverrideScope {
+    User,
+    Project,
 }
 
 /// Stable short identifier matching the `provider` field in the
@@ -304,8 +583,12 @@ pub fn provider_kind_name(k: crate::providers::ProviderKind) -> &'static str {
         ProviderKind::Gemini => "gemini",
         ProviderKind::Ollama => "ollama",
         ProviderKind::OllamaAnthropic => "ollama-anthropic",
+        ProviderKind::OllamaCloud => "ollama-cloud",
         ProviderKind::DashScope => "dashscope",
         ProviderKind::AgenticPress => "agentic-press",
+        ProviderKind::ZAi => "zai",
+        ProviderKind::LMStudio => "lmstudio",
+        ProviderKind::AzureAIFoundry => "azure",
     }
 }
 
@@ -461,49 +744,44 @@ mod tests {
         assert_eq!(anth.default_context, Some(200_000));
     }
 
-    #[test]
-    fn lookup_finds_exact_model() {
-        let c = EffectiveCatalogue {
+    fn baseline_only() -> EffectiveCatalogue {
+        EffectiveCatalogue {
             cache: None,
             baseline: Catalogue::from_json_str(BASELINE_JSON).unwrap(),
-        };
-        let (n, known) = effective_context_window_with(&c, "claude-sonnet-4-6");
+            overrides: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn lookup_finds_exact_model() {
+        let c = baseline_only();
+        let (n, src) = effective_context_window_with(&c, "claude-sonnet-4-6");
         assert_eq!(n, 200_000);
-        assert!(known);
+        assert_eq!(src, ContextSource::Catalogue);
     }
 
     #[test]
     fn lookup_strips_vendor_prefix() {
-        let c = EffectiveCatalogue {
-            cache: None,
-            baseline: Catalogue::from_json_str(BASELINE_JSON).unwrap(),
-        };
-        let (n, known) =
-            effective_context_window_with(&c, "openrouter/anthropic/claude-sonnet-4-6");
+        let c = baseline_only();
+        let (n, src) = effective_context_window_with(&c, "openrouter/anthropic/claude-sonnet-4-6");
         assert_eq!(n, 200_000);
-        assert!(known);
+        assert_eq!(src, ContextSource::Catalogue);
     }
 
     #[test]
     fn lookup_falls_back_to_provider_default_and_flags_unknown() {
-        let c = EffectiveCatalogue {
-            cache: None,
-            baseline: Catalogue::from_json_str(BASELINE_JSON).unwrap(),
-        };
-        let (n, known) = effective_context_window_with(&c, "claude-future-x99");
+        let c = baseline_only();
+        let (n, src) = effective_context_window_with(&c, "claude-future-x99");
         assert_eq!(n, 200_000);
-        assert!(!known);
+        assert_eq!(src, ContextSource::Fallback);
     }
 
     #[test]
     fn lookup_falls_back_to_global_for_unknown_provider() {
-        let c = EffectiveCatalogue {
-            cache: None,
-            baseline: Catalogue::from_json_str(BASELINE_JSON).unwrap(),
-        };
-        let (n, known) = effective_context_window_with(&c, "unknown-vendor/unknown-model");
+        let c = baseline_only();
+        let (n, src) = effective_context_window_with(&c, "unknown-vendor/unknown-model");
         assert_eq!(n, GLOBAL_FALLBACK);
-        assert!(!known);
+        assert_eq!(src, ContextSource::Fallback);
     }
 
     #[test]
@@ -526,10 +804,188 @@ mod tests {
         }"#;
         let cache = Catalogue::from_json_str(cache_json);
         assert!(cache.is_some());
-        let eff = EffectiveCatalogue { cache, baseline };
-        let (n, known) = effective_context_window_with(&eff, "claude-sonnet-4-6");
+        let eff = EffectiveCatalogue {
+            cache,
+            baseline,
+            overrides: HashMap::new(),
+        };
+        let (n, src) = effective_context_window_with(&eff, "claude-sonnet-4-6");
         assert_eq!(n, 1_048_576);
-        assert!(known);
+        assert_eq!(src, ContextSource::Catalogue);
+    }
+
+    fn override_entry(context: u32) -> ModelEntry {
+        ModelEntry {
+            context: Some(context),
+            max_output: None,
+            source: Some("override".into()),
+            verified_at: None,
+        }
+    }
+
+    #[test]
+    fn override_beats_user_cache() {
+        // Same id is in both the user cache (256k) and overrides (100k).
+        // Override wins.
+        let baseline = Catalogue::from_json_str(BASELINE_JSON).unwrap();
+        let cache = Catalogue::from_json_str(
+            r#"{
+            "schema": 3,
+            "providers": {
+                "anthropic": {
+                    "default_context": 200000,
+                    "models": {
+                        "claude-sonnet-4-6": {"context": 256000}
+                    }
+                }
+            }
+        }"#,
+        );
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "anthropic/claude-sonnet-4-6".to_string(),
+            override_entry(100_000),
+        );
+        let eff = EffectiveCatalogue {
+            cache,
+            baseline,
+            overrides,
+        };
+        let (n, src) = effective_context_window_with(&eff, "claude-sonnet-4-6");
+        assert_eq!(n, 100_000);
+        assert_eq!(src, ContextSource::Override);
+    }
+
+    #[test]
+    fn override_resolves_alias() {
+        // `claude-sonnet-4-6` is an alias for the dated variant. Override
+        // is keyed against the alias (the form the user typed) and still
+        // wins for the dated lookup.
+        let json = r#"{
+            "schema": 3,
+            "providers": {
+                "anthropic": {
+                    "default_context": 200000,
+                    "models": {
+                        "claude-sonnet-4-6-20261001": {"context": 200000}
+                    }
+                }
+            },
+            "aliases": {
+                "claude-sonnet-4-6": "claude-sonnet-4-6-20261001"
+            }
+        }"#;
+        let baseline = Catalogue::from_json_str(json).unwrap();
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "anthropic/claude-sonnet-4-6".to_string(),
+            override_entry(50_000),
+        );
+        let eff = EffectiveCatalogue {
+            cache: None,
+            baseline,
+            overrides,
+        };
+        let (n, src) = effective_context_window_with(&eff, "claude-sonnet-4-6-20261001");
+        assert_eq!(n, 50_000);
+        assert_eq!(src, ContextSource::Override);
+    }
+
+    #[test]
+    fn override_strips_vendor_prefix() {
+        // `openrouter/anthropic/claude-sonnet-4-6` should match an
+        // override keyed `anthropic/claude-sonnet-4-6` once the
+        // outermost `openrouter/` prefix is stripped.
+        let baseline = Catalogue::from_json_str(BASELINE_JSON).unwrap();
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "anthropic/claude-sonnet-4-6".to_string(),
+            override_entry(64_000),
+        );
+        let eff = EffectiveCatalogue {
+            cache: None,
+            baseline,
+            overrides,
+        };
+        let (n, src) =
+            effective_context_window_with(&eff, "openrouter/anthropic/claude-sonnet-4-6");
+        assert_eq!(n, 64_000);
+        assert_eq!(src, ContextSource::Override);
+    }
+
+    #[test]
+    fn override_removal_falls_back_to_catalogue() {
+        // Empty override map → catalogue layer wins as before.
+        let eff = baseline_only();
+        let (n, src) = effective_context_window_with(&eff, "claude-sonnet-4-6");
+        assert_eq!(n, 200_000);
+        assert_eq!(src, ContextSource::Catalogue);
+    }
+
+    #[test]
+    fn override_can_exceed_catalogue_value() {
+        // Trust + warn policy: override wins even when above the
+        // catalogue value. (Caller surfaces a warning at save-time.)
+        let baseline = Catalogue::from_json_str(BASELINE_JSON).unwrap();
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "anthropic/claude-sonnet-4-6".to_string(),
+            override_entry(2_000_000),
+        );
+        let eff = EffectiveCatalogue {
+            cache: None,
+            baseline,
+            overrides,
+        };
+        let (n, src) = effective_context_window_with(&eff, "claude-sonnet-4-6");
+        assert_eq!(n, 2_000_000);
+        assert_eq!(src, ContextSource::Override);
+    }
+
+    #[test]
+    fn bare_model_override_key_works() {
+        // Key without a `provider/` prefix matches when the bare id
+        // equals the input (or any prefix-stripped form of it).
+        let baseline = Catalogue::from_json_str(BASELINE_JSON).unwrap();
+        let mut overrides = HashMap::new();
+        overrides.insert("claude-sonnet-4-6".to_string(), override_entry(80_000));
+        let eff = EffectiveCatalogue {
+            cache: None,
+            baseline,
+            overrides,
+        };
+        let (n, src) = effective_context_window_with(&eff, "claude-sonnet-4-6");
+        assert_eq!(n, 80_000);
+        assert_eq!(src, ContextSource::Override);
+    }
+
+    #[test]
+    fn list_models_marks_override_rows() {
+        let baseline = Catalogue::from_json_str(
+            r#"{
+            "schema": 3,
+            "providers": {
+                "ollama": {
+                    "default_context": 8192,
+                    "models": {
+                        "ollama/llama3.2": {"context": 8192, "source": "baseline"}
+                    }
+                }
+            }
+        }"#,
+        )
+        .unwrap();
+        let mut overrides = HashMap::new();
+        overrides.insert("ollama/ollama/llama3.2".to_string(), override_entry(32_768));
+        let eff = EffectiveCatalogue {
+            cache: None,
+            baseline,
+            overrides,
+        };
+        let rows = eff.list_models_for_provider("ollama");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.context, Some(32_768));
+        assert_eq!(rows[0].1.source.as_deref(), Some("override"));
     }
 
     #[test]
@@ -576,7 +1032,11 @@ mod tests {
             }
         }"#,
         );
-        let eff = EffectiveCatalogue { cache, baseline };
+        let eff = EffectiveCatalogue {
+            cache,
+            baseline,
+            overrides: HashMap::new(),
+        };
         let rows = eff.list_models_for_provider("ollama");
         // Two distinct ids, sorted alphabetically.
         let ids: Vec<&str> = rows.iter().map(|(id, _)| id.as_str()).collect();
@@ -614,10 +1074,11 @@ mod tests {
         let eff = EffectiveCatalogue {
             cache: None,
             baseline: c,
+            overrides: HashMap::new(),
         };
-        let (n, known) = effective_context_window_with(&eff, "qwen3-0.6b");
+        let (n, src) = effective_context_window_with(&eff, "qwen3-0.6b");
         assert_eq!(n, 131072); // from dashscope.default_context
-        assert!(!known); // provider-default, not a verified entry
+        assert_eq!(src, ContextSource::Fallback); // provider-default, not a verified entry
     }
 
     #[test]

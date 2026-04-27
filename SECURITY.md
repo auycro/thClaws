@@ -6,14 +6,24 @@ Only the latest minor release of thClaws receives security updates. Older versio
 
 | Version | Supported |
 |---|---|
-| 0.2.x | ✅ |
-| < 0.2 | ❌ |
+| 0.3.x | ✅ |
+| < 0.3 | ❌ |
 
 ## Reporting a vulnerability
 
-Please **do not open a public GitHub issue** for security vulnerabilities. Instead:
+Please **do not open a public GitHub issue** for security vulnerabilities. Use one of these private channels:
 
-📧 Email **security@thaigpt.com** with:
+### Preferred: GitHub Private Vulnerability Reporting
+
+[**Open a private security advisory →**](https://github.com/thClaws/thClaws/security/advisories/new)
+
+Reports filed through this form become draft GitHub Security Advisories — private by default, with built-in collaboration on the fix and one-click CVE publishing when we coordinate disclosure.
+
+### Alternate: Email
+
+📧 **security@thaigpt.com** — for researchers who prefer email or use PGP.
+
+Whichever channel you choose, please include:
 
 - A clear description of the vulnerability
 - Steps to reproduce (minimal proof-of-concept preferred)

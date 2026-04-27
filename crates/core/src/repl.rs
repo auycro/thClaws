@@ -13,7 +13,7 @@ use crate::memory::MemoryStore;
 use crate::permissions::{PermissionMode, ReplApprover};
 use crate::providers::{
     anthropic::AnthropicProvider, gemini::GeminiProvider, ollama::OllamaProvider,
-    openai::OpenAIProvider, Provider, ProviderKind,
+    ollama_cloud::OllamaCloudProvider, openai::OpenAIProvider, Provider, ProviderKind,
 };
 use crate::session::{Session, SessionStore};
 use crate::subagent::{AgentFactory, SubAgentTool};
@@ -42,6 +42,22 @@ pub enum SlashCommand {
     /// update the local cache. Used by the `/models refresh` UI path
     /// and by the daily auto-refresh background task.
     ModelsRefresh,
+    /// Set a per-`provider/model` user override for context window.
+    /// Defaults to user-global scope (`~/.config/thclaws/settings.json`);
+    /// `--project` scopes to `.thclaws/settings.json` of the current
+    /// working directory. Override wins over every catalogue layer at
+    /// lookup time.
+    ModelsSetContext {
+        key: String,
+        size: u32,
+        project: bool,
+    },
+    /// Remove a `provider/model` override. Falls back to whatever the
+    /// next catalogue layer says.
+    ModelsUnsetContext {
+        key: String,
+        project: bool,
+    },
     Provider(String),
     Providers,
     Config {
@@ -258,6 +274,91 @@ fn parse_mcp_subcommand(args: &str) -> SlashCommand {
     }
 }
 
+/// Parse `/models [refresh|set-context|unset-context ...]`.
+/// - `/models` → list (current behaviour)
+/// - `/models refresh` → refetch catalogue
+/// - `/models set-context [--project] <provider/model> <size>`
+/// - `/models unset-context [--project] <provider/model>`
+fn parse_models_subcommand(args: &str) -> SlashCommand {
+    let args = args.trim();
+    if args.is_empty() {
+        return SlashCommand::Models;
+    }
+    let (sub, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+    match sub {
+        "refresh" => SlashCommand::ModelsRefresh,
+        "set-context" => {
+            let mut parts: Vec<&str> = rest.split_whitespace().collect();
+            let mut project = false;
+            if parts.first().copied() == Some("--project") {
+                project = true;
+                parts.remove(0);
+            } else if parts.first().copied() == Some("--user") {
+                parts.remove(0);
+            }
+            match parts.as_slice() {
+                [key, size] => match parse_size(size) {
+                    Some(n) => SlashCommand::ModelsSetContext {
+                        key: (*key).to_string(),
+                        size: n,
+                        project,
+                    },
+                    None => SlashCommand::Unknown(format!(
+                        "/models set-context: invalid size '{size}' (try 128000 or 128k)"
+                    )),
+                },
+                _ => SlashCommand::Unknown(
+                    "usage: /models set-context [--project] <provider/model> <size>".into(),
+                ),
+            }
+        }
+        "unset-context" => {
+            let mut parts: Vec<&str> = rest.split_whitespace().collect();
+            let mut project = false;
+            if parts.first().copied() == Some("--project") {
+                project = true;
+                parts.remove(0);
+            } else if parts.first().copied() == Some("--user") {
+                parts.remove(0);
+            }
+            match parts.as_slice() {
+                [key] => SlashCommand::ModelsUnsetContext {
+                    key: (*key).to_string(),
+                    project,
+                },
+                _ => SlashCommand::Unknown(
+                    "usage: /models unset-context [--project] <provider/model>".into(),
+                ),
+            }
+        }
+        other => SlashCommand::Unknown(format!(
+            "unknown /models subcommand: '{other}' (try /models, /models refresh, /models set-context, /models unset-context)"
+        )),
+    }
+}
+
+/// Parse a token-count argument that accepts plain digits ("128000") or
+/// a `k`/`m` suffix ("128k", "1m"). Case-insensitive on the suffix.
+fn parse_size(s: &str) -> Option<u32> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (num, mult) = if let Some(rest) = s.strip_suffix(['k', 'K']) {
+        (rest, 1_000u64)
+    } else if let Some(rest) = s.strip_suffix(['m', 'M']) {
+        (rest, 1_000_000u64)
+    } else {
+        (s, 1u64)
+    };
+    let n: u64 = num.parse().ok()?;
+    let total = n.checked_mul(mult)?;
+    if total == 0 || total > u32::MAX as u64 {
+        return None;
+    }
+    Some(total as u32)
+}
+
 /// Default model to select when switching provider by name only.
 /// Thin wrapper around `ProviderKind::from_name` + `default_model` for
 /// backward-compat tests and REPL call sites that already use `&str`.
@@ -282,13 +383,7 @@ pub fn parse_slash(input: &str) -> Option<SlashCommand> {
         "clear" => SlashCommand::Clear,
         "history" => SlashCommand::History,
         "model" => SlashCommand::Model(args.to_string()),
-        "models" => match args.trim() {
-            "refresh" => SlashCommand::ModelsRefresh,
-            "" => SlashCommand::Models,
-            other => SlashCommand::Unknown(format!(
-                "unknown /models subcommand: '{other}' (try /models or /models refresh)"
-            )),
-        },
+        "models" => parse_models_subcommand(args),
         "provider" => SlashCommand::Provider(args.to_string()),
         "providers" => SlashCommand::Providers,
         "config" => match args.split_once('=') {
@@ -482,6 +577,72 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
     }
 }
 
+/// One built-in slash command, surfaced to the GUI's `/` popup so it can
+/// render an autocomplete list grouped by `category`.
+///
+/// Keep this list in lock-step with the `parse_slash` arms in this file
+/// and the dispatch arms in `shell_dispatch.rs`. Help text is the
+/// single-line summary shown next to the name in the popup; longer
+/// usage syntax (e.g. flags, sub-commands) goes in `usage` so the
+/// popup can render it as dim trailing text.
+pub struct BuiltInCommand {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub category: &'static str,
+    /// Optional argument hint, e.g. `"NAME"` for `/model NAME`. Empty
+    /// when the command takes no arguments.
+    pub usage: &'static str,
+}
+
+// Hand-aligned struct-literal table — keeping the columns reads well at a
+// glance and rustfmt's exploded form (~6 lines per row) bloats the function
+// to >180 lines for the same content. Skip for the table only.
+#[rustfmt::skip]
+pub fn built_in_commands() -> &'static [BuiltInCommand] {
+    &[
+        // Session
+        BuiltInCommand { name: "clear",    description: "Clear conversation history",                 category: "Session", usage: "" },
+        BuiltInCommand { name: "compact",  description: "Compact history (drop oldest, keep recent)", category: "Session", usage: "" },
+        BuiltInCommand { name: "fork",     description: "Save + start a new session seeded with a summary", category: "Session", usage: "" },
+        BuiltInCommand { name: "save",     description: "Force-save the current session",             category: "Session", usage: "" },
+        BuiltInCommand { name: "load",     description: "Load a saved session by id or name",         category: "Session", usage: "ID|NAME" },
+        BuiltInCommand { name: "sessions", description: "List saved sessions",                        category: "Session", usage: "" },
+        BuiltInCommand { name: "rename",   description: "Rename the current session",                 category: "Session", usage: "NAME" },
+        BuiltInCommand { name: "history",  description: "Print message-history summary",              category: "Session", usage: "" },
+
+        // Model
+        BuiltInCommand { name: "model",     description: "Show or switch the current model",          category: "Model", usage: "[NAME]" },
+        BuiltInCommand { name: "models",    description: "List models from the current provider",     category: "Model", usage: "" },
+        BuiltInCommand { name: "provider",  description: "Switch provider to its default model",      category: "Model", usage: "NAME" },
+        BuiltInCommand { name: "providers", description: "List all supported providers",              category: "Model", usage: "" },
+        BuiltInCommand { name: "thinking",  description: "Set extended-thinking token budget",        category: "Model", usage: "BUDGET" },
+        BuiltInCommand { name: "permissions", description: "Show or set the permission mode",         category: "Model", usage: "[auto|ask]" },
+
+        // Context / memory / knowledge
+        BuiltInCommand { name: "context",  description: "Show context-window usage breakdown",        category: "Context", usage: "" },
+        BuiltInCommand { name: "memory",   description: "List memory entries",                        category: "Context", usage: "" },
+        BuiltInCommand { name: "kms",      description: "List knowledge bases",                       category: "Context", usage: "" },
+
+        // Skills, plugins, MCP
+        BuiltInCommand { name: "skills",   description: "List installed skills",                      category: "Extensions", usage: "" },
+        BuiltInCommand { name: "plugins",  description: "List installed plugins",                     category: "Extensions", usage: "" },
+        BuiltInCommand { name: "mcp",      description: "List active MCP servers and their tools",    category: "Extensions", usage: "" },
+
+        // Team
+        BuiltInCommand { name: "team",     description: "Show team agent status",                     category: "Team", usage: "" },
+        BuiltInCommand { name: "tasks",    description: "List current tasks/todos",                   category: "Team", usage: "" },
+
+        // System
+        BuiltInCommand { name: "help",     description: "Show this help",                             category: "System", usage: "" },
+        BuiltInCommand { name: "version",  description: "Show version",                               category: "System", usage: "" },
+        BuiltInCommand { name: "cwd",      description: "Show current working directory",             category: "System", usage: "" },
+        BuiltInCommand { name: "usage",    description: "Show token usage by provider and model",     category: "System", usage: "" },
+        BuiltInCommand { name: "doctor",   description: "Run diagnostics",                            category: "System", usage: "" },
+        BuiltInCommand { name: "config",   description: "Set a config value (session-only)",          category: "System", usage: "key=value" },
+        BuiltInCommand { name: "quit",     description: "Exit",                                       category: "System", usage: "" },
+    ]
+}
+
 pub fn render_help() -> &'static str {
     "Slash commands:\n  \
      /help             Show this help\n  \
@@ -551,6 +712,27 @@ pub fn render_help() -> &'static str {
 pub fn build_provider(config: &AppConfig) -> Result<Arc<dyn Provider>> {
     let kind = config.detect_provider_kind()?;
 
+    // Org policy gateway (EE Phase 3): when policies.gateway.enabled and
+    // this provider should route through the gateway, replace the entire
+    // provider with an OpenAI-compatible client pointing at the gateway
+    // URL. The gateway (LiteLLM, Portkey, etc.) handles upstream routing
+    // based on the model id and applies its own auth. User's per-provider
+    // API keys are deliberately ignored — gateway owns credentials.
+    if crate::providers::gateway::should_route(kind) {
+        if let Some(url) = crate::providers::gateway::gateway_url() {
+            let chat_url = if url.ends_with("/chat/completions") {
+                url
+            } else {
+                format!("{}/chat/completions", url.trim_end_matches('/'))
+            };
+            // The gateway's auth header replaces normal Bearer-with-key.
+            // Empty string is fine — OpenAIProvider always sends some
+            // Authorization, and gateways without auth ignore it.
+            let auth = crate::providers::gateway::resolve_auth_header().unwrap_or_default();
+            return Ok(Arc::new(OpenAIProvider::new(auth).with_base_url(chat_url)));
+        }
+    }
+
     // Auth-less providers build directly.
     match kind {
         ProviderKind::AgentSdk => {
@@ -573,6 +755,25 @@ pub fn build_provider(config: &AppConfig) -> Result<Arc<dyn Provider>> {
             let url = format!("{}/v1/messages", base.trim_end_matches('/'));
             return Ok(Arc::new(
                 AnthropicProvider::new("ollama").with_base_url(url),
+            ));
+        }
+        ProviderKind::LMStudio => {
+            // LMStudio is OpenAI-compatible at /v1 with no auth. Default
+            // base http://localhost:1234/v1; user-configurable via the
+            // Settings UI or LMSTUDIO_BASE_URL env. Pass a dummy bearer
+            // token — LMStudio ignores Authorization but the OpenAI
+            // client always sends one.
+            let base = std::env::var("LMSTUDIO_BASE_URL")
+                .unwrap_or_else(|_| "http://localhost:1234/v1".to_string());
+            let url = if base.ends_with("/chat/completions") {
+                base
+            } else {
+                format!("{}/chat/completions", base.trim_end_matches('/'))
+            };
+            return Ok(Arc::new(
+                OpenAIProvider::new("lm-studio".to_string())
+                    .with_base_url(url)
+                    .with_strip_model_prefix("lmstudio/"),
             ));
         }
         _ => {}
@@ -621,9 +822,45 @@ pub fn build_provider(config: &AppConfig) -> Result<Arc<dyn Provider>> {
             };
             Ok(Arc::new(OpenAIProvider::new(api_key).with_base_url(url)))
         }
-        ProviderKind::Ollama | ProviderKind::OllamaAnthropic | ProviderKind::AgentSdk => {
+        ProviderKind::ZAi => {
+            // Z.ai GLM Coding Plan endpoint. Models use `zai/<id>` form
+            // (e.g. zai/glm-4.6). Strip the prefix before forwarding to
+            // the OpenAI-compatible upstream. Power users with the
+            // general BigModel SKU (https://open.bigmodel.cn/api/paas/v4)
+            // can override via ZAI_BASE_URL.
+            let base = std::env::var("ZAI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.z.ai/api/coding/paas/v4".to_string());
+            let url = if base.ends_with("/chat/completions") {
+                base
+            } else {
+                format!("{}/chat/completions", base.trim_end_matches('/'))
+            };
+            Ok(Arc::new(
+                OpenAIProvider::new(api_key)
+                    .with_base_url(url)
+                    .with_strip_model_prefix("zai/"),
+            ))
+        }
+        ProviderKind::AzureAIFoundry => {
+            let endpoint = std::env::var("AZURE_AI_FOUNDRY_ENDPOINT").map_err(|_| {
+                Error::Config(
+                    "AZURE_AI_FOUNDRY_ENDPOINT not set — add it in Settings or export the env var"
+                        .into(),
+                )
+            })?;
+            let base = endpoint.trim_end_matches('/');
+            let messages_url = format!("{base}/anthropic/v1/messages");
+            Ok(Arc::new(
+                AnthropicProvider::new(api_key).with_base_url(messages_url),
+            ))
+        }
+        ProviderKind::Ollama
+        | ProviderKind::OllamaAnthropic
+        | ProviderKind::LMStudio
+        | ProviderKind::AgentSdk => {
             unreachable!("handled above")
         }
+        ProviderKind::OllamaCloud => Ok(Arc::new(OllamaCloudProvider::new(api_key))),
     }
 }
 
@@ -678,8 +915,10 @@ pub async fn build_provider_with_fallback(
         ProviderKind::OpenRouter,
         ProviderKind::Gemini,
         ProviderKind::DashScope,
+        ProviderKind::ZAi,
         ProviderKind::Ollama,
         ProviderKind::OllamaAnthropic,
+        ProviderKind::OllamaCloud,
     ];
     let ollama_alive = ollama_is_reachable().await;
     for kind in fallback_order {
@@ -1267,14 +1506,14 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
     };
     let v = crate::version::info();
     let dirty_tag = if v.git_dirty { "+dirty" } else { "" };
+    let brand = crate::branding::current();
     if team_agent_name.is_none() {
-        const BANNER: &str = include_str!("../../../banner.txt");
-        println!("\n{COLOR_CYAN}{BANNER}{COLOR_RESET}");
+        println!("\n{COLOR_CYAN}{}{COLOR_RESET}", brand.banner_text);
         println!();
     }
     println!(
-        "{COLOR_BOLD}thClaws {}{COLOR_RESET} {COLOR_DIM}({}{}) — model: {} · permissions: {} · session: {}{COLOR_RESET}",
-        v.version, v.git_sha, dirty_tag, config.model, perm_label, session.id
+        "{COLOR_BOLD}{} {}{COLOR_RESET} {COLOR_DIM}({}{}) — model: {} · permissions: {} · session: {}{COLOR_RESET}",
+        brand.name, v.version, v.git_sha, dirty_tag, config.model, perm_label, session.id
     );
     if let Some(ref name) = team_agent_name {
         println!(
@@ -1868,7 +2107,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         continue;
                     }
                     // Resolve short aliases ("sonnet" → "claude-sonnet-4-6",
-                    // "flash" → "gemini-2.0-flash", etc.) to the canonical
+                    // "flash" → "gemini-2.5-flash", etc.) to the canonical
                     // model id. Otherwise we'd persist "sonnet" and hand it
                     // straight to the Anthropic API, which replies
                     // `not_found_error: model: sonnet`.
@@ -2022,6 +2261,55 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         Err(e) => println!(
                             "{COLOR_YELLOW}catalogue refresh failed: {e}{COLOR_RESET}"
                         ),
+                    }
+                }
+                SlashCommand::ModelsSetContext { key, size, project } => {
+                    let scope = if project {
+                        crate::model_catalogue::OverrideScope::Project
+                    } else {
+                        crate::model_catalogue::OverrideScope::User
+                    };
+                    let entry = crate::model_catalogue::ModelEntry {
+                        context: Some(size),
+                        max_output: None,
+                        source: Some("override".into()),
+                        verified_at: None,
+                    };
+                    // Compare against catalogue value before saving so we
+                    // can warn when the override exceeds it (trust + warn).
+                    let cat = crate::model_catalogue::EffectiveCatalogue::load();
+                    let warn = cat.lookup_exact(&key).map(|n| size > n).unwrap_or(false);
+                    match crate::model_catalogue::save_override(&key, Some(entry), scope) {
+                        Ok(path) => {
+                            println!(
+                                "{COLOR_DIM}override → {key}: {size} tokens (saved to {}){COLOR_RESET}",
+                                path.display()
+                            );
+                            if warn {
+                                println!(
+                                    "{COLOR_YELLOW}warning: override exceeds catalogue value — provider may reject{COLOR_RESET}"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            println!("{COLOR_YELLOW}set-context failed: {e}{COLOR_RESET}")
+                        }
+                    }
+                }
+                SlashCommand::ModelsUnsetContext { key, project } => {
+                    let scope = if project {
+                        crate::model_catalogue::OverrideScope::Project
+                    } else {
+                        crate::model_catalogue::OverrideScope::User
+                    };
+                    match crate::model_catalogue::save_override(&key, None, scope) {
+                        Ok(path) => println!(
+                            "{COLOR_DIM}override removed for {key} (in {}){COLOR_RESET}",
+                            path.display()
+                        ),
+                        Err(e) => {
+                            println!("{COLOR_YELLOW}unset-context failed: {e}{COLOR_RESET}")
+                        }
                     }
                 }
                 SlashCommand::Models => {
@@ -2452,7 +2740,8 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                                 plugin.path.display()
                             );
                             println!(
-                                "{COLOR_YELLOW}restart thClaws to activate the plugin's skills / commands / MCP servers{COLOR_RESET}"
+                                "{COLOR_YELLOW}restart {} to activate the plugin's skills / commands / MCP servers{COLOR_RESET}",
+                                crate::branding::current().name
                             );
                         }
                         Err(e) => {
@@ -2747,7 +3036,10 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     );
                 }
                 SlashCommand::Doctor => {
-                    println!("{COLOR_DIM}── thClaws diagnostics ──{COLOR_RESET}");
+                    println!(
+                        "{COLOR_DIM}── {} diagnostics ──{COLOR_RESET}",
+                        crate::branding::current().name
+                    );
                     let v = crate::version::info();
                     println!("{COLOR_DIM}version:    {}{COLOR_RESET}", v.version);
                     println!(
@@ -3127,10 +3419,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                 continue;
             }
             println!("{COLOR_DIM}$ {shell_cmd}{COLOR_RESET}");
-            let status = std::process::Command::new("/bin/sh")
-                .arg("-c")
-                .arg(shell_cmd)
-                .status();
+            let status = crate::util::shell_command_sync(shell_cmd).status();
             // If the child left the cursor mid-line (e.g. `cat` on a file with
             // no trailing newline), readline's next-prompt render issues a CR
             // + clear-to-EOL and wipes whatever the child just wrote. Emit a
@@ -3494,6 +3783,77 @@ mod tests {
     #[test]
     fn parse_slash_models() {
         assert_eq!(parse_slash("/models"), Some(SlashCommand::Models));
+        assert_eq!(
+            parse_slash("/models refresh"),
+            Some(SlashCommand::ModelsRefresh)
+        );
+    }
+
+    #[test]
+    fn parse_slash_models_set_context() {
+        // Default scope is user.
+        assert_eq!(
+            parse_slash("/models set-context anthropic/claude-sonnet-4-6 200000"),
+            Some(SlashCommand::ModelsSetContext {
+                key: "anthropic/claude-sonnet-4-6".into(),
+                size: 200_000,
+                project: false,
+            })
+        );
+        // --project flag scopes to project.
+        assert_eq!(
+            parse_slash("/models set-context --project openai/gpt-4o 128000"),
+            Some(SlashCommand::ModelsSetContext {
+                key: "openai/gpt-4o".into(),
+                size: 128_000,
+                project: true,
+            })
+        );
+        // Suffix shorthand: "128k", "1m".
+        assert_eq!(
+            parse_slash("/models set-context anthropic/claude-sonnet-4-6 200k"),
+            Some(SlashCommand::ModelsSetContext {
+                key: "anthropic/claude-sonnet-4-6".into(),
+                size: 200_000,
+                project: false,
+            })
+        );
+        assert_eq!(
+            parse_slash("/models set-context anthropic/claude-opus-4-7-1m 1m"),
+            Some(SlashCommand::ModelsSetContext {
+                key: "anthropic/claude-opus-4-7-1m".into(),
+                size: 1_000_000,
+                project: false,
+            })
+        );
+        // Unset.
+        assert_eq!(
+            parse_slash("/models unset-context anthropic/claude-sonnet-4-6"),
+            Some(SlashCommand::ModelsUnsetContext {
+                key: "anthropic/claude-sonnet-4-6".into(),
+                project: false,
+            })
+        );
+        assert_eq!(
+            parse_slash("/models unset-context --project openai/gpt-4o"),
+            Some(SlashCommand::ModelsUnsetContext {
+                key: "openai/gpt-4o".into(),
+                project: true,
+            })
+        );
+        // Bad usage → Unknown with hint.
+        assert!(matches!(
+            parse_slash("/models set-context"),
+            Some(SlashCommand::Unknown(msg)) if msg.contains("usage:")
+        ));
+        assert!(matches!(
+            parse_slash("/models set-context openai/gpt-4o not-a-number"),
+            Some(SlashCommand::Unknown(msg)) if msg.contains("invalid size")
+        ));
+        assert!(matches!(
+            parse_slash("/models foo"),
+            Some(SlashCommand::Unknown(msg)) if msg.contains("unknown /models subcommand")
+        ));
     }
 
     #[test]
@@ -3630,7 +3990,7 @@ mod tests {
         assert_eq!(default_model_for_provider("openai"), Some("gpt-4o"));
         assert_eq!(
             default_model_for_provider("gemini"),
-            Some("gemini-2.0-flash")
+            Some("gemini-2.5-flash")
         );
         assert_eq!(
             default_model_for_provider("ollama"),
@@ -3704,6 +4064,56 @@ mod tests {
         }
         if let Some(v) = saved_o {
             std::env::set_var("OPENAI_API_KEY", v);
+        }
+    }
+
+    /// Regression: an exported-but-empty env var ("ANTHROPIC_API_KEY=")
+    /// must NOT count as configured. Before the fix, it did — and
+    /// auto_fallback_model in the GUI refused to switch off Anthropic
+    /// even after the user pasted a key for a different provider, because
+    /// `std::env::var(name).is_ok()` returns true for empty values.
+    /// Trace: https://github.com/thClaws/thClaws (screenshot in Thai)
+    #[test]
+    fn empty_env_var_treated_as_unset() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let saved_a = std::env::var("ANTHROPIC_API_KEY").ok();
+        let saved_g = std::env::var("GEMINI_API_KEY").ok();
+
+        // Empty Anthropic env (the bug-trigger), no Gemini env.
+        std::env::set_var("ANTHROPIC_API_KEY", "");
+        std::env::remove_var("GEMINI_API_KEY");
+
+        // api_key_from_env on a Claude model should NOT return Some("")
+        // — that produces a 401 with an empty bearer.
+        let mut cfg = AppConfig::default();
+        cfg.model = "claude-sonnet-4-6".into();
+        assert!(
+            cfg.api_key_from_env().is_none()
+                || cfg
+                    .api_key_from_env()
+                    .map(|v| !v.trim().is_empty())
+                    .unwrap_or(false),
+            "empty ANTHROPIC_API_KEY must not produce an empty Some(\"\")"
+        );
+
+        // build_provider should error pointing at the env var, same as
+        // the var-not-set case (see build_provider_honors_env_keys).
+        match build_provider(&cfg) {
+            Ok(_) => panic!("empty env var must not let build_provider succeed"),
+            Err(e) => assert!(
+                format!("{e}").contains("ANTHROPIC_API_KEY"),
+                "error should point at the missing env var, got: {e}"
+            ),
+        }
+
+        // Restore original env.
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        if let Some(v) = saved_a {
+            std::env::set_var("ANTHROPIC_API_KEY", v);
+        }
+        if let Some(v) = saved_g {
+            std::env::set_var("GEMINI_API_KEY", v);
         }
     }
 }

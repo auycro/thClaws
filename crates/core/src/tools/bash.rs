@@ -12,7 +12,6 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::process::Stdio;
 use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
@@ -203,10 +202,8 @@ async fn run_shell_command(
     timeout_ms: u64,
     is_server: bool,
 ) -> Result<String> {
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c")
-        .arg(command)
-        .stdin(Stdio::null())
+    let mut cmd = crate::util::shell_command_async(command);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .current_dir(cwd);

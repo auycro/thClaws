@@ -16,6 +16,12 @@ on:
 permissions:
   contents: write
 
+# Opt into Node 24 ahead of GitHub's 2026-06-02 forced switch, so we
+# catch action-runtime breakage on our schedule, not theirs. Drop this
+# once Node 24 is the runner default.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
 jobs:
   build:
     name: ${{ matrix.target }}
@@ -84,7 +90,7 @@ jobs:
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: crates/core
+          workspaces: .
           key: ${{ matrix.target }}
 
       - name: Install pnpm
@@ -106,13 +112,13 @@ jobs:
           pnpm run build
 
       - name: Build thclaws (GUI)
-        working-directory: crates/core
         shell: bash
+        # Run from repo root: workspace Cargo.toml at root since #2.
+        # Binary lands at ./target/<target>/release/thclaws.
         run: cargo build --release --bin thclaws --features gui --target ${{ matrix.target }}
 
       - name: Package (unix)
         if: matrix.os != 'windows'
-        working-directory: crates/core
         shell: bash
         run: |
           VERSION="${{ steps.tag.outputs.name }}"
@@ -131,7 +137,6 @@ jobs:
 
       - name: Package (windows)
         if: matrix.os == 'windows'
-        working-directory: crates/core
         shell: pwsh
         run: |
           $version = "${{ steps.tag.outputs.name }}"
@@ -147,7 +152,7 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: thclaws-${{ matrix.target }}
-          path: crates/core/dist/*
+          path: dist/*
 
   release:
     name: Publish release

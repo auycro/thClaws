@@ -390,69 +390,94 @@ impl ProjectConfig {
         let contents = std::fs::read_to_string(path).ok()?;
         let v: serde_json::Value = serde_json::from_str(&contents).ok()?;
         let servers = v.get("mcpServers").and_then(|s| s.as_object())?;
-        Some(
-            servers
-                .iter()
-                .filter_map(|(name, cfg)| {
-                    let transport = cfg
-                        .get("transport")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("stdio")
-                        .to_string();
-                    if transport == "http" {
-                        // HTTP transport: needs a URL, optional headers.
-                        let url = cfg.get("url")?.as_str()?.to_string();
-                        let headers: std::collections::HashMap<String, String> = cfg
-                            .get("headers")
-                            .and_then(|h| h.as_object())
-                            .map(|obj| {
-                                obj.iter()
-                                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        return Some(crate::mcp::McpServerConfig {
-                            name: name.clone(),
-                            transport,
-                            command: String::new(),
-                            args: Vec::new(),
-                            env: std::collections::HashMap::new(),
-                            url,
-                            headers,
-                        });
-                    }
-                    // Stdio transport: needs a command.
-                    let command = cfg.get("command")?.as_str()?.to_string();
-                    let args: Vec<String> = cfg
-                        .get("args")
-                        .and_then(|a| a.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(String::from))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let env: std::collections::HashMap<String, String> = cfg
-                        .get("env")
-                        .and_then(|e| e.as_object())
+        let parsed: Vec<crate::mcp::McpServerConfig> = servers
+            .iter()
+            .filter_map(|(name, cfg)| {
+                let transport = cfg
+                    .get("transport")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("stdio")
+                    .to_string();
+                if transport == "http" {
+                    // HTTP transport: needs a URL, optional headers.
+                    let url = cfg.get("url")?.as_str()?.to_string();
+                    let headers: std::collections::HashMap<String, String> = cfg
+                        .get("headers")
+                        .and_then(|h| h.as_object())
                         .map(|obj| {
                             obj.iter()
                                 .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
                                 .collect()
                         })
                         .unwrap_or_default();
-                    Some(crate::mcp::McpServerConfig {
+                    return Some(crate::mcp::McpServerConfig {
                         name: name.clone(),
                         transport,
-                        command,
-                        args,
-                        env,
-                        url: String::new(),
-                        headers: std::collections::HashMap::new(),
+                        command: String::new(),
+                        args: Vec::new(),
+                        env: std::collections::HashMap::new(),
+                        url,
+                        headers,
+                    });
+                }
+                // Stdio transport: needs a command.
+                let command = cfg.get("command")?.as_str()?.to_string();
+                let args: Vec<String> = cfg
+                    .get("args")
+                    .and_then(|a| a.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
                     })
+                    .unwrap_or_default();
+                let env: std::collections::HashMap<String, String> = cfg
+                    .get("env")
+                    .and_then(|e| e.as_object())
+                    .map(|obj| {
+                        obj.iter()
+                            .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some(crate::mcp::McpServerConfig {
+                    name: name.clone(),
+                    transport,
+                    command,
+                    args,
+                    env,
+                    url: String::new(),
+                    headers: std::collections::HashMap::new(),
                 })
-                .collect(),
-        )
+            })
+            .collect();
+        // Org-policy gate (Phase 2): when policies.plugins.enabled with
+        // allow_external_mcp: false, reject HTTP MCP servers whose URL
+        // host isn't in `allowed_hosts`. Stdio entries pass through —
+        // gating arbitrary stdio commands is a separate sub-policy
+        // (admin's mcp.json content = admin's responsibility).
+        let filtered: Vec<crate::mcp::McpServerConfig> = if crate::policy::external_mcp_disallowed()
+        {
+            parsed
+                .into_iter()
+                .filter(|s| {
+                    if s.transport != "http" {
+                        return true;
+                    }
+                    match crate::policy::check_url(&s.url) {
+                        crate::policy::AllowDecision::Allowed
+                        | crate::policy::AllowDecision::NoPolicy => true,
+                        crate::policy::AllowDecision::Denied { reason } => {
+                            eprintln!("\x1b[33m[mcp] '{}' skipped: {}\x1b[0m", s.name, reason);
+                            false
+                        }
+                    }
+                })
+                .collect()
+        } else {
+            parsed
+        };
+        Some(filtered)
     }
 }
 
@@ -673,20 +698,27 @@ impl AppConfig {
     pub fn api_key_from_env(&self) -> Option<String> {
         let kind = self.detect_provider_kind().ok()?;
         let var = kind.api_key_env()?;
+        // Treat an exported-but-empty env var ("ANTHROPIC_API_KEY=") as
+        // unset and fall through to the keychain. A stale shell rc or
+        // VS Code env injection can leave the var present but blank;
+        // returning Some("") from here would produce an empty bearer
+        // token and a confusing 401 on every request.
         if let Ok(value) = std::env::var(var) {
-            if std::env::var("THCLAWS_KEYCHAIN_TRACE").is_ok() {
-                eprintln!(
-                    "\x1b[35m[keychain pid={}] api_key_from_env({}) → from env {}\x1b[0m",
-                    std::process::id(),
-                    kind.name(),
-                    var
-                );
+            if !value.trim().is_empty() {
+                if std::env::var("THCLAWS_KEYCHAIN_TRACE").is_ok() {
+                    eprintln!(
+                        "\x1b[35m[keychain pid={}] api_key_from_env({}) → from env {}\x1b[0m",
+                        std::process::id(),
+                        kind.name(),
+                        var
+                    );
+                }
+                return Some(value);
             }
-            return Some(value);
         }
         if std::env::var("THCLAWS_KEYCHAIN_TRACE").is_ok() {
             eprintln!(
-                "\x1b[35m[keychain pid={}] api_key_from_env({}) → env {} unset, falling back to keychain\x1b[0m",
+                "\x1b[35m[keychain pid={}] api_key_from_env({}) → env {} unset or blank, falling back to keychain\x1b[0m",
                 std::process::id(), kind.name(), var
             );
         }

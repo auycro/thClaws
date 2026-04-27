@@ -152,9 +152,25 @@ impl Tool for ReadTool {
         // (`.png` containing JPEG, `.jpg` containing PNG). Anthropic /
         // OpenAI / Gemini all 400 when the declared media_type doesn't
         // match what the decoder sees, so we sniff and use the actual
-        // format. Sniff falling back to ext_mime preserves behavior for
-        // unrecognized-but-valid formats (rare edge cases).
-        let mime = sniff_image_mime(&bytes).unwrap_or(ext_mime);
+        // format. If the bytes don't match any of the four formats we
+        // accept, we error out cleanly here rather than shipping bytes
+        // with a guessed MIME — providers would reject them anyway,
+        // but with a less actionable error. (`image_media_type` and
+        // `sniff_image_mime` cover the same four formats, so a working
+        // image with one of these extensions is guaranteed to sniff.)
+        let mime = sniff_image_mime(&bytes).ok_or_else(|| {
+            // ext_mime is unused on this path but kept in the message
+            // for context — tells the user "you said it was X, but
+            // the bytes aren't a recognised image".
+            Error::Tool(format!(
+                "{}: bytes don't match any supported image format \
+                 (PNG/JPEG/WebP/GIF) despite extension claiming {}. \
+                 File may be corrupted, encrypted, or saved with the \
+                 wrong extension.",
+                path.display(),
+                ext_mime,
+            ))
+        })?;
 
         let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
         let summary = format!(

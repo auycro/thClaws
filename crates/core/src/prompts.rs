@@ -42,17 +42,19 @@ fn user_path(name: &str) -> Option<PathBuf> {
 }
 
 /// Load a prompt template by name. Returns the override content (project →
-/// user) if present, otherwise the built-in default string.
+/// user) if present, otherwise the built-in default string. Branding
+/// placeholders (`{product}`, `{support_email}`) are substituted before
+/// returning so any prompt — built-in default, project override, user
+/// override — picks up the active branding without per-callsite work.
 pub fn load(name: &str, default: &str) -> String {
-    if let Ok(s) = std::fs::read_to_string(project_path(name)) {
-        return s;
-    }
-    if let Some(p) = user_path(name) {
-        if let Ok(s) = std::fs::read_to_string(p) {
-            return s;
-        }
-    }
-    default.to_string()
+    let raw = if let Ok(s) = std::fs::read_to_string(project_path(name)) {
+        s
+    } else if let Some(p) = user_path(name) {
+        std::fs::read_to_string(p).unwrap_or_else(|_| default.to_string())
+    } else {
+        default.to_string()
+    };
+    crate::branding::apply_template(&raw)
 }
 
 /// Replace `{key}` occurrences with the corresponding values. Unknown
@@ -93,5 +95,34 @@ mod tests {
     fn load_falls_back_to_default_when_no_override() {
         let out = load("__nonexistent_prompt_xyz__", "DEFAULT");
         assert_eq!(out, "DEFAULT");
+    }
+
+    #[test]
+    fn load_applies_branding_to_product_placeholder() {
+        // The default branding (open-core, no policy active) substitutes
+        // `{product}` with "thClaws". Critical for system.md, which now
+        // says "You are {product}" — without this substitution the agent
+        // would literally introduce itself as "{product}".
+        let template = "I am {product}.";
+        let out = load("__nonexistent_for_test__", template);
+        assert_eq!(out, "I am thClaws.");
+    }
+
+    #[test]
+    fn load_applies_branding_to_default_system_prompt() {
+        // The actual built-in system.md template starts with
+        // "You are {product}, …" — confirm it round-trips through `load`
+        // with the placeholder substituted. Test guards against future
+        // bypasses of `branding::apply_template` in the load path.
+        let out = load("__nonexistent_for_test__", defaults::SYSTEM);
+        assert!(
+            out.starts_with("You are thClaws,"),
+            "system.md substitution missing — got: {}",
+            out.lines().next().unwrap_or("")
+        );
+        assert!(
+            !out.contains("{product}"),
+            "{{product}} placeholder leaked into rendered prompt"
+        );
     }
 }

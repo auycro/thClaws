@@ -1,6 +1,6 @@
 [package]
 name = "thclaws-core"
-version = "0.3.3"
+version = "0.5.0"
 edition = "2021"
 description = "thClaws — native Rust AI agent workspace with CLI and desktop GUI."
 license = "MIT OR Apache-2.0"
@@ -44,6 +44,12 @@ rfd = { version = "0.17.2", optional = true }
 # Native confirm dialog — replaces the Windows-branch PowerShell
 # MessageBox shell-out. Backported from public repo (commit 7339bc0).
 native-dialog = { version = "0.9.6", optional = true }
+# Ed25519 signature verification for org policy files (Enterprise Edition
+# foundation, dev-plan/01). `rand_core` brings in the OsRng we need for the
+# `thclaws-policy-tool` keypair generator. Verifier-only callers (the main
+# binary) compile without `rand_core` — the dependency lands when the
+# policy-tool bin pulls it in.
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast", "pkcs8", "pem"] }
 
 [features]
 default = []
@@ -63,6 +69,13 @@ path = "src/bin/app.rs"
 [[bin]]
 name = "catalogue-seed"
 path = "src/bin/catalogue_seed.rs"
+
+# Operator/Enterprise: generate keypairs, sign policy files, verify and
+# inspect existing policies. Shipped alongside the EE binary for ops use,
+# also available in open-core builds for testing self-locking workflows.
+[[bin]]
+name = "thclaws-policy-tool"
+path = "src/bin/policy_tool.rs"
 
 [dev-dependencies]
 tempfile = "3"

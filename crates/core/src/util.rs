@@ -105,6 +105,53 @@ pub fn format_tokens(n: usize) -> String {
     }
 }
 
+/// Build a sync `std::process::Command` that runs a shell-string in
+/// the platform's default shell. On Windows this is `cmd.exe /C
+/// <cmd>`; on Unix it's `/bin/sh -c <cmd>`. Centralized here so the
+/// 4+ tool / hook / team / repl call sites don't each repeat the
+/// `cfg!(windows)` branch.
+///
+/// Caveats: bash-syntax commands the agent emits (`find . -name
+/// '*.rs'`, complex pipelines, `&&` chains with single-quoted args)
+/// may not parse identically under cmd.exe. Power users can override
+/// with the `THCLAWS_SHELL` env var (path to a shell + flag pair like
+/// `bash -c`) — see [`shell_command_sync`] / [`shell_command_async`]
+/// for the override path.
+pub fn shell_command_sync(command: &str) -> std::process::Command {
+    let (shell, flag) = shell_invocation();
+    let mut c = std::process::Command::new(shell);
+    c.arg(flag).arg(command);
+    c
+}
+
+/// Async variant for tokio-based call sites (currently the Bash
+/// tool). Same shell-resolution logic as [`shell_command_sync`].
+pub fn shell_command_async(command: &str) -> tokio::process::Command {
+    let (shell, flag) = shell_invocation();
+    let mut c = tokio::process::Command::new(shell);
+    c.arg(flag).arg(command);
+    c
+}
+
+/// Resolve `(shell, flag)` for the current host. Honors
+/// `THCLAWS_SHELL` for power-user overrides — set it to a single
+/// string like `"bash -c"` or `"pwsh -Command"` and we split on
+/// whitespace; the first token is the executable, the second is the
+/// flag.
+fn shell_invocation() -> (String, String) {
+    if let Ok(s) = std::env::var("THCLAWS_SHELL") {
+        let parts: Vec<&str> = s.split_whitespace().collect();
+        if parts.len() == 2 {
+            return (parts[0].to_string(), parts[1].to_string());
+        }
+    }
+    if cfg!(windows) {
+        ("cmd".to_string(), "/C".to_string())
+    } else {
+        ("/bin/sh".to_string(), "-c".to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +162,36 @@ mod tests {
         // CI this could fail if a sandboxed runner strips env — we
         // allow `None` there, but don't crash.
         let _ = home_dir();
+    }
+
+    #[test]
+    fn shell_invocation_picks_platform_default() {
+        // Clear any THCLAWS_SHELL override so we test the default.
+        let saved = std::env::var("THCLAWS_SHELL").ok();
+        std::env::remove_var("THCLAWS_SHELL");
+        let (shell, flag) = shell_invocation();
+        if cfg!(windows) {
+            assert_eq!(shell, "cmd");
+            assert_eq!(flag, "/C");
+        } else {
+            assert_eq!(shell, "/bin/sh");
+            assert_eq!(flag, "-c");
+        }
+        if let Some(v) = saved {
+            std::env::set_var("THCLAWS_SHELL", v);
+        }
+    }
+
+    #[test]
+    fn thclaws_shell_override_works() {
+        let saved = std::env::var("THCLAWS_SHELL").ok();
+        std::env::set_var("THCLAWS_SHELL", "bash -c");
+        let (shell, flag) = shell_invocation();
+        assert_eq!(shell, "bash");
+        assert_eq!(flag, "-c");
+        std::env::remove_var("THCLAWS_SHELL");
+        if let Some(v) = saved {
+            std::env::set_var("THCLAWS_SHELL", v);
+        }
     }
 }

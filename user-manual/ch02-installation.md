@@ -24,6 +24,27 @@ Pick the right macOS build:
 - **Intel Macs**: use the `x86_64` build. The `arm64` build won't run
   on Intel.
 
+## System requirements
+
+thClaws itself is small — the binary is ~20 MB unpacked and uses
+~250–400 MB of RAM at runtime, most of it the embedded webview
+supplied by the operating system (WKWebView on macOS, WebView2 on
+Windows, WebKit2GTK on Linux).
+
+| | Minimum | Recommended |
+|---|---|---|
+| **OS** | macOS 12+ · Windows 10+ · Linux with webkit2gtk-4.1 (Ubuntu 22.04+, Fedora 38+) | latest stable |
+| **CPU** | any 64-bit x86_64 or ARM64 from the past ~10 years | modern multi-core |
+| **RAM** | 2 GB free | 8 GB total |
+| **Disk** | ~50 MB | SSD |
+| **Network** | required for cloud providers (Anthropic / OpenAI / Gemini / OpenRouter / Z.ai / DashScope / Agentic Press); optional if you only use local Ollama or LMStudio | broadband |
+
+If you're using thClaws purely against cloud providers, any laptop
+bought in the past few years works comfortably. The heavy spec floor
+for **local** model use is the model runtime (Ollama / LMStudio),
+not thClaws — see [Optional: Ollama for fully local use](#optional-ollama-for-fully-local-use)
+below for those numbers.
+
 > **Prefer to build from source?** thClaws is open source — clone
 > [github.com/thClaws/thClaws](https://github.com/thClaws/thClaws)
 > and run `cargo build --release --features gui` (Rust 1.85+,

@@ -101,6 +101,16 @@ async fn main() {
     load_dotenv();
     let _ = Sandbox::init();
 
+    // Org policy file enforcement (Enterprise Edition foundation).
+    // Runs before CLI parse so a fail-closed refusal happens identically
+    // whether the user invoked GUI, CLI, or print mode. Open-core builds
+    // with no policy file and no key are unaffected — `load_or_refuse`
+    // returns Ok(false).
+    if let Err(e) = thclaws_core::policy::load_or_refuse() {
+        eprintln!("\x1b[31m{}\x1b[0m", e.refuse_message());
+        std::process::exit(2);
+    }
+
     let cli = Cli::parse();
     let use_cli = cli.cli || cli.print;
 

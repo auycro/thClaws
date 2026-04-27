@@ -10,6 +10,32 @@ thClaws is a **native-Rust AI agent workspace** that runs locally on your machin
 
 ---
 
+## See it work
+
+Three tabs, one binary — captured from a live thClaws session looking at its own source.
+
+<table>
+  <tr>
+    <td width="33%" align="center">
+      <a href="docs/img/screen-files.webp"><img src="docs/img/screen-files.webp" alt="thClaws Files tab — landing-page source open in the editor with file tree" /></a><br/>
+      <strong>Files</strong><br/>
+      <sub>preview · edit · browse — codemirror + tiptap</sub>
+    </td>
+    <td width="33%" align="center">
+      <a href="docs/img/screen-terminal.webp"><img src="docs/img/screen-terminal.webp" alt="thClaws Terminal tab — REPL session with ASCII banner" /></a><br/>
+      <strong>Terminal</strong><br/>
+      <sub>raw REPL · slash commands · ANSI tool output</sub>
+    </td>
+    <td width="33%" align="center">
+      <a href="docs/img/screen-chat.webp"><img src="docs/img/screen-chat.webp" alt="thClaws Chat tab — conversational interface answering a product question" /></a><br/>
+      <strong>Chat</strong><br/>
+      <sub>conversational · markdown render · tool indicators</sub>
+    </td>
+  </tr>
+</table>
+
+---
+
 ## Three interfaces, one binary
 
 - **Desktop GUI** (`thclaws`) — a native window with Terminal, Chat, Files, and optional Team tabs.
