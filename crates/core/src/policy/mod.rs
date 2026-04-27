@@ -166,6 +166,46 @@ pub struct SsoPolicy {
     pub client_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audience: Option<String>,
+    /// Optional inline client_secret. Use **only** for "non-confidential"
+    /// secrets — Google's docs explicitly classify Desktop-app
+    /// client_secrets as not-actually-secret because they ship embedded
+    /// in every binary copy:
+    ///
+    /// > In this context, the client secret is obviously not treated
+    /// > as a secret.
+    ///
+    /// For these IdPs, embedding here is the recommended pattern: one
+    /// signed policy file carries everything the enterprise needs to
+    /// deploy, no separate env-var distribution required. **Do not
+    /// embed real confidential-client secrets here** (Okta confidential,
+    /// Auth0 production, Azure AD with secret) — those leak from the
+    /// policy file to every workstation and a single dump compromises
+    /// the OAuth project. Use `clientSecretEnv` for those.
+    ///
+    /// Resolution order at token-exchange time: `client_secret` →
+    /// `client_secret_env` → none.
+    #[serde(
+        rename = "clientSecret",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub client_secret: Option<String>,
+    /// Optional. Names an env var holding a client_secret for the
+    /// token exchange. Use this when the secret is *truly* secret and
+    /// shouldn't end up on workstations as plaintext (real confidential
+    /// clients). The env var itself is deployed via MDM / login script
+    /// / OS keychain alongside the binary, in the same channel as the
+    /// signed policy file.
+    ///
+    /// Modern PKCE-only clients (Okta public-client setting, Azure AD
+    /// desktop, Keycloak public clients) leave both this and
+    /// `client_secret` unset — secret-less PKCE flow is used.
+    #[serde(
+        rename = "clientSecretEnv",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub client_secret_env: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -569,6 +609,8 @@ mod tests {
                     issuer_url: String::new(),
                     client_id: "client".into(),
                     audience: None,
+                    client_secret: None,
+                    client_secret_env: None,
                 }),
                 ..Default::default()
             },

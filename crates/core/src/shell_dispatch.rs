@@ -759,6 +759,54 @@ pub async fn dispatch(
             }
         }
 
+        // ─── sso (EE Phase 4) ───────────────────────────────────────
+        SlashCommand::Sso { sub } => {
+            let policy = crate::policy::active()
+                .and_then(|a| a.policy.policies.sso.as_ref())
+                .cloned();
+            let policy = match policy {
+                Some(p) if p.enabled => p,
+                Some(_) => {
+                    emit(
+                        events_tx,
+                        "policies.sso.enabled is false — nothing to do".into(),
+                    );
+                    return;
+                }
+                None => {
+                    emit(
+                        events_tx,
+                        "no SSO policy active — /sso requires policies.sso.enabled in the org policy".into(),
+                    );
+                    return;
+                }
+            };
+            match sub {
+                crate::repl::SsoSubcommand::Status => {
+                    emit(events_tx, crate::sso::status(&policy));
+                }
+                crate::repl::SsoSubcommand::Login => match crate::sso::login(&policy).await {
+                    Ok(s) => {
+                        let who = s
+                            .email
+                            .clone()
+                            .or(s.name.clone())
+                            .or(s.sub.clone())
+                            .unwrap_or_else(|| "(no identity claim)".into());
+                        emit(
+                            events_tx,
+                            format!("✓ signed in as {who} (issuer: {})", s.issuer),
+                        );
+                    }
+                    Err(e) => emit(events_tx, format!("/sso login failed: {e}")),
+                },
+                crate::repl::SsoSubcommand::Logout => match crate::sso::logout(&policy) {
+                    Ok(()) => emit(events_tx, "signed out (cached tokens cleared)".into()),
+                    Err(e) => emit(events_tx, format!("/sso logout failed: {e}")),
+                },
+            }
+        }
+
         // ─── skills ─────────────────────────────────────────────────
         SlashCommand::Skills => {
             let s = crate::skills::SkillStore::discover();

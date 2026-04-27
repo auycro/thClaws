@@ -37,6 +37,7 @@ pub enum ProviderKind {
     ZAi,
     LMStudio,
     AzureAIFoundry,
+    OpenAICompat,
 }
 
 impl ProviderKind {
@@ -55,6 +56,7 @@ impl ProviderKind {
         Self::ZAi,
         Self::LMStudio,
         Self::AzureAIFoundry,
+        Self::OpenAICompat,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -73,6 +75,7 @@ impl ProviderKind {
             Self::ZAi => "zai",
             Self::LMStudio => "lmstudio",
             Self::AzureAIFoundry => "azure",
+            Self::OpenAICompat => "openai-compat",
         }
     }
 
@@ -84,6 +87,13 @@ impl ProviderKind {
             Self::OpenAI => "gpt-4o",
             Self::OpenAIResponses => "codex/gpt-5.2-codex",
             Self::OpenRouter => "openrouter/anthropic/claude-sonnet-4-6",
+            // Pinned to a versioned ID (matching Anthropic / OpenAI
+            // convention) rather than `gemini-flash-latest` — `-latest`
+            // is a rolling Google-side alias that could promote into a
+            // higher-tier model without warning, surprising users with
+            // unexpected cost. Track upcoming retirement at:
+            // https://ai.google.dev/gemini-api/docs/deprecations
+            // Next bump deadline: 2026-06-17 (gemini-2.5-flash shutdown).
             Self::Gemini => "gemini-2.5-flash",
             Self::Ollama => "ollama/llama3.2",
             Self::OllamaAnthropic => "oa/qwen3-coder",
@@ -101,6 +111,10 @@ impl ProviderKind {
             // placeholder routes to the right provider but forces the user to
             // override with `/model azure/<your-deployment>`.
             Self::AzureAIFoundry => "azure/<deployment>",
+            // Generic OpenAI-compatible endpoint (SML Gateway, LiteLLM, Portkey,
+            // vLLM, etc.). Users supply their own model id via /model oai/<id>;
+            // the "oai/" prefix is stripped before the request goes upstream.
+            Self::OpenAICompat => "oai/gpt-4o-mini",
         }
     }
 
@@ -117,6 +131,7 @@ impl ProviderKind {
             Self::ZAi => Some("ZAI_BASE_URL"),
             Self::LMStudio => Some("LMSTUDIO_BASE_URL"),
             Self::AzureAIFoundry => Some("AZURE_AI_FOUNDRY_ENDPOINT"),
+            Self::OpenAICompat => Some("OPENAI_COMPAT_BASE_URL"),
             _ => None,
         }
     }
@@ -129,7 +144,11 @@ impl ProviderKind {
     pub fn endpoint_user_configurable(&self) -> bool {
         matches!(
             self,
-            Self::Ollama | Self::OllamaAnthropic | Self::LMStudio | Self::AzureAIFoundry,
+            Self::Ollama
+                | Self::OllamaAnthropic
+                | Self::LMStudio
+                | Self::AzureAIFoundry
+                | Self::OpenAICompat,
         )
     }
 
@@ -152,6 +171,9 @@ impl ProviderKind {
             // editable Settings field above.
             Self::LMStudio => Some("http://localhost:1234/v1"),
             Self::AzureAIFoundry => Some("https://{resource}.services.ai.azure.com"),
+            // Generic OAI-compat: users always set their own URL; this
+            // placeholder just hints at the expected shape (path ending in /v1).
+            Self::OpenAICompat => Some("http://localhost:8000/v1"),
             _ => None,
         }
     }
@@ -173,6 +195,7 @@ impl ProviderKind {
             Self::ZAi => Some("ZAI_API_KEY"),
             Self::LMStudio => None, // Local runtime, no auth.
             Self::AzureAIFoundry => Some("AZURE_AI_FOUNDRY_API_KEY"),
+            Self::OpenAICompat => Some("OPENAI_COMPAT_API_KEY"),
         }
     }
 
@@ -249,7 +272,8 @@ impl ProviderKind {
             | Self::DashScope
             | Self::ZAi
             | Self::LMStudio
-            | Self::AzureAIFoundry => None,
+            | Self::AzureAIFoundry
+            | Self::OpenAICompat => None,
         }
     }
 
@@ -289,6 +313,11 @@ impl ProviderKind {
             // The "zai/" prefix is stripped before forwarding to the
             // OpenAI-compatible upstream.
             Some(Self::ZAi)
+        } else if model.starts_with("oai/") {
+            // Generic OpenAI-compatible endpoint (SML Gateway, LiteLLM,
+            // Portkey, vLLM, internal proxies, etc.). The "oai/" prefix
+            // is stripped before forwarding to the upstream API.
+            Some(Self::OpenAICompat)
         } else if model.starts_with("lmstudio/") {
             // LMStudio (local runtime, OpenAI-compatible at /v1).
             // Models look like lmstudio/<loaded-model-id>; the prefix

@@ -659,7 +659,46 @@ fn is_gemini_chat(id: &str) -> bool {
         "-audio",
         "computer-use",
     ];
-    !skip.iter().any(|s| id.contains(s))
+    if skip.iter().any(|s| id.contains(s)) {
+        return false;
+    }
+    // Drop Gemini IDs Google has deprecated or shut down. Google
+    // sometimes keeps them in the public list for "existing customer"
+    // backward compat even after new-customer 404s start, which leads
+    // to misleading entries in our catalogue (issue #32: user calls
+    // gemini-2.0-flash → 404). Source of truth:
+    //
+    //     https://ai.google.dev/gemini-api/docs/deprecations
+    //
+    // Update this list when Google retires more IDs. Track the next
+    // upcoming shutdown via the official deprecations page; the 2.5
+    // family is on the clock for 2026-06-17.
+    if is_retired_gemini(id) {
+        return false;
+    }
+    true
+}
+
+/// Hard-list of Gemini model IDs we refuse to import even when the
+/// upstream `/v1beta/models` endpoint still returns them. Sources:
+/// <https://ai.google.dev/gemini-api/docs/deprecations>.
+fn is_retired_gemini(id: &str) -> bool {
+    // 1.x family — fully shut down (2025).
+    if id.starts_with("gemini-1.") || id == "gemini-pro" || id == "gemini-pro-vision" {
+        return true;
+    }
+    // 2.0 family — existing-customer-only since 2026-03-06; hard
+    // shutdown 2026-06-01. Already 404s for new API keys, which is
+    // exactly issue #32's symptom.
+    if id.starts_with("gemini-2.0-flash") {
+        return true;
+    }
+    // 3-pro-preview — already shut down 2026-03-09 (replaced by
+    // gemini-3.1-pro-preview).
+    if id == "gemini-3-pro-preview" {
+        return true;
+    }
+    false
 }
 
 // ── Date stamp ──────────────────────────────────────────────────────
@@ -729,9 +768,11 @@ mod tests {
 
     #[test]
     fn gemini_filter_keeps_chat_drops_noise() {
+        // Currently-shipping chat IDs.
         assert!(is_gemini_chat("gemini-2.5-pro"));
         assert!(is_gemini_chat("gemini-2.5-flash"));
-        assert!(is_gemini_chat("gemini-3-pro-preview"));
+        assert!(is_gemini_chat("gemini-3.1-pro-preview"));
+        assert!(is_gemini_chat("gemini-3-flash-preview"));
         assert!(is_gemini_chat("gemini-flash-latest"));
         // Non-gemini families dropped outright.
         assert!(!is_gemini_chat("imagen-4.0-generate-001"));
@@ -747,5 +788,36 @@ mod tests {
         assert!(!is_gemini_chat("gemini-2.5-flash-preview-tts"));
         assert!(!is_gemini_chat("gemini-robotics-er-1.5-preview"));
         assert!(!is_gemini_chat("gemini-2.5-computer-use-preview-10-2025"));
+    }
+
+    #[test]
+    fn gemini_filter_drops_retired_models() {
+        // Issue #32: keep retired Gemini IDs out of the catalogue so
+        // `make catalogue` runs against a still-listing upstream don't
+        // re-add them. Source: ai.google.dev/gemini-api/docs/deprecations.
+        // 1.x family — fully shut down 2025.
+        assert!(is_retired_gemini("gemini-1.5-flash"));
+        assert!(is_retired_gemini("gemini-1.5-pro"));
+        assert!(is_retired_gemini("gemini-1.0-pro"));
+        assert!(is_retired_gemini("gemini-pro"));
+        assert!(is_retired_gemini("gemini-pro-vision"));
+        // 2.0 family — existing-customer-only 2026-03-06; full shutdown
+        // 2026-06-01. Issue #32's specific symptom (404 for new keys).
+        assert!(is_retired_gemini("gemini-2.0-flash"));
+        assert!(is_retired_gemini("gemini-2.0-flash-001"));
+        assert!(is_retired_gemini("gemini-2.0-flash-lite"));
+        assert!(is_retired_gemini("gemini-2.0-flash-lite-001"));
+        // 3-pro-preview — already shut down 2026-03-09.
+        assert!(is_retired_gemini("gemini-3-pro-preview"));
+        // Currently-shipping IDs must not match the retirement filter.
+        assert!(!is_retired_gemini("gemini-2.5-flash"));
+        assert!(!is_retired_gemini("gemini-2.5-pro"));
+        assert!(!is_retired_gemini("gemini-3.1-pro-preview"));
+        assert!(!is_retired_gemini("gemini-3-flash-preview"));
+        assert!(!is_retired_gemini("gemini-flash-latest"));
+        // is_gemini_chat composes both filters — retired IDs drop out.
+        assert!(!is_gemini_chat("gemini-2.0-flash"));
+        assert!(!is_gemini_chat("gemini-3-pro-preview"));
+        assert!(!is_gemini_chat("gemini-1.5-flash"));
     }
 }

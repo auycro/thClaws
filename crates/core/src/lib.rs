@@ -36,6 +36,7 @@ pub mod shared_session;
 #[cfg(feature = "gui")]
 pub mod shell_dispatch;
 pub mod skills;
+pub mod sso;
 pub mod subagent;
 pub mod team;
 pub mod tokens;

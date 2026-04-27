@@ -113,6 +113,13 @@ pub enum SlashCommand {
     Fork,
     Doctor,
     Skills,
+    /// Org-policy SSO subcommands (Phase 4).
+    /// `/sso login`  — interactive OIDC login via browser + loopback callback
+    /// `/sso logout` — clear cached tokens for the active issuer
+    /// `/sso status` — show current session, expiry, and issuer
+    Sso {
+        sub: SsoSubcommand,
+    },
     SkillInstall {
         git_url: String,
         name: Option<String>,
@@ -137,6 +144,14 @@ pub enum SlashCommand {
         force: bool,
     },
     Unknown(String),
+}
+
+/// Subcommands of `/sso`. `/sso` with no arg defaults to `Status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SsoSubcommand {
+    Login,
+    Logout,
+    Status,
 }
 
 /// Parse `/plugin [install|remove ...]` and the `/plugins` alias.
@@ -419,6 +434,20 @@ pub fn parse_slash(input: &str) -> Option<SlashCommand> {
         "compact" => SlashCommand::Compact,
         "fork" => SlashCommand::Fork,
         "doctor" | "diag" => SlashCommand::Doctor,
+        "sso" => match args.trim() {
+            "" | "status" => SlashCommand::Sso {
+                sub: SsoSubcommand::Status,
+            },
+            "login" => SlashCommand::Sso {
+                sub: SsoSubcommand::Login,
+            },
+            "logout" => SlashCommand::Sso {
+                sub: SsoSubcommand::Logout,
+            },
+            other => SlashCommand::Unknown(format!(
+                "unknown /sso subcommand: '{other}' (try /sso, /sso login, /sso logout)"
+            )),
+        },
         "skills" => SlashCommand::Skills,
         "skill" => {
             // Supported (project scope is the default; --user opts out):
@@ -852,6 +881,25 @@ pub fn build_provider(config: &AppConfig) -> Result<Arc<dyn Provider>> {
             let messages_url = format!("{base}/anthropic/v1/messages");
             Ok(Arc::new(
                 AnthropicProvider::new(api_key).with_base_url(messages_url),
+            ))
+        }
+        ProviderKind::OpenAICompat => {
+            // Generic OpenAI-compatible endpoint (SML Gateway, LiteLLM,
+            // Portkey, Helicone, vLLM, internal corporate proxies, etc.).
+            // Models use `oai/<id>` form (e.g. oai/gpt-4o-mini); the
+            // "oai/" prefix is stripped before the request reaches the
+            // upstream. Auth is `Bearer $OPENAI_COMPAT_API_KEY`.
+            let base = std::env::var("OPENAI_COMPAT_BASE_URL")
+                .unwrap_or_else(|_| "http://localhost:8000/v1".to_string());
+            let url = if base.ends_with("/chat/completions") {
+                base
+            } else {
+                format!("{}/chat/completions", base.trim_end_matches('/'))
+            };
+            Ok(Arc::new(
+                OpenAIProvider::new(api_key)
+                    .with_base_url(url)
+                    .with_strip_model_prefix("oai/"),
             ))
         }
         ProviderKind::Ollama
@@ -3125,6 +3173,55 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         }
                     }
                 }
+                SlashCommand::Sso { sub } => {
+                    let active = crate::policy::active();
+                    let policy = active.and_then(|a| a.policy.policies.sso.as_ref());
+                    let policy = match policy {
+                        Some(p) => p.clone(),
+                        None => {
+                            println!(
+                                "{COLOR_YELLOW}no SSO policy active — /sso requires policies.sso.enabled in the org policy{COLOR_RESET}"
+                            );
+                            continue;
+                        }
+                    };
+                    if !policy.enabled {
+                        println!(
+                            "{COLOR_YELLOW}policies.sso.enabled is false — nothing to do{COLOR_RESET}"
+                        );
+                        continue;
+                    }
+                    match sub {
+                        SsoSubcommand::Status => {
+                            println!("{COLOR_DIM}{}{COLOR_RESET}", crate::sso::status(&policy));
+                        }
+                        SsoSubcommand::Login => match crate::sso::login(&policy).await {
+                            Ok(s) => {
+                                let who = s
+                                    .email
+                                    .clone()
+                                    .or(s.name.clone())
+                                    .or(s.sub.clone())
+                                    .unwrap_or_else(|| "(no identity claim)".into());
+                                println!(
+                                    "{COLOR_DIM}✓ signed in as {who} (issuer: {}){COLOR_RESET}",
+                                    s.issuer
+                                );
+                            }
+                            Err(e) => {
+                                println!("{COLOR_YELLOW}/sso login failed: {e}{COLOR_RESET}");
+                            }
+                        },
+                        SsoSubcommand::Logout => match crate::sso::logout(&policy) {
+                            Ok(()) => println!(
+                                "{COLOR_DIM}signed out (cached tokens cleared){COLOR_RESET}"
+                            ),
+                            Err(e) => {
+                                println!("{COLOR_YELLOW}/sso logout failed: {e}{COLOR_RESET}")
+                            }
+                        },
+                    }
+                }
                 SlashCommand::Skills => {
                     let store = crate::skills::SkillStore::discover();
                     if store.skills.is_empty() {
@@ -3778,6 +3875,38 @@ mod tests {
             parse_slash("/rename"),
             Some(SlashCommand::Rename(String::new()))
         );
+    }
+
+    #[test]
+    fn parse_slash_sso_subcommands() {
+        assert_eq!(
+            parse_slash("/sso"),
+            Some(SlashCommand::Sso {
+                sub: SsoSubcommand::Status
+            })
+        );
+        assert_eq!(
+            parse_slash("/sso status"),
+            Some(SlashCommand::Sso {
+                sub: SsoSubcommand::Status
+            })
+        );
+        assert_eq!(
+            parse_slash("/sso login"),
+            Some(SlashCommand::Sso {
+                sub: SsoSubcommand::Login
+            })
+        );
+        assert_eq!(
+            parse_slash("/sso logout"),
+            Some(SlashCommand::Sso {
+                sub: SsoSubcommand::Logout
+            })
+        );
+        assert!(matches!(
+            parse_slash("/sso bogus"),
+            Some(SlashCommand::Unknown(msg)) if msg.contains("unknown /sso subcommand")
+        ));
     }
 
     #[test]

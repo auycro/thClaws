@@ -35,12 +35,24 @@ function confirmNative(opts: {
   });
 }
 
+type SsoState = {
+  enabled: boolean;
+  logged_in: boolean;
+  issuer?: string;
+  email?: string;
+  name?: string;
+  sub?: string;
+  expires_in_secs?: number;
+  error?: string;
+};
+
 export function Sidebar() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState<string>("");
   const [activeProvider, setActiveProvider] = useState("anthropic");
   const [activeModel, setActiveModel] = useState("claude-sonnet-4-5");
   const [providerReady, setProviderReady] = useState(true);
+  const [sso, setSso] = useState<SsoState>({ enabled: false, logged_in: false });
   const [mcpServers, setMcpServers] = useState<
     { name: string; tools: number }[]
   >([]);
@@ -89,8 +101,22 @@ export function Sidebar() {
         setMcpServers(msg.servers as { name: string; tools: number }[]);
       } else if (msg.type === "kms_update") {
         setKmss(msg.kmss as KmsInfo[]);
+      } else if (msg.type === "sso_state") {
+        setSso({
+          enabled: Boolean(msg.enabled),
+          logged_in: Boolean(msg.logged_in),
+          issuer: msg.issuer as string | undefined,
+          email: msg.email as string | undefined,
+          name: msg.name as string | undefined,
+          sub: msg.sub as string | undefined,
+          expires_in_secs: msg.expires_in_secs as number | undefined,
+          error: msg.error as string | undefined,
+        });
       }
     });
+    // Ask for current SSO state once at mount. Backend replies with an
+    // `sso_state` event the subscriber above renders.
+    send({ type: "sso_status" });
     return unsub;
   }, []);
 
@@ -175,6 +201,96 @@ export function Sidebar() {
           )}
         </div>
       </Section>
+
+      {/* Identity (org-policy SSO — EE Phase 4). Renders only when the
+          active org policy has policies.sso.enabled. Otherwise the
+          section is invisible — open-core users never see it. */}
+      {sso.enabled && (
+        <Section title="Identity">
+          <div className="px-2 py-1">
+            {sso.logged_in ? (
+              <>
+                <div className="flex items-center gap-1.5">
+                  <span
+                    className="w-1.5 h-1.5 rounded-full"
+                    style={{ background: "var(--accent)" }}
+                    title={`signed in via ${sso.issuer ?? "OIDC"}`}
+                  />
+                  <span
+                    style={{ color: "var(--text-primary)" }}
+                    title={sso.issuer}
+                  >
+                    {sso.email ?? sso.name ?? sso.sub ?? "(no claim)"}
+                  </span>
+                </div>
+                {typeof sso.expires_in_secs === "number" && (
+                  <div
+                    className="ml-3 font-mono"
+                    style={{
+                      color: "var(--text-secondary)",
+                      fontSize: "10px",
+                    }}
+                  >
+                    token: {sso.expires_in_secs}s
+                  </div>
+                )}
+                <button
+                  className="ml-3 mt-1 underline"
+                  style={{
+                    color: "var(--text-secondary)",
+                    fontSize: "10px",
+                    background: "none",
+                    border: "none",
+                    padding: 0,
+                    cursor: "pointer",
+                  }}
+                  onClick={() => send({ type: "sso_logout" })}
+                  title="Clear cached tokens"
+                >
+                  sign out
+                </button>
+              </>
+            ) : (
+              <>
+                <div
+                  style={{
+                    color: "var(--text-secondary)",
+                    fontSize: "11px",
+                  }}
+                  title={sso.issuer}
+                >
+                  not signed in
+                </div>
+                <button
+                  className="mt-1 px-2 py-0.5 rounded"
+                  style={{
+                    background: "var(--accent)",
+                    color: "var(--bg-primary, #08090d)",
+                    fontSize: "11px",
+                    border: "none",
+                    cursor: "pointer",
+                  }}
+                  onClick={() => send({ type: "sso_login" })}
+                  title="Open browser to sign in via OIDC"
+                >
+                  sign in
+                </button>
+                {sso.error && (
+                  <div
+                    className="mt-1"
+                    style={{
+                      color: "var(--danger, #e06c75)",
+                      fontSize: "10px",
+                    }}
+                  >
+                    {sso.error}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </Section>
+      )}
 
       {/* Sessions */}
       <Section

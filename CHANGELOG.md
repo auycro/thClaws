@@ -7,6 +7,295 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] — 2026-04-27
+
+Patch release. Two open-issue fixes plus a routine catalogue refresh.
+
+### Fixed
+
+- **Terminal slash-command popup cursor desync** ([#31](https://github.com/thClaws/thClaws/issues/31),
+  [@mrpokx5](https://github.com/mrpokx5)). After accepting a command via Tab
+  or mouse click, the JS-side `cursorPos` stayed at its pre-accept value
+  while the visible terminal cursor jumped to the end of the rewritten
+  command. Subsequent keystrokes used the stale `cursorPos` to slice +
+  splice `lineBuffer`, mangling the command name (the user's reported
+  "selected but can do nothing" + "cursor misplaced on mouse click").
+  Fix: assign `cursorPos = next.length;` after the buffer rewrite.
+  Single line, three accept paths covered (Tab key, Enter when name
+  still being composed, popup mouse onClick).
+
+- **Retired Gemini models in catalogue** ([#32](https://github.com/thClaws/thClaws/issues/32),
+  [@jubbyy](https://github.com/jubbyy)). Reporter hit 404 on
+  `gemini-2.0-flash`. Cross-checked against
+  [Google's official deprecations page](https://ai.google.dev/gemini-api/docs/deprecations) —
+  the model is in "existing-customer-only" since 2026-03-06 with hard
+  shutdown 2026-06-01. Removed 7 retired rows from the catalogue:
+  - `gemini-1.5-flash`, `gemini-1.5-pro` (1.x family fully shut down 2025)
+  - `gemini-2.0-flash`, `-001`, `-lite`, `-lite-001` (shutdown 2026-06-01)
+  - `gemini-3-pro-preview` (already shut down 2026-03-09; replaced by `gemini-3.1-pro-preview`)
+
+  Added `is_retired_gemini` filter in `catalogue-seed` so future
+  `make catalogue` runs won't re-add them even though Google's upstream
+  `/v1beta/models` still lists them for backward-compat. Verified the
+  filter held against a live refresh — Gemini stayed at 10 rows. Comment
+  in the filter points at Google's deprecations page so the next
+  maintainer knows where to update.
+
+### Catalogue
+
+Routine refresh added 6 new model rows:
+
+- **OpenRouter** — 5 new Qwen entries: `qwen/qwen3.5-plus-20260420`,
+  `qwen/qwen3.6-{27b,35b-a3b,flash,max-preview}`.
+- **Ollama Cloud** — `ollama-cloud/deepseek-v4-pro`.
+
+Catalogue total now 589 rows (down 1 from v0.6.1's 590, net of the 7
+retirements minus 6 additions).
+
+### Default model — no change
+
+The default Gemini model stays at `gemini-2.5-flash`. Considered switching
+to Google's `gemini-flash-latest` rolling alias for auto-tracking, but
+rejected — `-latest` could promote a higher-tier model into the alias
+without warning, surprising users with unexpected cost. Convention
+matches Anthropic / OpenAI defaults (pinned versioned IDs). Next bump
+deadline: **2026-06-17** when `gemini-2.5-flash` retires per Google's
+schedule. Comment near the default points at the deprecations page so
+the next maintainer knows when to bump.
+
+## [0.6.1] — 2026-04-27
+
+Patch release. Three community PRs landed in quick succession after
+v0.6.0 — a real cost optimization, a contributor-experience improvement,
+and a new provider variant. All three fully tested, no breaking changes.
+
+### Added — `OpenAICompat` provider ([#35](https://github.com/thClaws/thClaws/pull/35), [@SalmonRK](https://github.com/SalmonRK))
+
+A first-class slot for generic OpenAI-compatible HTTP endpoints — LLM
+gateways like LiteLLM, Portkey, Helicone, internal corporate proxies,
+self-hosted inference servers (vLLM, text-generation-inference,
+lm-deploy), and any other service that speaks OpenAI's
+`/v1/chat/completions` wire format with a Bearer token.
+
+Mirrors the existing `LMStudio` / `DashScope` / `ZAi` /
+`AzureAIFoundry` template — a configurable base URL (`OPENAI_COMPAT_BASE_URL`
+or Settings UI), Bearer token from `OPENAI_COMPAT_API_KEY`, and a
+`oai/<id>` model prefix that is stripped before the request reaches
+the upstream. Real OpenAI (`OPENAI_API_KEY` + `gpt-*` / `o*` models)
+is unaffected — there is no env-var collision and no slot shadowing.
+
+Usage:
+
+```sh
+# .env or shell
+export OPENAI_COMPAT_BASE_URL=http://localhost:8000/v1
+export OPENAI_COMPAT_API_KEY=...
+
+# in REPL or via --model flag
+/model oai/<upstream-model-id>
+```
+
+The `oai/` prefix is stripped before the wire payload, so an upstream
+model named `meta-llama/Llama-3.1-70B-Instruct` is reached via
+`/model oai/meta-llama/Llama-3.1-70B-Instruct`.
+
+### Added — Anthropic third cache breakpoint ([#33](https://github.com/thClaws/thClaws/pull/33), [@chawasit](https://github.com/chawasit))
+
+Adds a `cache_control: ephemeral` marker on the last content block of
+the second-to-last message in `AnthropicProvider::build_body`, turning
+the rolling conversation history into a cached prefix on subsequent
+turns. The newest message stays uncached (it's the live user turn);
+the one before it is byte-stable across the next call and becomes the
+cache anchor.
+
+Anthropic supports up to 4 `cache_control` markers per request. Before
+this change we used 2 (system prompt + last tool definition); both
+cached *fixed-size* blocks. The growing conversation history was
+re-tokenized in full on every turn even though everything except the
+newest user message was byte-stable across the next call.
+
+Approximate input-cost reductions on Sonnet 4.6 vs. the prior
+2-breakpoint setup:
+
+| Session length × shape | Saving vs. 2 breakpoints |
+|---|---|
+| 10 turns, normal coding | ~46% |
+| 10 turns, tool-heavy | ~54% |
+| 30 turns, normal coding | ~74% |
+
+Break-even is one cache hit: the 25% write surcharge is recovered
+the next time the cached prefix is reused at 90% off. Anthropic's
+1024-token minimum-cacheable-prefix floor is enforced server-side;
+the client adds the marker only when the history has at least 3
+messages (a soft-skip so the breakpoint slot isn't burned on
+sub-1024-token histories that almost certainly won't qualify).
+
+Three new tests cover the positive case, the short-history guard,
+and a byte-stability invariant guarding against silent cache busts
+from non-deterministic field ordering.
+
+### Added — `scripts/build.{sh,ps1}` build helpers ([#34](https://github.com/thClaws/thClaws/pull/34), [@chawasit](https://github.com/chawasit))
+
+One-shot cross-platform build helpers. Default behavior: build the
+frontend (`pnpm install` + `pnpm build`), then `cargo build --features
+gui`. The Rust GUI build embeds `frontend/dist/index.html` at compile
+time, so a bare `cargo build --features gui` without a prior frontend
+build fails with a confusing missing-file error from `include_str!`.
+The helpers enforce the order and surface a clear "you forgot to build
+the frontend" message instead.
+
+| `bash` | `PowerShell` | Effect |
+|---|---|---|
+| `scripts/build.sh` | `scripts/build.ps1` | debug build (frontend + cargo) |
+| `--release` | `-Release` | release profile |
+| `--no-frontend` | `-NoFrontend` | skip pnpm steps; assume `frontend/dist` exists |
+| `--check` | `-Check` | full verification suite (`cargo fmt --check`, `clippy -- -D warnings`, `pnpm tsc --noEmit`, `cargo test`) |
+
+Includes a `.gitattributes` that pins `*.sh` to LF and PowerShell /
+batch files to CRLF so the bash script stays executable on Linux/macOS
+even when the repo is checked out on Windows with `core.autocrlf=true`.
+Without this, every Windows checkout would mangle the bash script's
+shebang line and break it on POSIX hosts.
+
+### Internal cleanup
+
+- Two `clippy` warnings in `crates/core/build.rs` cleaned up
+  (`collapsible_str_replace`, `manual_div_ceil`) — these were
+  pre-existing from the v0.5.0 Phase 0 EE work and were noted in
+  the PR descriptions of #33 and #34. `cargo clippy --fix` also
+  applied 8 mechanical fixes across `repl.rs`, `skills.rs`,
+  `providers/mod.rs`, `model_catalogue.rs`, `sso/discovery.rs`, and
+  `bin/catalogue_seed.rs`. **505 lib tests pass.**
+
+## [0.6.0] — 2026-04-27
+
+Minor release — Enterprise Edition Phase 4 (OIDC SSO) + admin
+deployment UX. Open-core users see zero behavior change; every
+feature below is inert unless a verified org policy with
+`policies.sso.enabled` is loaded.
+
+### Added — OIDC SSO (Phase 4)
+
+- **Browser-driven OIDC authorization-code + PKCE flow.** Works
+  against any standards-compliant IdP — Okta, Azure AD / Entra ID,
+  Auth0, Keycloak, Google Workspace, AWS Cognito — selected by
+  `policies.sso.issuer_url` in the active org policy. New module
+  surface under `crates/core/src/sso/`:
+  - `pkce.rs` — RFC 7636 verifier/challenge generator (32-byte
+    OS-RNG verifier → SHA-256 → S256 challenge), RFC 7636 Appendix B
+    test vector covered.
+  - `discovery.rs` — fetches `<issuer>/.well-known/openid-configuration`,
+    validates S256 PKCE support, decodes endpoints. One implementation,
+    all IdPs.
+  - `loopback.rs` — minimal HTTP listener on `127.0.0.1:<random>`
+    (~60 lines `std::net`, no extra HTTP-server dep). Reads request
+    line, extracts `code`/`state`/`error`, returns a friendly "you can
+    close this tab" HTML page, shuts down. 5-minute timeout so a user
+    who closes their browser doesn't hang the agent.
+  - `storage.rs` — keychain persistence via the existing `secrets`
+    module. Cache key is `thclaws-sso-<sha256-of-issuer>` so flipping
+    IdPs doesn't pollute new claims with stale ones. Tokens never
+    touch disk plaintext.
+  - `mod.rs` — public API: `login`, `logout`, `current_session`,
+    `current_access_token`, `status`, `decode_id_token_claims`. Token
+    exchange via `reqwest`. Background refresh kicked off via
+    `tokio::spawn` when within 60s of expiry. CSRF-safe `state` parameter
+    refused on mismatch.
+
+- **Slash commands**: `/sso`, `/sso login`, `/sso logout`, `/sso status`.
+  Wired in both REPL and GUI dispatch.
+
+- **GUI sidebar Identity section**. Three new IPC handlers
+  (`sso_status` / `sso_login` / `sso_logout`) + a React component that
+  renders only when the active policy has `sso.enabled`. Shows
+  signed-in state with email + token-expiry pill + sign-out link, or
+  not-signed-in state with a sign-in button. Open-core deployments
+  never see the section at all.
+
+- **Gateway `{{sso_token}}` substitution wired**. The Phase 3 gateway's
+  auth-header template now resolves `{{sso_token}}` from the active
+  SSO session at request time. Per-user identity flows through to the
+  gateway audit log: instead of "device-token-X used claude-sonnet-4-6"
+  the audit shows "alice@acme.com used claude-sonnet-4-6". Phase 3
+  rendered this placeholder as empty string; v0.6.0 makes it active.
+
+### Added — Policy schema (SsoPolicy fields)
+
+- **`clientSecret`** (inline literal) — for "non-confidential" secrets
+  that ship embedded in every binary copy by design (Google's Desktop
+  OAuth being the canonical example, with Google's own docs explicitly
+  classifying these as not-actually-secret). Recommended for those
+  IdPs because it collapses the deploy story to "one signed file =
+  one deployment artifact."
+
+- **`clientSecretEnv`** (env var name) — for real confidential
+  secrets that should never embed in deployed artifacts. The named env
+  var is read at token-exchange time. Deploy via MDM / login script /
+  OS keychain alongside the binary, in the same channel as the signed
+  policy file.
+
+  Resolution order: `clientSecret` (inline) → `clientSecretEnv` (env
+  lookup) → none (PKCE-only public client). Each layer treats blank /
+  missing as "not set" so a stray space or a left-over `=""` line in
+  `.env` doesn't accidentally authenticate as the empty string.
+
+### Added — Operator workflow (Make targets)
+
+Six new Make targets that drive the EE lifecycle end-to-end:
+
+- `make gen-key` — generates Ed25519 keypair at `thclaws-config/policy.{pub,key}`,
+  chmod 600 on Unix, refuses to overwrite without `FORCE=1`.
+- `make policy-google` — signed policy template targeting
+  `accounts.google.com`, reads `GOOGLE_CLIENT_ID` / optional
+  `GOOGLE_CLIENT_SECRET` from `.env`, embeds inline.
+- `make policy-okta` — Okta tenant template, reads `OKTA_ISSUER_URL` /
+  `OKTA_CLIENT_ID` / optional `OKTA_CLIENT_SECRET`, uses
+  `clientSecretEnv` (Okta secrets are real).
+- `make policy-azure` — Azure / Entra template, reads `AZURE_TENANT_ID`
+  / `AZURE_CLIENT_ID` / optional `AZURE_CLIENT_SECRET`, builds the v2
+  issuer URL automatically (`login.microsoftonline.com/<tenant>/v2.0`
+  — v1 lacks the OIDC discovery doc).
+- `make remove-key` — clears the public key + signed policy from the
+  build-pickup path. Leaves the private key alone (admin may want to
+  keep signing more policies). Idempotent. Useful for "build a clean
+  open-core binary from this same checkout" workflows.
+- `make remove-keypair FORCE=1` — destructive wipe of all keypair
+  material. Refuses without `FORCE=1` because losing the private key
+  means existing signed policies can't be re-signed.
+
+Forward path (open-core → enterprise): `gen-key` → `policy-google` (or
+`policy-okta` / `policy-azure`) → `make build`.
+Backward path (enterprise → open-core): `remove-key` → `make build`.
+
+### Added — Documentation
+
+- **`docs/enterprise-make.md`** — canonical operator reference for the
+  EE lifecycle. Covers prerequisites, target reference, lifecycle
+  workflows (initial setup, re-sign, annual rotation, multi-customer
+  pipeline, switching IdPs, going back to clean open-core),
+  troubleshooting, file layout, and design principles.
+
+- **`ENTERPRISE.md`** updated to reflect Phase 4 shipped: status table
+  moved SSO from "Planned for v0.6.0" to "Shipped".
+
+### Caveats
+
+- **Live smoke confirmed against Google Workspace.** Okta and Azure
+  templates are unit-tested with synthetic credentials but haven't
+  been exercised against a real tenant. Any tenant-specific quirks
+  surface in early customer feedback, not in this CHANGELOG.
+
+- **Frontend hardcoded "thClaws" strings** in `App.tsx` /
+  `ChatView.tsx` still aren't routed through the branding module —
+  same caveat carried over from v0.5.0. Phase 4 covered the GUI
+  Identity section but didn't expand the branding-IPC surface.
+
+- **Tool-call audit (WebFetch / WebSearch URLs)** is still not
+  gateway-routed. Those are general-purpose web fetches, not LLM
+  provider calls, and intentionally bypass the gateway in v0.6.0. An
+  admin who wants to gate them would do so at the network firewall
+  level. A future sub-policy could add this if customers ask.
+
 ## [0.5.0] — 2026-04-27
 
 Minor release. Lands the **Enterprise Edition foundation** (Phases 0–3

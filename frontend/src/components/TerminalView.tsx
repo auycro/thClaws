@@ -194,6 +194,12 @@ export function TerminalView({ active }: Props) {
       term.write("\x1b[2K\r");
       writePrompt();
       lineBuffer = next;
+      // Keep cursorPos in lockstep with the visible xterm cursor.
+      // Without this the user's next keystroke inserts mid-command
+      // (closes #31): Tab/mouse "selects" the command, but cursorPos
+      // stays at the pre-accept position (e.g. 2 after typing "/s"),
+      // so typing arguments mangles the command name.
+      cursorPos = next.length;
       term.write(next);
       recomputeSlash();
     };

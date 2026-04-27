@@ -493,6 +493,51 @@ fn recent_dirs_path() -> Option<std::path::PathBuf> {
     crate::util::home_dir().map(|h| h.join(".config/thclaws/recent_dirs.json"))
 }
 
+/// Snapshot the SSO sidebar state into a JSON event payload. Emitted
+/// in response to `sso_status` / `sso_login` / `sso_logout` IPC calls
+/// from the frontend so the React sidebar can render the right thing
+/// (signed-in pill, sign-in button, or nothing when policy inactive).
+fn build_sso_state_payload() -> serde_json::Value {
+    let policy = crate::policy::active()
+        .and_then(|a| a.policy.policies.sso.as_ref())
+        .cloned();
+    let policy = match policy {
+        Some(p) if p.enabled => p,
+        _ => {
+            return serde_json::json!({
+                "type": "sso_state",
+                "enabled": false,
+                "logged_in": false,
+            });
+        }
+    };
+    match crate::sso::current_session(&policy) {
+        Some(s) if !s.is_expired() => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let remaining = s.expires_at.saturating_sub(now);
+            serde_json::json!({
+                "type": "sso_state",
+                "enabled": true,
+                "logged_in": true,
+                "issuer": s.issuer,
+                "email": s.email,
+                "name": s.name,
+                "sub": s.sub,
+                "expires_in_secs": remaining,
+            })
+        }
+        _ => serde_json::json!({
+            "type": "sso_state",
+            "enabled": true,
+            "logged_in": false,
+            "issuer": policy.issuer_url,
+        }),
+    }
+}
+
 fn load_recent_dirs() -> Vec<String> {
     let Some(path) = recent_dirs_path() else {
         return vec![];
@@ -1141,6 +1186,65 @@ pub fn run_gui() {
                     let _ = proxy_for_ipc.send_event(UserEvent::SessionLoaded(
                         payload.to_string(),
                     ));
+                }
+                // ─── EE Phase 4: org-policy SSO (IPC surface for sidebar) ─
+                "sso_status" => {
+                    let payload = build_sso_state_payload();
+                    let _ = proxy_for_ipc
+                        .send_event(UserEvent::SessionLoaded(payload.to_string()));
+                }
+                "sso_login" => {
+                    let proxy = proxy_for_ipc.clone();
+                    tokio::spawn(async move {
+                        let policy = match crate::policy::active()
+                            .and_then(|a| a.policy.policies.sso.as_ref())
+                            .cloned()
+                        {
+                            Some(p) if p.enabled => p,
+                            _ => {
+                                let payload = serde_json::json!({
+                                    "type": "sso_state",
+                                    "enabled": false,
+                                    "logged_in": false,
+                                    "error": "SSO not enabled in org policy",
+                                });
+                                let _ = proxy.send_event(UserEvent::SessionLoaded(
+                                    payload.to_string(),
+                                ));
+                                return;
+                            }
+                        };
+                        match crate::sso::login(&policy).await {
+                            Ok(_) => {
+                                let payload = build_sso_state_payload();
+                                let _ = proxy.send_event(UserEvent::SessionLoaded(
+                                    payload.to_string(),
+                                ));
+                            }
+                            Err(e) => {
+                                let payload = serde_json::json!({
+                                    "type": "sso_state",
+                                    "enabled": true,
+                                    "logged_in": false,
+                                    "issuer": policy.issuer_url,
+                                    "error": format!("login failed: {e}"),
+                                });
+                                let _ = proxy.send_event(UserEvent::SessionLoaded(
+                                    payload.to_string(),
+                                ));
+                            }
+                        }
+                    });
+                }
+                "sso_logout" => {
+                    if let Some(p) = crate::policy::active()
+                        .and_then(|a| a.policy.policies.sso.as_ref())
+                    {
+                        let _ = crate::sso::logout(p);
+                    }
+                    let payload = build_sso_state_payload();
+                    let _ = proxy_for_ipc
+                        .send_event(UserEvent::SessionLoaded(payload.to_string()));
                 }
                 "get_cwd" => {
                     let cwd = std::env::current_dir()

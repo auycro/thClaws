@@ -748,7 +748,7 @@ mod tests {
         assert_eq!(c.detect_provider().unwrap(), "openai");
         c.model = "ollama/llama3.2".into();
         assert_eq!(c.detect_provider().unwrap(), "ollama");
-        c.model = "gemini-2.0-flash".into();
+        c.model = "gemini-2.5-flash".into();
         assert_eq!(c.detect_provider().unwrap(), "gemini");
     }
 
@@ -757,6 +757,15 @@ mod tests {
         let mut c = AppConfig::default();
         c.model = "mysterymodel".into();
         assert!(c.detect_provider().is_err());
+    }
+
+    #[test]
+    fn detect_provider_covers_openai_compat() {
+        let mut c = AppConfig::default();
+        c.model = "oai/gpt-4o-mini".into();
+        assert_eq!(c.detect_provider().unwrap(), "openai-compat");
+        c.model = "oai/llama-3.1-70b".into();
+        assert_eq!(c.detect_provider().unwrap(), "openai-compat");
     }
 
     #[test]

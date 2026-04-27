@@ -1,9 +1,10 @@
 # thClaws Enterprise Edition — Administrator Guide
 
-> **Status:** Phases 0–3 (policy infrastructure, branding, plugin/skill/MCP
-> allow-list, gateway enforcement) **shipped in v0.5.0**. SSO (Phase 4)
-> lands in v0.6.0; the gateway works with static-token / env-var auth
-> until then. See the "Status by phase" section for details.
+> **Status:** Phases 0–4 (policy infrastructure, branding, plugin/skill/MCP
+> allow-list, gateway enforcement, OIDC SSO) **shipped in v0.6.0**. The
+> EE foundation is feature-complete for the four most-asked-for
+> enterprise controls. See the "Status by phase" section for what each
+> phase covers.
 
 This document is for IT/Security administrators evaluating or deploying
 thClaws inside an organization. Read this if you need to:
@@ -245,8 +246,8 @@ become enforceable as their respective phase ships:
 |---|---|---|---|
 | `branding` (logo, name, support contact, banner) | 1 | ✅ Shipped (Rust-side) | v0.5.0 |
 | `plugins` (allow-list, no-external-scripts, no-external-mcp) | 2 | ✅ Shipped | v0.5.0 |
-| `gateway` (HTTP routing, fail-closed, identity injection) | 3 | ✅ Shipped (static-token / env-var auth) | v0.5.0 |
-| `sso` (OIDC discovery, PKCE, token storage) | 4 | Planned | v0.6.0 |
+| `gateway` (HTTP routing, fail-closed, identity injection) | 3 | ✅ Shipped | v0.5.0 |
+| `sso` (OIDC discovery, PKCE, token storage, gateway identity) | 4 | ✅ Shipped (Google smoke verified) | v0.6.0 |
 
 A policy file with all four blocks present is valid against any v0.5.x+
 build; blocks for unimplemented phases are accepted but inert. Once

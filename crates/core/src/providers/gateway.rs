@@ -125,8 +125,18 @@ pub fn render_template(template: &str) -> String {
         let full_token_end = start + 6 + end_offset + 2;
         out.replace_range(start..full_token_end, &value);
     }
-    // {{sso_token}} → empty in Phase 3 (Phase 4 will populate).
-    out = out.replace("{{sso_token}}", "");
+    // {{sso_token}} → access_token from the active SSO session, when
+    // policies.sso is enabled and the user is logged in. Renders to
+    // empty string when no session — the gateway will surface a 401
+    // and the user is prompted to run /sso login.
+    if out.contains("{{sso_token}}") {
+        let token = crate::policy::active()
+            .and_then(|a| a.policy.policies.sso.as_ref())
+            .filter(|s| s.enabled)
+            .and_then(crate::sso::current_access_token)
+            .unwrap_or_default();
+        out = out.replace("{{sso_token}}", &token);
+    }
     out
 }
 

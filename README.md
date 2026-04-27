@@ -46,7 +46,7 @@ Three tabs, one binary — captured from a live thClaws session looking at its o
 
 ## What makes it different
 
-- **Multi-provider.** Anthropic, OpenAI, Gemini, Alibaba DashScope, OpenRouter, Ollama (local and Anthropic-compatible), and Agentic Press — auto-detected by model name prefix. Switch mid-session with `/model` or swap the whole provider with `/provider`.
+- **Multi-provider.** Anthropic, OpenAI, Gemini, Alibaba DashScope, OpenRouter, Ollama (local and Anthropic-compatible), Agentic Press, plus a generic **OpenAI-compatible** slot (`oai/*`) for LiteLLM / Portkey / Helicone / vLLM / internal proxies — auto-detected by model name prefix. Switch mid-session with `/model` or swap the whole provider with `/provider`.
 
 - **Any knowledge worker, not just engineers.** Chat tab for researchers, PMs, ops, legal, marketing, finance — natural-language prompts, file access, knowledge-base lookup, drafting. Terminal tab for engineers who want the raw REPL. Same engine, same sessions, same config — different preferred surface.
 
@@ -165,6 +165,16 @@ API keys are **never stored in config files** — only in the OS keychain (defau
 - [Security](SECURITY.md) — vulnerability disclosure
 
 For books, training, and commercial deployment, see [agentic-press.com](https://agentic-press.com).
+
+---
+
+## Contributors
+
+Every avatar below has a merged commit in this repo. The roadmap is theirs.
+
+[![Contributors](https://contrib.rocks/image?repo=thClaws/thClaws)](https://github.com/thClaws/thClaws/graphs/contributors)
+
+Auto-generated from the [contributors graph](https://github.com/thClaws/thClaws/graphs/contributors) (refreshes within ~24h of a new merge). Filed a PR or shipped a fix? You'll show up here automatically — no README edit required. For the per-PR attribution of who shipped what, see the entries in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
