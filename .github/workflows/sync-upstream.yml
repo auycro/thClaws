@@ -37,5 +37,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout main
-          git merge upstream/main --ff-only
+          git merge upstream/main --no-ff -m "chore: sync upstream $(date +%Y-%m-%d)"
           git push origin main
