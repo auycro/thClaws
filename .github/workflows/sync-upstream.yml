@@ -2,8 +2,8 @@ name: Sync Upstream
 
 on:
   schedule:
-    - cron: '0 2 * * *'   # every day at 2:00 AM UTC
-  workflow_dispatch:        # allow manual trigger
+    - cron: '0 2 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -29,6 +29,7 @@ jobs:
         id: diff
         run: |
           COUNT=$(git rev-list HEAD..upstream/main --count)
+          echo "Commits behind upstream: $COUNT"
           echo "ahead=$COUNT" >> $GITHUB_OUTPUT
 
       - name: Sync, open PR, and auto-merge
@@ -43,7 +44,6 @@ jobs:
             --head $BRANCH \
             --title "chore: sync upstream $(date +%Y-%m-%d)" \
             --body "Automated daily sync from [thClaws/thClaws](https://github.com/thClaws/thClaws) main branch." \
-            --label "sync,automated" \
           && gh pr merge $BRANCH --merge --auto --delete-branch
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
