@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
 
 jobs:
   sync:
@@ -32,18 +31,11 @@ jobs:
           echo "Commits behind upstream: $COUNT"
           echo "ahead=$COUNT" >> $GITHUB_OUTPUT
 
-      - name: Sync, open PR, and auto-merge
+      - name: Merge upstream into main
         if: steps.diff.outputs.ahead != '0'
         run: |
-          BRANCH="sync/upstream-$(date +%Y%m%d)"
-          git checkout -b $BRANCH upstream/main
-          git push origin $BRANCH --force
-
-          gh pr create \
-            --base main \
-            --head $BRANCH \
-            --title "chore: sync upstream $(date +%Y-%m-%d)" \
-            --body "Automated daily sync from [thClaws/thClaws](https://github.com/thClaws/thClaws) main branch." \
-          && gh pr merge $BRANCH --merge --auto --delete-branch
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout main
+          git merge upstream/main --ff-only
+          git push origin main
