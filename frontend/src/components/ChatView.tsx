@@ -63,7 +63,12 @@ function blobToBase64(blob: Blob): Promise<string> {
   });
 }
 
-export function ChatView() {
+type Props = {
+  active: boolean;
+  modalOpen: boolean;
+};
+
+export function ChatView({ active, modalOpen }: Props) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
@@ -87,7 +92,7 @@ export function ChatView() {
   // streaming turn — slash commands fire instantly so there's nothing
   // useful to autocomplete while the model is still talking.
   const slashOpen =
-    !askPrompt && !streaming && input.startsWith("/");
+    !askPrompt && !streaming && input.startsWith("/") && !input.slice(1).includes(" ");
   const slashQuery = slashOpen ? input.slice(1).split(/\s/)[0] : "";
   const slashFiltered = slashOpen
     ? filterCommands(slashCommands, slashQuery)
@@ -330,6 +335,11 @@ export function ChatView() {
     setSlashIndex(0);
   }, [slashQuery, slashOpen]);
 
+  // Focus the input when the tab becomes active or a modal closes.
+  useEffect(() => {
+    if (active && !modalOpen) inputRef.current?.focus();
+  }, [active, modalOpen]);
+
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
@@ -389,11 +399,10 @@ export function ChatView() {
   };
 
   const acceptSlashCommand = (cmd: SlashCommandInfo) => {
-    // Commands with required args (usage non-empty and not optional)
-    // get the slash + name + trailing space inserted so the user can
-    // immediately type the argument. Zero-arg commands fire on enter.
-    const needsArg = cmd.usage && !cmd.usage.startsWith("[");
-    setInput(`/${cmd.name}${needsArg ? " " : ""}`);
+    // Always append a trailing space so the popup closes (slashOpen
+    // checks for space) and the user can immediately type args or
+    // press Enter.
+    setInput(`/${cmd.name} `);
     setSlashIndex(0);
     inputRef.current?.focus();
   };

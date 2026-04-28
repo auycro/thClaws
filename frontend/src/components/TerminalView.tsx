@@ -54,6 +54,7 @@ const PROMPT = "\x1b[32m❯ \x1b[0m";
 
 interface Props {
   active: boolean;
+  modalOpen: boolean;
 }
 
 function b64decode(s: string): Uint8Array {
@@ -63,7 +64,7 @@ function b64decode(s: string): Uint8Array {
   return out;
 }
 
-export function TerminalView({ active }: Props) {
+export function TerminalView({ active, modalOpen }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -185,23 +186,17 @@ export function TerminalView({ active }: Props) {
       setSlashView({ open: true, query, index, filtered });
     };
 
-    // Accept a command into the line buffer + visible terminal. Args-
-    // required commands (e.g. /model NAME) get a trailing space so the
-    // user can keep typing; zero-arg commands stop at the name.
+    // Accept a command into the line buffer + visible terminal. Always
+    // appends a trailing space so the popup closes and the user can
+    // immediately type args or press Enter.
     const acceptSlashCommand = (cmd: SlashCommandInfo) => {
-      const needsArg = cmd.usage && !cmd.usage.startsWith("[");
-      const next = `/${cmd.name}${needsArg ? " " : ""}`;
+      const next = `/${cmd.name} `;
       term.write("\x1b[2K\r");
       writePrompt();
       lineBuffer = next;
-      // Keep cursorPos in lockstep with the visible xterm cursor.
-      // Without this the user's next keystroke inserts mid-command
-      // (closes #31): Tab/mouse "selects" the command, but cursorPos
-      // stays at the pre-accept position (e.g. 2 after typing "/s"),
-      // so typing arguments mangles the command name.
       cursorPos = next.length;
       term.write(next);
-      recomputeSlash();
+      setSlashView(SLASH_VIEW_CLOSED);
     };
     acceptSlashRef.current = acceptSlashCommand;
 
@@ -265,6 +260,7 @@ export function TerminalView({ active }: Props) {
             return false;
           }
           if (e.key === "Tab") {
+            e.preventDefault();
             const cmd = sv.filtered[sv.index];
             if (cmd) acceptSlashCommand(cmd);
             return false;
@@ -653,9 +649,9 @@ export function TerminalView({ active }: Props) {
     };
   }, []);
 
-  // Refit + focus when the tab becomes active.
+  // Refit + focus when the tab becomes active or a modal closes.
   useEffect(() => {
-    if (!active) return;
+    if (!active || modalOpen) return;
     const t = termRef.current;
     const f = fitRef.current;
     if (!t) return;
@@ -663,7 +659,7 @@ export function TerminalView({ active }: Props) {
       try { f?.fit(); } catch { /* fit() may throw on zero-size or disposed container */ }
       t.focus();
     });
-  }, [active]);
+  }, [active, modalOpen]);
 
   // Live theme swap.
   useEffect(() => {
