@@ -126,6 +126,16 @@ pub enum SlashCommand {
         project: bool,
     },
     SkillShow(String),
+    /// `/skill marketplace` — list all skills in the marketplace catalogue.
+    /// `--refresh` forces a remote fetch before listing.
+    SkillMarketplace {
+        refresh: bool,
+    },
+    /// `/skill search <query>` — case-insensitive substring match across
+    /// name / description / category in the marketplace catalogue.
+    SkillSearch(String),
+    /// `/skill info <name>` — detail view for one marketplace entry.
+    SkillInfo(String),
     Permissions(String),
     Team,
     Usage,
@@ -450,18 +460,39 @@ pub fn parse_slash(input: &str) -> Option<SlashCommand> {
         },
         "skills" => SlashCommand::Skills,
         "skill" => {
-            // Supported (project scope is the default; --user opts out):
-            //   /skill install <url>
-            //   /skill install --user <url>
-            //   /skill install <url> <name>
-            //   /skill install --user <url> <name>
-            // `<url>` is either a git repo or a `.zip` archive URL.
+            // Supported subcommands:
+            //   /skill show <name>                                  — installed-skill detail
+            //   /skill install [--user] <url-or-zip-or-name> [name] — install (URL or marketplace name)
+            //   /skill marketplace [--refresh]                      — list marketplace
+            //   /skill search <query>                               — search marketplace
+            //   /skill info <name>                                  — marketplace detail
+            //
+            // For `/skill install <X>`, `<X>` may be a git URL, a `.zip`
+            // URL (incl. our `<repo>#<branch>:<subpath>` extension),
+            // or a marketplace name. The dispatcher in the executor
+            // detects which form it is and routes accordingly.
             let rest = args.trim();
             if let Some(after_show) = rest.strip_prefix("show").map(str::trim_start) {
                 if after_show.is_empty() {
                     SlashCommand::Unknown("usage: /skill show <name>".into())
                 } else {
                     SlashCommand::SkillShow(after_show.to_string())
+                }
+            } else if let Some(after_mp) = rest.strip_prefix("marketplace").map(str::trim_start) {
+                let parts: Vec<&str> = after_mp.split_whitespace().collect();
+                let refresh = parts.iter().any(|p| *p == "--refresh");
+                SlashCommand::SkillMarketplace { refresh }
+            } else if let Some(after_search) = rest.strip_prefix("search").map(str::trim_start) {
+                if after_search.is_empty() {
+                    SlashCommand::Unknown("usage: /skill search <query>".into())
+                } else {
+                    SlashCommand::SkillSearch(after_search.to_string())
+                }
+            } else if let Some(after_info) = rest.strip_prefix("info").map(str::trim_start) {
+                if after_info.is_empty() {
+                    SlashCommand::Unknown("usage: /skill info <name>".into())
+                } else {
+                    SlashCommand::SkillInfo(after_info.to_string())
                 }
             } else if let Some(after_install) = rest.strip_prefix("install").map(str::trim_start) {
                 let mut project = true;
@@ -475,23 +506,23 @@ pub fn parse_slash(input: &str) -> Option<SlashCommand> {
                     parts.remove(0);
                 }
                 match parts.as_slice() {
-                    [url] => SlashCommand::SkillInstall {
-                        git_url: url.to_string(),
+                    [url_or_name] => SlashCommand::SkillInstall {
+                        git_url: url_or_name.to_string(),
                         name: None,
                         project,
                     },
-                    [url, name] => SlashCommand::SkillInstall {
-                        git_url: url.to_string(),
+                    [url_or_name, name] => SlashCommand::SkillInstall {
+                        git_url: url_or_name.to_string(),
                         name: Some(name.to_string()),
                         project,
                     },
                     _ => SlashCommand::Unknown(
-                        "usage: /skill install [--user] <git-url-or-.zip> [name]".into(),
+                        "usage: /skill install [--user] <name-or-git-url-or-.zip> [name]".into(),
                     ),
                 }
             } else {
                 SlashCommand::Unknown(format!(
-                    "unknown skill subcommand: '{rest}' (try: /skill install …)"
+                    "unknown skill subcommand: '{rest}' (try: /skill install, /skill marketplace, /skill search, /skill info)"
                 ))
             }
         }
@@ -623,6 +654,81 @@ pub struct BuiltInCommand {
     pub usage: &'static str,
 }
 
+/// Decide how to interpret the argument to `/skill install <X>`:
+///
+///   * URL-shaped (`http://`, `https://`, `git@`, `.zip`, contains `://`,
+///     starts with `/`, or carries our `<repo>#<branch>:<subpath>`
+///     extension) → install_from_url gets `<X>` directly, optional
+///     `name` from the second arg.
+///   * Otherwise (bare slug like `skill-creator`) → look up in the
+///     marketplace catalogue. Resolved `install_url` becomes the URL we
+///     hand to `install_from_url`; the name defaults to the marketplace
+///     entry's slug if the user didn't pass one explicitly.
+///
+/// Returns `(effective_url, effective_name, abort_msg)`. If `abort_msg`
+/// is `Some`, the caller should print it and skip install (used for
+/// linked-only entries and unknown names).
+fn resolve_skill_install_target(
+    arg: &str,
+    explicit_name: Option<&str>,
+) -> (String, Option<String>, Option<String>) {
+    if looks_like_url(arg) {
+        return (arg.to_string(), explicit_name.map(String::from), None);
+    }
+    let mp = crate::marketplace::load();
+    match mp.find(arg) {
+        Some(entry) if entry.license_tier == "linked-only" => {
+            let homepage = if entry.homepage.is_empty() {
+                "the upstream repo".to_string()
+            } else {
+                entry.homepage.clone()
+            };
+            (
+                String::new(),
+                None,
+                Some(format!(
+                    "'{}' is source-available and cannot be redistributed — install directly from {}",
+                    entry.name, homepage
+                )),
+            )
+        }
+        Some(entry) => match &entry.install_url {
+            Some(url) => (
+                url.clone(),
+                Some(explicit_name.map(String::from).unwrap_or_else(|| entry.name.clone())),
+                None,
+            ),
+            None => (
+                String::new(),
+                None,
+                Some(format!(
+                    "'{}' has no install_url in the marketplace catalogue",
+                    entry.name
+                )),
+            ),
+        },
+        None => (
+            String::new(),
+            None,
+            Some(format!(
+                "no skill named '{arg}' in marketplace and not a URL — try /skill search <query> or pass a git URL"
+            )),
+        ),
+    }
+}
+
+/// Heuristic: does this argument look like a URL or a bare marketplace
+/// name? Conservative — when in doubt we prefer URL (so a typo in a
+/// marketplace name doesn't accidentally hit some local path).
+fn looks_like_url(s: &str) -> bool {
+    s.contains("://")
+        || s.starts_with("git@")
+        || s.starts_with('/')
+        || s.starts_with("./")
+        || s.starts_with("../")
+        || s.to_ascii_lowercase().ends_with(".zip")
+}
+
 // Hand-aligned struct-literal table — keeping the columns reads well at a
 // glance and rustfmt's exploded form (~6 lines per row) bloats the function
 // to >180 lines for the same content. Skip for the table only.
@@ -654,6 +760,7 @@ pub fn built_in_commands() -> &'static [BuiltInCommand] {
 
         // Skills, plugins, MCP
         BuiltInCommand { name: "skills",   description: "List installed skills",                      category: "Extensions", usage: "" },
+        BuiltInCommand { name: "skill",    description: "Skill subcommands (install / marketplace / search / info / show)", category: "Extensions", usage: "<sub> [args]" },
         BuiltInCommand { name: "plugins",  description: "List installed plugins",                     category: "Extensions", usage: "" },
         BuiltInCommand { name: "mcp",      description: "List active MCP servers and their tools",    category: "Extensions", usage: "" },
 
@@ -1909,10 +2016,17 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
         });
     }
 
-    // Shared readline editor for spawn_blocking calls.
-    let rl_mutex = std::sync::Arc::new(std::sync::Mutex::new(
-        rustyline::DefaultEditor::new().map_err(|e| Error::Agent(format!("readline init: {e}")))?,
-    ));
+    // Shared readline editor for spawn_blocking calls. Helper enables
+    // Tab-completion of slash commands plus inline ghost-text hints
+    // (see `crate::cli_completer`). Default Circular completion: Tab
+    // cycles through matches; the Hinter shows a dim suggestion after
+    // the cursor that Right-arrow accepts.
+    let mut rl: rustyline::Editor<
+        crate::cli_completer::SlashCompleter,
+        rustyline::history::DefaultHistory,
+    > = rustyline::Editor::new().map_err(|e| Error::Agent(format!("readline init: {e}")))?;
+    rl.set_helper(Some(crate::cli_completer::SlashCompleter));
+    let rl_mutex = std::sync::Arc::new(std::sync::Mutex::new(rl));
 
     // Helper: process team inbox messages and run agent turn.
     macro_rules! process_team_messages {
@@ -3314,25 +3428,166 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     }
                 }
                 SlashCommand::SkillInstall { git_url, name, project } => {
-                    match crate::skills::install_from_url(&git_url, name.as_deref(), project).await {
-                        Ok(report) => {
-                            for line in report {
-                                println!("{COLOR_DIM}  {line}{COLOR_RESET}");
+                    // Resolve the argument: if it parses as a URL (http/https/git@/.zip)
+                    // or a `<repo>#<branch>:<subpath>` extension, install
+                    // directly. Otherwise treat it as a marketplace name
+                    // and look up the install_url from the catalogue.
+                    let (effective_url, effective_name, abort_msg) =
+                        resolve_skill_install_target(&git_url, name.as_deref());
+                    if let Some(msg) = abort_msg {
+                        println!("{COLOR_YELLOW}{msg}{COLOR_RESET}");
+                    } else {
+                        match crate::skills::install_from_url(&effective_url, effective_name.as_deref(), project).await {
+                            Ok(report) => {
+                                for line in report {
+                                    println!("{COLOR_DIM}  {line}{COLOR_RESET}");
+                                }
+                                // Refresh both the shared SkillStore (so the
+                                // Skill tool can load the new content) and the
+                                // local `skill_names` (so `/<skill-name>` works
+                                // without restart).
+                                let refreshed = crate::skills::SkillStore::discover();
+                                skill_names = refreshed.skills.keys().cloned().collect();
+                                if let Some(handle) = &skill_store_handle {
+                                    if let Ok(mut store) = handle.lock() {
+                                        *store = refreshed;
+                                    }
+                                }
                             }
-                            // Refresh both the shared SkillStore (so the
-                            // Skill tool can load the new content) and the
-                            // local `skill_names` (so `/<skill-name>` works
-                            // without restart).
-                            let refreshed = crate::skills::SkillStore::discover();
-                            skill_names = refreshed.skills.keys().cloned().collect();
-                            if let Some(handle) = &skill_store_handle {
-                                if let Ok(mut store) = handle.lock() {
-                                    *store = refreshed;
+                            Err(e) => {
+                                println!("{COLOR_YELLOW}skill install failed: {e}{COLOR_RESET}");
+                            }
+                        }
+                    }
+                }
+                SlashCommand::SkillMarketplace { refresh } => {
+                    if refresh {
+                        match crate::marketplace::refresh_from_remote().await {
+                            Ok(out) => {
+                                println!(
+                                    "{COLOR_DIM}refreshed marketplace from {} — {} skill(s){COLOR_RESET}",
+                                    crate::marketplace::REMOTE_URL,
+                                    out.skill_count
+                                );
+                            }
+                            Err(e) => {
+                                println!(
+                                    "{COLOR_YELLOW}refresh failed ({e}); using cached/baseline catalogue{COLOR_RESET}"
+                                );
+                            }
+                        }
+                    }
+                    let mp = crate::marketplace::load();
+                    println!(
+                        "{COLOR_DIM}marketplace ({}, {} skill(s)){COLOR_RESET}",
+                        mp.source,
+                        mp.skills.len()
+                    );
+                    // Group by category so the listing reads like a catalog.
+                    let mut by_cat: std::collections::BTreeMap<String, Vec<&crate::marketplace::MarketplaceSkill>> =
+                        std::collections::BTreeMap::new();
+                    for s in &mp.skills {
+                        let cat = if s.category.is_empty() {
+                            "other".to_string()
+                        } else {
+                            s.category.clone()
+                        };
+                        by_cat.entry(cat).or_default().push(s);
+                    }
+                    for (cat, skills) in by_cat {
+                        println!("{COLOR_DIM}── {cat} ──{COLOR_RESET}");
+                        for s in skills {
+                            let tier_tag = match s.license_tier.as_str() {
+                                "linked-only" => " [linked-only]",
+                                _ => "",
+                            };
+                            println!(
+                                "{COLOR_DIM}  {:<24}{tier_tag} — {}{COLOR_RESET}",
+                                s.name,
+                                s.short_line()
+                            );
+                        }
+                    }
+                    println!(
+                        "{COLOR_DIM}install with: /skill install <name>   |   detail: /skill info <name>{COLOR_RESET}"
+                    );
+                }
+                SlashCommand::SkillSearch(query) => {
+                    let mp = crate::marketplace::load();
+                    let hits = mp.search(&query);
+                    if hits.is_empty() {
+                        println!(
+                            "{COLOR_DIM}no matches for '{query}' — try /skill marketplace to browse all{COLOR_RESET}"
+                        );
+                    } else {
+                        println!(
+                            "{COLOR_DIM}{} match(es) for '{query}':{COLOR_RESET}",
+                            hits.len()
+                        );
+                        for s in hits {
+                            println!(
+                                "{COLOR_DIM}  {:<24} — {}{COLOR_RESET}",
+                                s.name,
+                                s.short_line()
+                            );
+                        }
+                    }
+                }
+                SlashCommand::SkillInfo(name) => {
+                    let mp = crate::marketplace::load();
+                    match mp.find(&name) {
+                        Some(s) => {
+                            println!("{COLOR_DIM}name:        {}{COLOR_RESET}", s.name);
+                            println!("{COLOR_DIM}description: {}{COLOR_RESET}", s.description);
+                            if !s.category.is_empty() {
+                                println!("{COLOR_DIM}category:    {}{COLOR_RESET}", s.category);
+                            }
+                            println!(
+                                "{COLOR_DIM}license:     {} ({}){COLOR_RESET}",
+                                s.license, s.license_tier
+                            );
+                            if !s.source_repo.is_empty() {
+                                println!(
+                                    "{COLOR_DIM}source:      {}{}{COLOR_RESET}",
+                                    s.source_repo,
+                                    if s.source_path.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(" ({})", s.source_path)
+                                    }
+                                );
+                            }
+                            if !s.homepage.is_empty() {
+                                println!("{COLOR_DIM}homepage:    {}{COLOR_RESET}", s.homepage);
+                            }
+                            match (s.license_tier.as_str(), s.install_url.as_ref()) {
+                                ("linked-only", _) => {
+                                    println!(
+                                        "{COLOR_YELLOW}install:     not redistributable — install from {}{COLOR_RESET}",
+                                        if s.homepage.is_empty() {
+                                            "the upstream repo"
+                                        } else {
+                                            &s.homepage
+                                        }
+                                    );
+                                }
+                                (_, Some(url)) => {
+                                    println!(
+                                        "{COLOR_DIM}install:     /skill install {} (resolves to {url}){COLOR_RESET}",
+                                        s.name
+                                    );
+                                }
+                                (_, None) => {
+                                    println!(
+                                        "{COLOR_YELLOW}install:     no install_url in catalogue{COLOR_RESET}"
+                                    );
                                 }
                             }
                         }
-                        Err(e) => {
-                            println!("{COLOR_YELLOW}skill install failed: {e}{COLOR_RESET}");
+                        None => {
+                            println!(
+                                "{COLOR_YELLOW}no skill named '{name}' in marketplace — try /skill search <query>{COLOR_RESET}"
+                            );
                         }
                     }
                 }
@@ -4027,6 +4282,82 @@ mod tests {
     }
 
     #[test]
+    fn parse_slash_skill_marketplace() {
+        assert_eq!(
+            parse_slash("/skill marketplace"),
+            Some(SlashCommand::SkillMarketplace { refresh: false })
+        );
+        assert_eq!(
+            parse_slash("/skill marketplace --refresh"),
+            Some(SlashCommand::SkillMarketplace { refresh: true })
+        );
+        assert_eq!(
+            parse_slash("/skill search playwright"),
+            Some(SlashCommand::SkillSearch("playwright".into()))
+        );
+        assert!(matches!(
+            parse_slash("/skill search"),
+            Some(SlashCommand::Unknown(msg)) if msg.contains("usage: /skill search")
+        ));
+        assert_eq!(
+            parse_slash("/skill info skill-creator"),
+            Some(SlashCommand::SkillInfo("skill-creator".into()))
+        );
+        assert!(matches!(
+            parse_slash("/skill info"),
+            Some(SlashCommand::Unknown(msg)) if msg.contains("usage: /skill info")
+        ));
+    }
+
+    #[test]
+    fn parse_slash_skill_install_bare_name() {
+        // Bare name (no URL): parser still emits SkillInstall — the
+        // executor decides if it's a marketplace lookup.
+        assert_eq!(
+            parse_slash("/skill install skill-creator"),
+            Some(SlashCommand::SkillInstall {
+                git_url: "skill-creator".into(),
+                name: None,
+                project: true,
+            })
+        );
+        // URL form still works.
+        assert_eq!(
+            parse_slash("/skill install https://github.com/x/y.git"),
+            Some(SlashCommand::SkillInstall {
+                git_url: "https://github.com/x/y.git".into(),
+                name: None,
+                project: true,
+            })
+        );
+        // --user flag.
+        assert_eq!(
+            parse_slash("/skill install --user skill-creator"),
+            Some(SlashCommand::SkillInstall {
+                git_url: "skill-creator".into(),
+                name: None,
+                project: false,
+            })
+        );
+    }
+
+    #[test]
+    fn looks_like_url_classification() {
+        assert!(looks_like_url("https://x.com/r.git"));
+        assert!(looks_like_url("http://x.com/r.git"));
+        assert!(looks_like_url("git@github.com:x/y.git"));
+        assert!(looks_like_url("/local/path"));
+        assert!(looks_like_url("./relative"));
+        assert!(looks_like_url("../up"));
+        assert!(looks_like_url("https://x.com/r.git#main:skills/foo"));
+        assert!(looks_like_url("https://example.com/pack.zip"));
+        // Marketplace slug (NOT a URL).
+        assert!(!looks_like_url("skill-creator"));
+        assert!(!looks_like_url("frontend-design"));
+        assert!(!looks_like_url("webapp-testing"));
+    }
+
+    #[test]
     fn parse_slash_kms() {
         assert_eq!(parse_slash("/kms"), Some(SlashCommand::Kms));
         assert_eq!(parse_slash("/kms list"), Some(SlashCommand::Kms));
@@ -4243,6 +4574,108 @@ mod tests {
         }
         if let Some(v) = saved_g {
             std::env::set_var("GEMINI_API_KEY", v);
+        }
+    }
+
+    // --- SlashCompleter tests ---------------------------------------------
+    //
+    // Exercise `crate::cli_completer::SlashCompleter` directly so we don't
+    // need a real terminal. The candidate set is sourced from
+    // `built_in_commands()`, so these double as a regression guard against
+    // accidentally dropping a command from the public list.
+    mod completer_tests {
+        use crate::cli_completer::SlashCompleter;
+        use rustyline::completion::Completer;
+        use rustyline::hint::Hinter;
+        use rustyline::history::DefaultHistory;
+        use rustyline::Context;
+
+        fn complete(line: &str, pos: usize) -> Vec<(String, String)> {
+            let history = DefaultHistory::new();
+            let ctx = Context::new(&history);
+            let (_start, pairs) = SlashCompleter
+                .complete(line, pos, &ctx)
+                .expect("completer ok");
+            pairs
+                .into_iter()
+                .map(|p| (p.display, p.replacement))
+                .collect()
+        }
+
+        fn hint(line: &str, pos: usize) -> Option<String> {
+            let history = DefaultHistory::new();
+            let ctx = Context::new(&history);
+            SlashCompleter.hint(line, pos, &ctx)
+        }
+
+        #[test]
+        fn slash_completer_lists_all_on_just_slash() {
+            let pairs = complete("/", 1);
+            assert_eq!(pairs.len(), super::built_in_commands().len());
+        }
+
+        #[test]
+        fn slash_completer_filters_by_prefix() {
+            let pairs = complete("/he", 3);
+            assert_eq!(pairs.len(), 1, "only /help should match: {pairs:?}");
+            assert!(pairs[0].1.starts_with("/help"));
+        }
+
+        #[test]
+        fn slash_completer_multiple_matches() {
+            let pairs = complete("/m", 2);
+            let names: Vec<&str> = pairs.iter().map(|(_, r)| r.trim()).collect();
+            for expected in ["/mcp", "/memory", "/model", "/models"] {
+                assert!(
+                    names.contains(&expected),
+                    "expected {expected} in {names:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn slash_completer_no_match_for_non_slash() {
+            assert!(complete("hello", 5).is_empty());
+        }
+
+        #[test]
+        fn slash_completer_no_match_after_first_word() {
+            // v1 only completes the leading slash-token; once the user types
+            // a space, the completer bows out.
+            assert!(complete("/model ", 7).is_empty());
+        }
+
+        #[test]
+        fn hinter_returns_remainder_for_unique_prefix() {
+            // `/he` → only `/help` matches → hint shows `lp`.
+            assert_eq!(hint("/he", 3).as_deref(), Some("lp"));
+        }
+
+        #[test]
+        fn hinter_returns_remainder_for_first_match_when_ambiguous() {
+            // `/m` matches several commands; we show the first one's
+            // remainder so the user still sees *something*. Tab cycles
+            // through the rest.
+            let h = hint("/m", 2).expect("expected a hint");
+            assert!(!h.is_empty());
+            // First match in the catalogue starting with `m` must be one of
+            // the known commands; we just guard against an empty/garbled
+            // hint.
+            assert!(
+                ["cp", "emory", "odel", "odels"].contains(&h.as_str()),
+                "unexpected hint: {h:?}"
+            );
+        }
+
+        #[test]
+        fn hinter_silent_for_bare_slash() {
+            // No char after `/` → don't pick an arbitrary command.
+            assert_eq!(hint("/", 1), None);
+        }
+
+        #[test]
+        fn hinter_silent_for_non_slash() {
+            assert_eq!(hint("hello", 5), None);
         }
     }
 }

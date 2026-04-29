@@ -7,6 +7,7 @@
 pub mod agent;
 pub mod agent_defs;
 pub mod branding;
+mod cli_completer;
 pub mod commands;
 pub mod compaction;
 pub mod config;
@@ -18,6 +19,7 @@ pub mod error;
 pub mod gui;
 pub mod hooks;
 pub mod kms;
+pub mod marketplace;
 pub mod mcp;
 pub mod memory;
 pub mod model_catalogue;

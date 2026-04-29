@@ -83,6 +83,36 @@ jobs:
       # Warnings logged but not fatal — cleanup tracked separately from launch
       - run: cargo clippy --features gui
 
+  # Cross-platform release-profile build verification. Catches Windows-
+  # specific compile errors on every push/PR rather than waiting for the
+  # next release tag. Build-only — tests still run on ubuntu/macos
+  # because Windows tests assume Unix path separators (see `test` job
+  # comment below).
+  build:
+    name: build (${{ matrix.os }})
+    needs: frontend
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      - name: Install Linux GUI dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
+      - uses: actions/download-artifact@v5
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+      - run: cargo build --release --features gui --bin thclaws
+
   # Test matrix across major platforms
   test:
     name: test (${{ matrix.os }})

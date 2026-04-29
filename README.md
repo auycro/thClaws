@@ -172,7 +172,7 @@ For books, training, and commercial deployment, see [agentic-press.com](https://
 
 Every avatar below has a merged commit in this repo. The roadmap is theirs.
 
-[![Contributors](https://contrib.rocks/image?repo=thClaws/thClaws)](https://github.com/thClaws/thClaws/graphs/contributors)
+[![Contributors](https://contrib.rocks/image?repo=thClaws/thClaws&refresh=2026-04-29)](https://github.com/thClaws/thClaws/graphs/contributors)
 
 Auto-generated from the [contributors graph](https://github.com/thClaws/thClaws/graphs/contributors) (refreshes within ~24h of a new merge). Filed a PR or shipped a fix? You'll show up here automatically — no README edit required. For the per-PR attribution of who shipped what, see the entries in [CHANGELOG.md](CHANGELOG.md).
 
