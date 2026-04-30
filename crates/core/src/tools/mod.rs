@@ -14,32 +14,54 @@ use std::sync::Arc;
 
 pub mod ask;
 pub mod bash;
+pub mod docx_create;
+pub mod docx_edit;
+pub mod docx_read;
 pub mod edit;
 pub mod glob;
 pub mod grep;
 pub mod kms;
 pub mod ls;
+pub mod pdf_create;
+pub mod pdf_read;
 pub mod plan;
+pub mod pptx_create;
+pub mod pptx_edit;
+pub mod pptx_read;
 pub mod read;
 pub mod search;
 pub mod tasks;
 pub mod todo;
 pub mod web;
 pub mod write;
+pub mod xlsx_create;
+pub mod xlsx_edit;
+pub mod xlsx_read;
 
 pub use ask::{set_gui_ask_sender, AskUserRequest, AskUserTool};
 pub use bash::BashTool;
+pub use docx_create::DocxCreateTool;
+pub use docx_edit::DocxEditTool;
+pub use docx_read::DocxReadTool;
 pub use edit::EditTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use kms::{KmsReadTool, KmsSearchTool};
 pub use ls::LsTool;
+pub use pdf_create::PdfCreateTool;
+pub use pdf_read::PdfReadTool;
 pub use plan::{EnterPlanModeTool, ExitPlanModeTool};
+pub use pptx_create::PptxCreateTool;
+pub use pptx_edit::PptxEditTool;
+pub use pptx_read::PptxReadTool;
 pub use read::ReadTool;
 pub use search::WebSearchTool;
 pub use todo::TodoWriteTool;
 pub use web::WebFetchTool;
 pub use write::WriteTool;
+pub use xlsx_create::XlsxCreateTool;
+pub use xlsx_edit::XlsxEditTool;
+pub use xlsx_read::XlsxReadTool;
 
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -86,6 +108,17 @@ impl ToolRegistry {
         r.register(Arc::new(GlobTool));
         r.register(Arc::new(GrepTool));
         r.register(Arc::new(BashTool));
+        r.register(Arc::new(DocxCreateTool));
+        r.register(Arc::new(DocxEditTool));
+        r.register(Arc::new(DocxReadTool));
+        r.register(Arc::new(XlsxCreateTool));
+        r.register(Arc::new(XlsxEditTool));
+        r.register(Arc::new(XlsxReadTool));
+        r.register(Arc::new(PptxCreateTool));
+        r.register(Arc::new(PptxEditTool));
+        r.register(Arc::new(PptxReadTool));
+        r.register(Arc::new(PdfCreateTool));
+        r.register(Arc::new(PdfReadTool));
         r.register(Arc::new(WebFetchTool::new()));
         r.register(Arc::new(WebSearchTool::default()));
         r.register(Arc::new(AskUserTool));
@@ -176,17 +209,28 @@ mod tests {
             vec![
                 "AskUserQuestion",
                 "Bash",
+                "DocxCreate",
+                "DocxEdit",
+                "DocxRead",
                 "Edit",
                 "EnterPlanMode",
                 "ExitPlanMode",
                 "Glob",
                 "Grep",
                 "Ls",
+                "PdfCreate",
+                "PdfRead",
+                "PptxCreate",
+                "PptxEdit",
+                "PptxRead",
                 "Read",
                 "TodoWrite",
                 "WebFetch",
                 "WebSearch",
-                "Write"
+                "Write",
+                "XlsxCreate",
+                "XlsxEdit",
+                "XlsxRead"
             ]
         );
         for def in &defs {

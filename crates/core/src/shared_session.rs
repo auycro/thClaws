@@ -154,6 +154,11 @@ pub enum ViewEvent {
     /// Emitted after `/kms new | use | off` so the sidebar reflects
     /// the new state without waiting for the next full session_update.
     KmsUpdate(String),
+    /// Sidebar MCP server list refresh — pre-built JSON payload shaped
+    /// like `{type: "mcp_update", servers: [{name, tools}, ...]}`.
+    /// Emitted after `/mcp add | remove` so the sidebar reflects the
+    /// new state without waiting for the next full session_update.
+    McpUpdate(String),
     /// Open the GUI's interactive model picker — pre-built JSON payload
     /// shaped like `{type: "model_picker_open", provider, current,
     /// models: [{id, context, max_output}, ...]}`. Emitted by the
@@ -990,6 +995,45 @@ async fn handle_line(
     );
 
     if trimmed.starts_with('/') {
+        // `/<skill-name> [args]` shortcut — same UX as the CLI repl
+        // (see repl.rs:2406). If `parse_slash` returns Unknown AND the
+        // first word matches an installed skill name, rewrite to a
+        // normal user prompt and fall through to the regular agent
+        // pipeline; the model then calls `Skill(name: …)` to load the
+        // skill content. Without this, every plugin-contributed skill
+        // surfaced as "unknown command" in the GUI even when the
+        // skill was loaded into the registry.
+        if let Some(crate::repl::SlashCommand::Unknown(what)) = crate::repl::parse_slash(trimmed) {
+            let word = what.split_whitespace().next().unwrap_or("").to_string();
+            let skill_present = state
+                .skill_store
+                .lock()
+                .ok()
+                .map(|s| s.skills.contains_key(&word))
+                .unwrap_or(false);
+            if skill_present {
+                let body = trimmed.strip_prefix('/').unwrap_or("").trim_start();
+                let args = body.strip_prefix(&word).unwrap_or("").trim();
+                let args_note = if args.is_empty() {
+                    String::new()
+                } else {
+                    format!(" The user's task for this skill: {args}")
+                };
+                let rewritten = format!(
+                    "The user ran the `/{word}` slash command. Call `Skill(name: \"{word}\")` right away and follow the instructions it returns.{args_note}"
+                );
+                // Fall through to the regular agent pipeline below
+                // with the rewritten prompt instead of dispatching as
+                // a slash command.
+                emit_skill_resolution_hint(events_tx, &word);
+                let stream = Box::pin(state.agent.run_turn(rewritten));
+                let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
+                let _ = lead_mb.write_status("lead", "working", None);
+                drive_turn_stream(stream, state, events_tx, cancel, &lead_mb).await;
+                return;
+            }
+        }
+
         crate::shell_dispatch::dispatch(trimmed, state, events_tx).await;
         let _ = events_tx.send(ViewEvent::TurnDone);
         return;
@@ -1148,6 +1192,14 @@ async fn drive_turn_stream(
             _ => {}
         }
     }
+}
+
+/// Surface the `/skill → Skill(name: …)` resolution to the user the
+/// same way the CLI does, so it's clear which skill is about to fire.
+fn emit_skill_resolution_hint(events_tx: &broadcast::Sender<ViewEvent>, name: &str) {
+    let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+        "(/{name} → Skill(name: \"{name}\"))"
+    )));
 }
 
 fn write_lead_log(log: &std::sync::Arc<std::sync::Mutex<Option<std::fs::File>>>, s: &str) {
@@ -1431,6 +1483,20 @@ fn team_grounding_prompt(model: &str, team_enabled: bool) -> String {
     out
 }
 
+/// Squash any control char (newline, carriage return, tab, ESC, etc.)
+/// to a single space so a multi-line tool argument renders as one
+/// line in the terminal. Keeps printable Unicode (Thai, emoji, etc.)
+/// intact — only ASCII control chars get replaced. Then collapses
+/// runs of whitespace so a sanitized multi-line string doesn't read
+/// as `Line 1   Line 2  ` after stripping.
+fn sanitize_label_field(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn format_tool_label(name: &str, input: &serde_json::Value) -> String {
     let detail = match name {
         "Skill" => input
@@ -1442,8 +1508,19 @@ fn format_tool_label(name: &str, input: &serde_json::Value) -> String {
             .and_then(|v| v.as_str())
             .map(|a| format!("(agent={a})")),
         "Bash" => input.get("command").and_then(|v| v.as_str()).map(|c| {
-            let first: String = c.chars().take(40).collect();
-            format!("({first}{})", if c.chars().count() > 40 { "…" } else { "" })
+            // Same control-char strip as AskUserQuestion — bash
+            // commands often contain heredocs (`<<'PY' ... PY`) whose
+            // newlines break the single-line label.
+            let cleaned = sanitize_label_field(c);
+            let first: String = cleaned.chars().take(40).collect();
+            format!(
+                "({first}{})",
+                if cleaned.chars().count() > 40 {
+                    "…"
+                } else {
+                    ""
+                }
+            )
         }),
         "Read" | "Write" | "Edit" => input
             .get("path")
@@ -1462,10 +1539,18 @@ fn format_tool_label(name: &str, input: &serde_json::Value) -> String {
             .and_then(|v| v.as_str())
             .map(|q| format!("({q})")),
         "AskUserQuestion" => input.get("question").and_then(|v| v.as_str()).map(|q| {
-            let first: String = q.chars().take(60).collect();
+            // Strip newlines / control chars first — agents often pass
+            // multi-line prompts here, and the raw text breaks the
+            // single-line tool label in xterm.
+            let cleaned = sanitize_label_field(q);
+            let first: String = cleaned.chars().take(60).collect();
             format!(
                 "({first}{})",
-                if q.chars().count() > 60 { "..." } else { "" }
+                if cleaned.chars().count() > 60 {
+                    "..."
+                } else {
+                    ""
+                }
             )
         }),
         _ => None,

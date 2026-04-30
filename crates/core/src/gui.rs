@@ -184,6 +184,7 @@ fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
         ViewEvent::SessionListRefresh(json) => vec![json.clone()],
         ViewEvent::ProviderUpdate(json) => vec![json.clone()],
         ViewEvent::KmsUpdate(json) => vec![json.clone()],
+        ViewEvent::McpUpdate(json) => vec![json.clone()],
         ViewEvent::ModelPickerOpen(json) => vec![json.clone()],
         ViewEvent::ContextWarning { file_size_mb } => vec![serde_json::json!({
             "type": "chat_context_warning",
@@ -291,6 +292,39 @@ mod ansi_strip_tests {
     }
 }
 
+#[cfg(test)]
+mod csv_table_tests {
+    use super::csv_to_markdown_table;
+
+    #[test]
+    fn renders_basic_csv_as_markdown_table() {
+        let md = csv_to_markdown_table("name,age\nAlice,30\nBob,25");
+        // Header row + separator + 2 data rows.
+        assert!(md.contains("| name | age |"));
+        assert!(md.contains("| --- | --- |"));
+        assert!(md.contains("| Alice | 30 |"));
+    }
+
+    #[test]
+    fn preserves_thai_cells() {
+        let md = csv_to_markdown_table("ชื่อ,อายุ\nสมชาย,25");
+        assert!(md.contains("ชื่อ"));
+        assert!(md.contains("สมชาย"));
+    }
+
+    #[test]
+    fn escapes_pipe_characters_in_cells() {
+        let md = csv_to_markdown_table("col1,col2\n\"a|b\",c");
+        // Pipe inside a cell becomes \| so the row structure stays valid.
+        assert!(md.contains("a\\|b"));
+    }
+
+    #[test]
+    fn empty_input_yields_empty_string() {
+        assert_eq!(csv_to_markdown_table(""), "");
+    }
+}
+
 /// Convert a ViewEvent into ANSI bytes suitable for xterm.js. Returns
 /// None when the event is metadata-only (e.g. a SessionListRefresh —
 /// the sidebar handles that via its own dispatch shape).
@@ -324,7 +358,7 @@ fn render_terminal_ansi(ev: &ViewEvent) -> Option<String> {
         ViewEvent::ToolCallStart { name: _, label } => {
             Some(format!("\r\n\x1b[2m[tool: {label}]\x1b[0m"))
         }
-        ViewEvent::ToolCallResult { .. } => Some(" \x1b[32m✓\x1b[0m".to_string()),
+        ViewEvent::ToolCallResult { .. } => Some(" \x1b[32m✓\x1b[0m\r\n".to_string()),
         ViewEvent::SlashOutput(text) => {
             let body = text.replace('\n', "\r\n");
             Some(format!("\x1b[2m{body}\x1b[0m\r\n"))
@@ -379,6 +413,7 @@ fn render_terminal_ansi(ev: &ViewEvent) -> Option<String> {
         ViewEvent::SessionListRefresh(_) => None,
         ViewEvent::ProviderUpdate(_) => None,
         ViewEvent::KmsUpdate(_) => None,
+        ViewEvent::McpUpdate(_) => None,
         ViewEvent::ModelPickerOpen(_) => None,
         ViewEvent::ContextWarning { file_size_mb } => Some(format!(
             "\r\n\x1b[33m[ session {:.1} MB — /fork to continue in a new session with summary ]\x1b[0m\r\n",
@@ -409,6 +444,53 @@ fn terminal_history_replaced_envelope(ansi: &str) -> String {
 /// strikethrough, autolinks); raw HTML in the source is stripped
 /// (`render.unsafe_ = false`) so `<script>` in a `.md` file we're
 /// previewing can't escape the iframe sandbox.
+/// Convert a CSV string to a GFM markdown pipe-table so the comrak
+/// renderer (which has the `table` extension on) emits a proper grid.
+/// First row is treated as the header. Pipe characters in cells are
+/// escaped (`\|`) so they don't break the row structure. Empty input
+/// yields an empty string.
+fn csv_to_markdown_table(csv: &str) -> String {
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .from_reader(csv.as_bytes());
+    let rows: Vec<Vec<String>> = rdr
+        .records()
+        .filter_map(|r| r.ok())
+        .map(|r| {
+            r.iter()
+                .map(|c| c.replace('|', "\\|").replace('\n', " "))
+                .collect()
+        })
+        .collect();
+    if rows.is_empty() {
+        return String::new();
+    }
+    let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    let mut out = String::new();
+    let pad = |row: &[String], cols: usize| {
+        let mut line = String::from("|");
+        for i in 0..cols {
+            line.push(' ');
+            line.push_str(row.get(i).map(String::as_str).unwrap_or(""));
+            line.push_str(" |");
+        }
+        line.push('\n');
+        line
+    };
+    out.push_str(&pad(&rows[0], cols));
+    let mut sep = String::from("|");
+    for _ in 0..cols {
+        sep.push_str(" --- |");
+    }
+    sep.push('\n');
+    out.push_str(&sep);
+    for row in &rows[1..] {
+        out.push_str(&pad(row, cols));
+    }
+    out
+}
+
 fn render_markdown_to_html(md: &str, theme: &str) -> String {
     let mut opts = comrak::ComrakOptions::default();
     opts.extension.table = true;
@@ -801,6 +883,7 @@ fn auto_fallback_model(cfg: &AppConfig) -> Option<String> {
         ProviderKind::Gemini,
         ProviderKind::DashScope,
         ProviderKind::ZAi,
+        ProviderKind::DeepSeek,
         // Local providers omitted here: if the user explicitly
         // configured one of them, they're already "ready" above; we
         // don't want to auto-fall-back to Ollama for a user who has
@@ -822,6 +905,26 @@ fn instructions_path(scope: &str) -> Option<std::path::PathBuf> {
         "global" => crate::util::home_dir().map(|h| h.join(".config/thclaws/AGENTS.md")),
         _ => std::env::current_dir().ok().map(|d| d.join("AGENTS.md")),
     }
+}
+
+/// Build the `mcp_update` IPC payload: the configured MCP servers for
+/// this session (read fresh from disk so removals via `/mcp remove` are
+/// reflected immediately, not after a restart). Tool count is reported
+/// as 0 for now — the live registry doesn't track which tool came from
+/// which MCP server, so we'd have to hold a separate name-to-server
+/// map to do better. The sidebar today only renders the name, so 0 is
+/// a non-misleading placeholder.
+pub(crate) fn build_mcp_update_payload() -> serde_json::Value {
+    let config = crate::config::AppConfig::load().unwrap_or_default();
+    let servers: Vec<serde_json::Value> = config
+        .mcp_servers
+        .iter()
+        .map(|s| serde_json::json!({"name": s.name, "tools": 0}))
+        .collect();
+    serde_json::json!({
+        "type": "mcp_update",
+        "servers": servers,
+    })
 }
 
 /// Build the `kms_update` IPC payload: every discoverable KMS tagged with
@@ -2166,6 +2269,15 @@ pub fn run_gui() {
                             let is_image = matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" | "bmp");
                             let is_pdf = ext == "pdf";
                             let is_markdown = ext == "md" || ext == "markdown";
+                            // Office formats: extracted to text via the
+                            // Tier 2 read tools, then handed to the same
+                            // markdown→HTML pipeline as `.md` files. In
+                            // source mode we skip extraction (no useful
+                            // editor surface for binary OOXML).
+                            let is_docx = ext == "docx";
+                            let is_xlsx = ext == "xlsx" || ext == "xlsm" || ext == "xlsb" || ext == "xls" || ext == "ods";
+                            let is_pptx = ext == "pptx";
+                            let is_office = is_docx || is_xlsx || is_pptx;
                             let mime = match ext.as_str() {
                                 "png" => "image/png",
                                 "jpg" | "jpeg" => "image/jpeg",
@@ -2182,6 +2294,9 @@ pub fn run_gui() {
                                     if source_mode { "text/markdown" } else { "text/html" }
                                 }
                                 "html" | "htm" => "text/html",
+                                "docx" | "xlsx" | "xlsm" | "xlsb" | "xls" | "ods" | "pptx" => {
+                                    "text/html"
+                                }
                                 _ => "text/plain",
                             };
                             if is_image || is_pdf {
@@ -2196,6 +2311,46 @@ pub fn run_gui() {
                                     });
                                     let _ = proxy_for_ipc.send_event(UserEvent::FileContent(payload.to_string()));
                                 }
+                            } else if is_office {
+                                // Extract text via the Tier 2 read tools,
+                                // wrap as markdown (with a header showing
+                                // the format + path so the user sees they
+                                // got an extracted preview, not the raw
+                                // bytes), render to themed HTML.
+                                let extracted = if is_docx {
+                                    crate::tools::docx_read::extract_docx(&path)
+                                } else if is_xlsx {
+                                    crate::tools::xlsx_read::extract_xlsx(&path, None, "csv")
+                                        .map(|csv| csv_to_markdown_table(&csv))
+                                } else {
+                                    crate::tools::pptx_read::extract_pptx(&path)
+                                };
+                                let (md, ok) = match extracted {
+                                    Ok(text) => {
+                                        let header = format!(
+                                            "_Extracted preview · {}_\n\n",
+                                            ext.to_uppercase()
+                                        );
+                                        (format!("{header}{text}"), true)
+                                    }
+                                    Err(e) => (
+                                        format!(
+                                            "**Failed to extract preview:** {e}\n\nRaw bytes \
+                                             aren't shown for binary OOXML formats."
+                                        ),
+                                        false,
+                                    ),
+                                };
+                                let html = render_markdown_to_html(&md, theme);
+                                let payload = serde_json::json!({
+                                    "type": "file_content",
+                                    "path": raw_path,
+                                    "content": html,
+                                    "mime": mime,
+                                    "mode": mode,
+                                    "ok": ok,
+                                });
+                                let _ = proxy_for_ipc.send_event(UserEvent::FileContent(payload.to_string()));
                             } else {
                                 match std::fs::read_to_string(&path) {
                                     Ok(text) => {

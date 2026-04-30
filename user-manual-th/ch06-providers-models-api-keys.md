@@ -1,6 +1,6 @@
 # บทที่ 6 — provider, model และ API key
 
-thClaws คุยกับ **provider ได้ทั้งหมดสิบเอ็ดราย** โดยตรวจจับให้อัตโนมัติ
+thClaws คุยกับ **provider ได้ทั้งหมดสิบสองราย** โดยตรวจจับให้อัตโนมัติ
 จากชื่อ model และสลับได้ตลอดเวลาด้วย `/model` หรือ `/provider`
 
 ## ภาพรวม provider
@@ -18,6 +18,7 @@ thClaws คุยกับ **provider ได้ทั้งหมดสิบเ
 | Ollama | `ollama/*` | — (local) | NDJSON streaming; ไม่ต้อง auth |
 | Ollama Anthropic | `oa/*` | — (local, v0.14+) | endpoint `/v1/messages` ของ Ollama ที่เข้ากันกับ Anthropic |
 | DashScope | `qwen-*`, `qwq-*` | `DASHSCOPE_API_KEY` | Qwen ของ Alibaba; caching อัตโนมัติ |
+| DeepSeek | `deepseek-*` | `DEEPSEEK_API_KEY` (+ `DEEPSEEK_BASE_URL`) | สาย V4: `deepseek-v4-flash`, `deepseek-v4-pro` ส่วน alias เดิม `deepseek-chat` / `deepseek-reasoner` ยังใช้ได้ในระดับ wire |
 
 ค่าเริ่มต้นครั้งแรกคือ `claude-sonnet-4-6` เปลี่ยนได้ด้วย
 `--model` ที่ command line หรือบันทึกลง `settings.json`
@@ -332,8 +333,8 @@ thClaws จัดการให้อัตโนมัติ — เก็บ 
 
 | ตระกูล | model id (ตัวอย่าง) | provider |
 |---|---|---|
-| DeepSeek v4 | `deepseek/deepseek-v4-flash`, `deepseek/deepseek-v4-pro` | OpenRouter |
-| DeepSeek r1 | `deepseek/deepseek-r1`, `deepseek-r1` | OpenRouter, native |
+| DeepSeek v4 | `deepseek-v4-flash`, `deepseek-v4-pro` (native) · `deepseek/deepseek-v4-*` (OpenRouter) | DeepSeek, OpenRouter |
+| DeepSeek r1 | `deepseek-reasoner` (native) · `deepseek/deepseek-r1`, `deepseek-r1` | DeepSeek, OpenRouter |
 | OpenAI o-series | `openai/o1-mini`, `openai/o3`, `openai/o4-*` | OpenRouter |
 
 โมเดลอื่น ๆ ที่ไม่อยู่ในกลุ่มนี้ (เช่น `gpt-4o`, `claude-sonnet-4-6`,

@@ -88,6 +88,10 @@ A filesystem browser rooted at the working directory. Click a file in the tree t
 
 Files are written through the same working-directory sandbox the agent uses, so edits stay inside the project tree. User-initiated saves do **not** go through the agent approval prompt — the Save button is your approval.
 
+**Refresh button** — re-fetches the file from disk and remounts the preview iframe. Use it after the agent updates a file behind the scenes (e.g. the productivity plugin's `dashboard.html` regenerating its inlined task snapshot). Forces the iframe to re-render rather than relying on browser cache. Prompts before discarding any unsaved editor changes.
+
+**Dashboard host bridge** — self-contained HTML dashboards opened in this tab can read and write sibling files via `postMessage` to the React shell, no File System Access API picker required. The productivity plugin's `dashboard.html` uses this: on Refresh it re-reads `TASKS.md` live from the bridge (no more snapshot-staleness), and Save writes back to disk through thClaws's `file_write` IPC. Any HTML page that posts `{type: "thclaws-dashboard-load" | "thclaws-dashboard-save", filename, content?}` to its parent works the same way.
+
 #### 4. Team tab
 
 Always present. When no team exists it shows an empty-state pointer ("No team agents running — ask the agent to create a team"). Once the agent calls `TeamCreate`, each teammate gets its own pane in this tab — click a pane to focus, scroll to browse history, type into it to send input. The agent only has access to the team-spawning tools (`TeamCreate`, `SpawnTeammate`, `SendMessage`, …) when `teamEnabled: true` is set in `.thclaws/settings.json`; the tab itself surfaces regardless. See [chapter 17](ch17-agent-teams.md) for the team concept.
