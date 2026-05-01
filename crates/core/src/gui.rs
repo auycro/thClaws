@@ -91,13 +91,22 @@ fn spawn_event_translator(handle: &SharedSessionHandle, proxy: EventLoopProxy<Us
             .build()
             .expect("translator runtime");
         rt.block_on(async move {
+            let mut term_state = TerminalRenderState::default();
             loop {
                 match rx.recv().await {
                     Ok(ev) => {
+                        // /quit confirmed by the worker — forward to
+                        // the tao event loop so the window runs the
+                        // same save-and-exit path as the close button
+                        // (#52). No chat / terminal rendering needed.
+                        if matches!(ev, ViewEvent::QuitRequested) {
+                            let _ = proxy.send_event(UserEvent::QuitRequested);
+                            continue;
+                        }
                         for dispatch in render_chat_dispatches(&ev) {
                             let _ = proxy.send_event(UserEvent::Dispatch(dispatch));
                         }
-                        if let Some(ansi) = render_terminal_ansi(&ev) {
+                        if let Some(ansi) = render_terminal_ansi(&mut term_state, &ev) {
                             // HistoryReplaced needs a distinct envelope
                             // so the frontend always re-renders the
                             // prompt at the end — empty-history loads
@@ -153,12 +162,31 @@ fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
             "name": strip_ansi(label),
         })
         .to_string()],
-        ViewEvent::ToolCallResult { name, output } => vec![serde_json::json!({
-            "type": "chat_tool_result",
-            "name": name,
-            "output": strip_ansi(output),
-        })
-        .to_string()],
+        ViewEvent::ToolCallResult {
+            name,
+            output,
+            ui_resource,
+        } => {
+            let mut env = serde_json::json!({
+                "type": "chat_tool_result",
+                "name": name,
+                "output": strip_ansi(output),
+            });
+            // Inline an MCP-Apps widget envelope so the chat surface
+            // can mount an iframe alongside the text result. We ship
+            // the full HTML over IPC (a few KB per pinn.ai widget) —
+            // simpler than an asset URL we'd have to also serve, and
+            // the iframe gets an opaque origin from `srcdoc` so the
+            // page can't reach back into our app context.
+            if let Some(ui) = ui_resource {
+                env["ui_resource"] = serde_json::json!({
+                    "uri": ui.uri,
+                    "html": ui.html,
+                    "mime": ui.mime,
+                });
+            }
+            vec![env.to_string()]
+        }
         ViewEvent::SlashOutput(text) => vec![serde_json::json!({
             "type": "chat_slash_output",
             "text": strip_ansi(text),
@@ -196,6 +224,21 @@ fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
             "text": format!("\n{}\n", strip_ansi(text)),
         })
         .to_string()],
+        ViewEvent::McpAppCallToolResult {
+            request_id,
+            content,
+            is_error,
+        } => vec![serde_json::json!({
+            "type": "mcp_call_tool_result",
+            "requestId": request_id,
+            "content": content,
+            "isError": is_error,
+        })
+        .to_string()],
+        // QuitRequested is intercepted by the translator before this
+        // function is called — see the `if matches!(...)` early-return
+        // above. Listed here for match exhaustiveness only.
+        ViewEvent::QuitRequested => vec![],
     }
 }
 
@@ -325,11 +368,80 @@ mod csv_table_tests {
     }
 }
 
+/// State carried across calls to `render_terminal_ansi` so consecutive
+/// tool calls with the same label coalesce into a single line with a
+/// `×N` count, instead of stacking N copies of `[tool: Ls] ✓`.
+///
+/// The cursor is left at the end of the result line (no trailing CRLF)
+/// so a follow-up matching `ToolCallStart` can rewrite the line in
+/// place via `\r\x1b[2K…`. A pending newline is flushed before the
+/// next non-matching event so streamed agent text or a different tool
+/// still starts on a fresh line.
+#[derive(Default)]
+pub(crate) struct TerminalRenderState {
+    /// Label of the most recently rendered tool call. None when the
+    /// last terminal output wasn't a tool call.
+    last_tool_label: Option<String>,
+    /// How many consecutive same-label tool calls have been merged
+    /// onto the most recent line (1 after the first result, ≥ 2 after
+    /// each merge).
+    last_tool_count: u32,
+    /// True when a `ToolCallStart` was suppressed because its label
+    /// matched the previous call. The matching `ToolCallResult` will
+    /// rewrite the previous line instead of appending a fresh ` ✓`.
+    merging: bool,
+    /// True when the cursor is currently parked at the end of a tool-
+    /// result line (no trailing CRLF). Cleared by emitting `\r\n`
+    /// before the next non-coalescing event.
+    pending_newline_after_tool: bool,
+}
+
 /// Convert a ViewEvent into ANSI bytes suitable for xterm.js. Returns
 /// None when the event is metadata-only (e.g. a SessionListRefresh —
 /// the sidebar handles that via its own dispatch shape).
-fn render_terminal_ansi(ev: &ViewEvent) -> Option<String> {
+fn render_terminal_ansi(state: &mut TerminalRenderState, ev: &ViewEvent) -> Option<String> {
+    // Tool-call coalescing lives ahead of the generic event match so
+    // it can suppress / rewrite output without going through the
+    // pending-newline flush path below.
     match ev {
+        ViewEvent::ToolCallStart { name: _, label } => {
+            if state.pending_newline_after_tool
+                && state.last_tool_label.as_deref() == Some(label.as_str())
+                && state.last_tool_count >= 1
+            {
+                // Same tool again — suppress the start. The matching
+                // result will rewrite the previous line with ×N.
+                state.pending_newline_after_tool = false;
+                state.merging = true;
+                return None;
+            }
+            // Different tool (or first one). The leading \r\n doubles
+            // as the flush for any pending tool-result line.
+            state.last_tool_label = Some(label.clone());
+            state.last_tool_count = 0;
+            state.merging = false;
+            state.pending_newline_after_tool = false;
+            return Some(format!("\r\n\x1b[2m[tool: {label}]\x1b[0m"));
+        }
+        ViewEvent::ToolCallResult { .. } => {
+            if state.merging {
+                state.merging = false;
+                state.last_tool_count += 1;
+                state.pending_newline_after_tool = true;
+                let label = state.last_tool_label.clone().unwrap_or_default();
+                let count = state.last_tool_count;
+                return Some(format!(
+                    "\r\x1b[2K\x1b[2m[tool: {label}]\x1b[0m \x1b[32m✓\x1b[0m \x1b[2m×{count}\x1b[0m"
+                ));
+            }
+            state.last_tool_count = 1;
+            state.pending_newline_after_tool = true;
+            return Some(" \x1b[32m✓\x1b[0m".to_string());
+        }
+        _ => {}
+    }
+
+    let inner = match ev {
         ViewEvent::UserPrompt(text) => {
             // Multi-line prompts (typical from a paste): `> ` marker on
             // the first line only, two-space indent on continuations
@@ -355,10 +467,9 @@ fn render_terminal_ansi(ev: &ViewEvent) -> Option<String> {
             // `\r\n` to start a fresh line at column 0.
             Some(text.replace('\n', "\r\n"))
         }
-        ViewEvent::ToolCallStart { name: _, label } => {
-            Some(format!("\r\n\x1b[2m[tool: {label}]\x1b[0m"))
+        ViewEvent::ToolCallStart { .. } | ViewEvent::ToolCallResult { .. } => {
+            unreachable!("handled above")
         }
-        ViewEvent::ToolCallResult { .. } => Some(" \x1b[32m✓\x1b[0m\r\n".to_string()),
         ViewEvent::SlashOutput(text) => {
             let body = text.replace('\n', "\r\n");
             Some(format!("\x1b[2m{body}\x1b[0m\r\n"))
@@ -419,6 +530,37 @@ fn render_terminal_ansi(ev: &ViewEvent) -> Option<String> {
             "\r\n\x1b[33m[ session {:.1} MB — /fork to continue in a new session with summary ]\x1b[0m\r\n",
             file_size_mb
         )),
+        // Widget tool-call results are an out-of-band channel for
+        // embedded MCP App iframes. The terminal tab doesn't render
+        // them — they're consumed by the chat-tab translator above
+        // and forwarded to the iframe's JSON-RPC reply path.
+        ViewEvent::McpAppCallToolResult { .. } => None,
+        // QuitRequested is intercepted by the translator early-return
+        // and forwarded to the tao loop; the terminal tab has nothing
+        // to render for it.
+        ViewEvent::QuitRequested => None,
+    };
+
+    // Non-tool event finished. If we had a pending tool-result line
+    // parked without a CRLF, flush it now so the next event starts
+    // on a fresh line. Reset coalesce state regardless: any output
+    // moves the cursor away from the tool line.
+    match inner {
+        Some(text) => {
+            state.last_tool_label = None;
+            state.last_tool_count = 0;
+            state.merging = false;
+            if state.pending_newline_after_tool {
+                state.pending_newline_after_tool = false;
+                Some(format!("\r\n{text}"))
+            } else {
+                Some(text)
+            }
+        }
+        // Metadata-only events (sidebar refreshes, TurnDone, …) don't
+        // emit terminal bytes, so the cursor stays where it was. Keep
+        // tool-coalesce state intact for the next real event.
+        None => None,
     }
 }
 
@@ -723,7 +865,12 @@ fn ospath(path: &str) -> String {
 /// Windows MessageBox enforces "Yes"/"No" labels; `yes_label`/`no_label`
 /// are only honoured on macOS and Linux, with the message text carrying
 /// the intent on Windows.
-fn native_confirm(title: &str, message: &str, yes_label: &str, no_label: &str) -> bool {
+pub(crate) fn native_confirm(
+    title: &str,
+    message: &str,
+    yes_label: &str,
+    no_label: &str,
+) -> bool {
     #[cfg(target_os = "macos")]
     {
         let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
@@ -884,6 +1031,7 @@ fn auto_fallback_model(cfg: &AppConfig) -> Option<String> {
         ProviderKind::DashScope,
         ProviderKind::ZAi,
         ProviderKind::DeepSeek,
+        ProviderKind::ThaiLLM,
         // Local providers omitted here: if the user explicitly
         // configured one of them, they're already "ready" above; we
         // don't want to auto-fall-back to Ollama for a user who has
@@ -967,6 +1115,103 @@ fn is_macos_close_shortcut(event: &tao::event::KeyEvent, modifiers: ModifiersSta
         Key::Character(ch) => ch.eq_ignore_ascii_case("q") || ch.eq_ignore_ascii_case("w"),
         _ => false,
     }
+}
+
+/// Whitelist external URLs to `http://` / `https://` only. Tool output is
+/// untrusted, so this rejects `file://`, `javascript:`, custom schemes,
+/// and anything that doesn't parse as a real URL — preventing a hostile
+/// MCP server from getting the user to launch arbitrary local handlers
+/// just because they clicked a link in chat.
+fn is_safe_external_url(s: &str) -> bool {
+    match url::Url::parse(s) {
+        Ok(u) => matches!(u.scheme(), "http" | "https") && u.host_str().is_some(),
+        Err(_) => false,
+    }
+}
+
+/// Open a URL in the OS default browser. URL must already be vetted by
+/// [`is_safe_external_url`]; this function does no validation itself.
+fn open_external_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // `start` is a `cmd` builtin; the empty "" arg is the title slot
+        // — without it, a quoted URL gets eaten as the title.
+        let _ = std::process::Command::new("cmd")
+            .args(["/c", "start", "", url])
+            .spawn();
+    }
+}
+
+/// Assemble the cross-provider model list payload for the sidebar's
+/// inline picker dropdown (#49). Catalogue rows for every known
+/// provider, plus a live Ollama probe so models added via `ollama pull`
+/// after launch are visible without restart. The Ollama probe uses a
+/// short timeout — failure just falls back to whatever rows are in the
+/// baseline catalogue.
+async fn build_all_models_payload() -> String {
+    use crate::providers::{Provider, ProviderKind};
+    let cat = crate::model_catalogue::EffectiveCatalogue::load();
+
+    // Live Ollama models (best-effort) — merged into the ollama group
+    // alongside catalogue rows. dedup on `id` so cached entries don't
+    // double up with live ones.
+    let ollama_live: Vec<String> = {
+        let base = std::env::var("OLLAMA_BASE_URL")
+            .unwrap_or_else(|_| crate::providers::ollama::DEFAULT_BASE_URL.to_string());
+        let provider = crate::providers::ollama::OllamaProvider::new().with_base_url(base);
+        // tokio timeout — short so an unreachable host doesn't stall
+        // the dropdown render.
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(800),
+            provider.list_models(),
+        )
+        .await
+        {
+            Ok(Ok(models)) => models.into_iter().map(|m| m.id).collect(),
+            _ => Vec::new(),
+        }
+    };
+
+    let mut groups: Vec<serde_json::Value> = Vec::new();
+    for kind in ProviderKind::ALL {
+        let name = kind.name();
+        let mut model_ids: std::collections::BTreeMap<String, Option<u32>> =
+            std::collections::BTreeMap::new();
+        for (id, entry) in cat.list_models_for_provider(name) {
+            model_ids.insert(id, entry.context);
+        }
+        if matches!(kind, ProviderKind::Ollama) {
+            for id in &ollama_live {
+                model_ids.entry(id.clone()).or_insert(None);
+            }
+        }
+        if model_ids.is_empty() {
+            continue;
+        }
+        let model_rows: Vec<serde_json::Value> = model_ids
+            .into_iter()
+            .map(|(id, ctx)| serde_json::json!({ "id": id, "context": ctx }))
+            .collect();
+        groups.push(serde_json::json!({
+            "provider": name,
+            "models": model_rows,
+        }));
+    }
+
+    serde_json::json!({
+        "type": "all_models_list",
+        "groups": groups,
+        "ollama_reachable": !ollama_live.is_empty(),
+    })
+    .to_string()
 }
 
 fn request_gui_shutdown(shared: &SharedSessionHandle, control_flow: &mut ControlFlow) {
@@ -1187,6 +1432,55 @@ pub fn run_gui() {
                 "app_close" => {
                     let _ = proxy_for_ipc.send_event(UserEvent::QuitRequested);
                 }
+                "mcp_call_tool" => {
+                    // Widget-initiated tool call from an embedded MCP
+                    // App. Forward to the worker; the response comes
+                    // back asynchronously as a `mcp_call_tool_result`
+                    // dispatch keyed by the same `requestId`. Trust
+                    // gating already happened at widget render time —
+                    // only trusted servers ship widgets, so any tool
+                    // call originating from a rendered widget is
+                    // implicitly trusted.
+                    let request_id = msg
+                        .get("requestId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let qualified_name = msg
+                        .get("qualifiedName")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let arguments = msg
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or(serde_json::json!({}));
+                    if !request_id.is_empty() && !qualified_name.is_empty() {
+                        let _ = shared_for_ipc.input_tx.send(
+                            ShellInput::McpAppCallTool {
+                                request_id,
+                                qualified_name,
+                                arguments,
+                            },
+                        );
+                    }
+                }
+                "open_external" => {
+                    // Open a URL in the OS default browser. The URL is
+                    // model-attributable (it can come from MCP tool
+                    // output rendered in chat), so we accept only
+                    // http(s). Anything else — `file://`, `javascript:`,
+                    // shell metacharacters — is dropped silently.
+                    if let Some(url) = msg.get("url").and_then(|v| v.as_str()) {
+                        if is_safe_external_url(url) {
+                            open_external_url(url);
+                        } else {
+                            eprintln!(
+                                "\x1b[33m[ipc open_external] refusing non-http(s) url\x1b[0m"
+                            );
+                        }
+                    }
+                }
                 "model_set" => {
                     // Frontend-driven model change (e.g. ModelPickerModal
                     // pick after api_key_set, or any future picker UI).
@@ -1220,6 +1514,18 @@ pub fn run_gui() {
                         ));
                         let _ = shared_for_ipc.input_tx.send(ShellInput::ReloadConfig);
                     }
+                }
+                "request_all_models" => {
+                    // Sidebar's inline model picker dropdown asking for
+                    // the cross-provider model list. Catalogue rows for
+                    // every known provider plus a live Ollama probe so
+                    // local models the user just `ollama pull`-ed show
+                    // up without restart. Issue #49.
+                    let proxy = proxy_for_ipc.clone();
+                    tokio::spawn(async move {
+                        let payload = build_all_models_payload().await;
+                        let _ = proxy.send_event(UserEvent::SessionLoaded(payload));
+                    });
                 }
                 "ask_user_response" => {
                     let id = msg.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -2498,6 +2804,28 @@ pub fn run_gui() {
                 }
                 _ => {}
             }
+        })
+        .with_navigation_handler(|url: String| {
+            // Allow any http(s) target. wry's macOS navigation delegate
+            // fires for iframe `src` loads as well as top-level
+            // navigations — and the closure signature hides which —
+            // so blocking http(s) here would also block the lightbox
+            // iframe used to render MCP preview viewer pages
+            // (e.g. `https://pinn.ai/mcp/preview/<uuid>`).
+            //
+            // Top-level navigation away from the chat is prevented at
+            // the React layer (ChatView.handleChatLinkClick calls
+            // preventDefault on every link click and routes to the
+            // in-app lightbox). The only role left for this handler
+            // is rejecting clearly-out-of-scope schemes — `file://`,
+            // `javascript:`, custom protocols — so a hostile MCP
+            // server can't smuggle one in via injected HTML.
+            url.starts_with("thclaws://")
+                || url.starts_with("http://")
+                || url.starts_with("https://")
+                || url.starts_with("about:")
+                || url.starts_with("data:")
+                || url.starts_with("blob:")
         });
     // wry exposes a different constructor on Linux because WebKit2GTK
     // mounts as a GTK widget rather than over a raw window handle.
@@ -2607,4 +2935,74 @@ pub fn run_gui() {
             _ => {}
         }
     });
+}
+
+#[cfg(test)]
+mod tool_coalesce_tests {
+    use super::*;
+
+    fn start(label: &str) -> ViewEvent {
+        ViewEvent::ToolCallStart {
+            name: label.to_string(),
+            label: label.to_string(),
+        }
+    }
+
+    fn ok() -> ViewEvent {
+        ViewEvent::ToolCallResult {
+            name: "Ls".to_string(),
+            output: String::new(),
+            ui_resource: None,
+        }
+    }
+
+    #[test]
+    fn first_tool_call_renders_normally() {
+        let mut s = TerminalRenderState::default();
+        let out = render_terminal_ansi(&mut s, &start("Ls")).unwrap();
+        assert!(out.contains("[tool: Ls]"));
+        assert!(out.starts_with("\r\n"));
+        let res = render_terminal_ansi(&mut s, &ok()).unwrap();
+        assert_eq!(res, " \x1b[32m✓\x1b[0m");
+    }
+
+    #[test]
+    fn repeated_tool_coalesces_with_count() {
+        let mut s = TerminalRenderState::default();
+        // First call: full line + ✓ (no trailing CRLF, parked).
+        render_terminal_ansi(&mut s, &start("Ls")).unwrap();
+        render_terminal_ansi(&mut s, &ok()).unwrap();
+        // Second call: start suppressed, result rewrites with ×2.
+        assert!(render_terminal_ansi(&mut s, &start("Ls")).is_none());
+        let merged = render_terminal_ansi(&mut s, &ok()).unwrap();
+        assert!(merged.starts_with("\r\x1b[2K"));
+        assert!(merged.contains("×2"));
+        // Third call: ×3.
+        assert!(render_terminal_ansi(&mut s, &start("Ls")).is_none());
+        let merged3 = render_terminal_ansi(&mut s, &ok()).unwrap();
+        assert!(merged3.contains("×3"));
+    }
+
+    #[test]
+    fn different_tool_breaks_coalesce_and_flushes_newline() {
+        let mut s = TerminalRenderState::default();
+        render_terminal_ansi(&mut s, &start("Ls")).unwrap();
+        render_terminal_ansi(&mut s, &ok()).unwrap();
+        // Different tool: leading \r\n acts as the line break.
+        let next = render_terminal_ansi(&mut s, &start("Read")).unwrap();
+        assert!(next.starts_with("\r\n"));
+        assert!(next.contains("[tool: Read]"));
+    }
+
+    #[test]
+    fn text_after_tool_starts_on_fresh_line() {
+        let mut s = TerminalRenderState::default();
+        render_terminal_ansi(&mut s, &start("Ls")).unwrap();
+        render_terminal_ansi(&mut s, &ok()).unwrap();
+        let text =
+            render_terminal_ansi(&mut s, &ViewEvent::AssistantTextDelta("Done.".to_string()))
+                .unwrap();
+        assert!(text.starts_with("\r\n"));
+        assert!(text.contains("Done."));
+    }
 }

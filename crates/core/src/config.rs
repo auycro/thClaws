@@ -410,6 +410,10 @@ impl ProjectConfig {
                                 .collect()
                         })
                         .unwrap_or_default();
+                    let trusted = cfg
+                        .get("trusted")
+                        .and_then(|t| t.as_bool())
+                        .unwrap_or(false);
                     return Some(crate::mcp::McpServerConfig {
                         name: name.clone(),
                         transport,
@@ -418,6 +422,7 @@ impl ProjectConfig {
                         env: std::collections::HashMap::new(),
                         url,
                         headers,
+                        trusted,
                     });
                 }
                 // Stdio transport: needs a command.
@@ -440,6 +445,10 @@ impl ProjectConfig {
                             .collect()
                     })
                     .unwrap_or_default();
+                let trusted = cfg
+                    .get("trusted")
+                    .and_then(|t| t.as_bool())
+                    .unwrap_or(false);
                 Some(crate::mcp::McpServerConfig {
                     name: name.clone(),
                     transport,
@@ -448,6 +457,7 @@ impl ProjectConfig {
                     env,
                     url: String::new(),
                     headers: std::collections::HashMap::new(),
+                    trusted,
                 })
             })
             .collect();

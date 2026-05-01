@@ -84,6 +84,25 @@ pub trait Tool: Send + Sync {
     fn requires_approval(&self, _input: &Value) -> bool {
         false
     }
+
+    /// MCP-Apps widget the chat surface should embed inline alongside
+    /// this tool's results. Returns `(uri, html, mime)` where `html` is
+    /// the resource body to mount in an iframe and `mime` is the
+    /// declared resource MIME (typically `text/html;profile=mcp-app`).
+    /// Default: no widget. Only [`crate::mcp::McpTool`] overrides this
+    /// today — a non-MCP tool has nothing to fetch.
+    async fn fetch_ui_resource(&self) -> Option<UiResource> {
+        None
+    }
+}
+
+/// A resolved MCP-Apps UI resource ready to be mounted in an iframe.
+/// Produced by [`Tool::fetch_ui_resource`] after a tool call completes.
+#[derive(Debug, Clone)]
+pub struct UiResource {
+    pub uri: String,
+    pub html: String,
+    pub mime: Option<String>,
 }
 
 #[derive(Default, Clone)]

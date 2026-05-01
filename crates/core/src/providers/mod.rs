@@ -39,6 +39,7 @@ pub enum ProviderKind {
     AzureAIFoundry,
     OpenAICompat,
     DeepSeek,
+    ThaiLLM,
 }
 
 impl ProviderKind {
@@ -59,6 +60,7 @@ impl ProviderKind {
         Self::AzureAIFoundry,
         Self::OpenAICompat,
         Self::DeepSeek,
+        Self::ThaiLLM,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -79,6 +81,7 @@ impl ProviderKind {
             Self::AzureAIFoundry => "azure",
             Self::OpenAICompat => "openai-compat",
             Self::DeepSeek => "deepseek",
+            Self::ThaiLLM => "thaillm",
         }
     }
 
@@ -123,6 +126,14 @@ impl ProviderKind {
             // still work on the wire but `/v1/models` only lists the V4 line,
             // so that's what catalogue-seed pulls in.
             Self::DeepSeek => "deepseek-v4-flash",
+            // NSTDA / สวทช. Thai LLM aggregator (thaillm.or.th). Hosts
+            // multiple Thai-language 8B models (OpenThaiGPT, Typhoon-S,
+            // Pathumma, THaLLE) on an OpenAI-compatible endpoint. The
+            // `thaillm/` prefix is stripped before the wire request, so
+            // users type `/model thaillm/<id>` and the upstream sees the
+            // bare model id. OpenThaiGPT v7.2 is the most general-purpose
+            // default; users can `/model thaillm/<other>` to switch.
+            Self::ThaiLLM => "thaillm/OpenThaiGPT-ThaiLLM-8B-Instruct-v7.2",
         }
     }
 
@@ -141,6 +152,7 @@ impl ProviderKind {
             Self::AzureAIFoundry => Some("AZURE_AI_FOUNDRY_ENDPOINT"),
             Self::OpenAICompat => Some("OPENAI_COMPAT_BASE_URL"),
             Self::DeepSeek => Some("DEEPSEEK_BASE_URL"),
+            Self::ThaiLLM => Some("THAILLM_BASE_URL"),
             _ => None,
         }
     }
@@ -184,6 +196,7 @@ impl ProviderKind {
             // placeholder just hints at the expected shape (path ending in /v1).
             Self::OpenAICompat => Some("http://localhost:8000/v1"),
             Self::DeepSeek => Some("https://api.deepseek.com/v1"),
+            Self::ThaiLLM => Some("http://thaillm.or.th/api/v1"),
             _ => None,
         }
     }
@@ -207,22 +220,32 @@ impl ProviderKind {
             Self::AzureAIFoundry => Some("AZURE_AI_FOUNDRY_API_KEY"),
             Self::OpenAICompat => Some("OPENAI_COMPAT_API_KEY"),
             Self::DeepSeek => Some("DEEPSEEK_API_KEY"),
+            Self::ThaiLLM => Some("THAILLM_API_KEY"),
         }
     }
 
     /// Resolve short model aliases to full names — **provider-blind**.
-    /// e.g. "sonnet" → "claude-sonnet-4-6", "opus" → "claude-opus-4-6"
+    /// e.g. "sonnet" → "claude-sonnet-4-6", "opus" → "claude-opus-4-6".
     /// Use this for explicit user-typed `/model <alias>` commands where
     /// the user intends to switch providers along with the model. For
     /// passive resolution (agent defs, etc.) where the current provider
     /// must be preserved, use `resolve_alias_for_provider` instead.
+    ///
+    /// Matching is case-insensitive: `OpenThaiGPT`, `openthaigpt`, and
+    /// `OPENTHAIGPT` all resolve the same way. Non-alias inputs are
+    /// returned with their original casing preserved (model ids upstream
+    /// are case-sensitive — only the alias *lookup* is folded).
     pub fn resolve_alias(model: &str) -> String {
-        match model {
+        match model.to_lowercase().as_str() {
             "sonnet" => "claude-sonnet-4-6".into(),
             "opus" => "claude-opus-4-6".into(),
             "haiku" => "claude-haiku-4-5".into(),
             "flash" => "gemini-2.5-flash".into(),
-            other => other.to_string(),
+            "openthaigpt" => "thaillm/OpenThaiGPT-ThaiLLM-8B-Instruct-v7.2".into(),
+            "pathumma" => "thaillm/Pathumma-ThaiLLM-qwen3-8b-think-3.0.0".into(),
+            "thalle" => "thaillm/THaLLE-0.2-ThaiLLM-8B-fa".into(),
+            "typhoon" => "thaillm/Typhoon-S-ThaiLLM-8B-Instruct".into(),
+            _ => model.to_string(),
         }
     }
 
@@ -235,22 +258,32 @@ impl ProviderKind {
     /// the global `resolve_alias` would surprise-switch a worktree
     /// teammate to native Anthropic even if the project is on OpenRouter.
     pub fn resolve_alias_for_provider(model: &str, provider: Self) -> Option<String> {
-        // Anthropic-family aliases.
-        let anthropic_id = match model {
+        // Match against the lowercased input so callers can write `Sonnet`
+        // or `OpenThaiGPT` and still hit the alias table — the resolved
+        // upstream id retains its original casing.
+        let lower = model.to_lowercase();
+        let anthropic_id = match lower.as_str() {
             "sonnet" => Some("claude-sonnet-4-6"),
             "opus" => Some("claude-opus-4-6"),
             "haiku" => Some("claude-haiku-4-5"),
             _ => None,
         };
-        // Google-family aliases (just `flash` for now).
-        let google_id = match model {
+        let google_id = match lower.as_str() {
             "flash" => Some("gemini-2.5-flash"),
+            _ => None,
+        };
+        let thaillm_id = match lower.as_str() {
+            "openthaigpt" => Some("thaillm/OpenThaiGPT-ThaiLLM-8B-Instruct-v7.2"),
+            "pathumma" => Some("thaillm/Pathumma-ThaiLLM-qwen3-8b-think-3.0.0"),
+            "thalle" => Some("thaillm/THaLLE-0.2-ThaiLLM-8B-fa"),
+            "typhoon" => Some("thaillm/Typhoon-S-ThaiLLM-8B-Instruct"),
             _ => None,
         };
 
         match provider {
             Self::Anthropic => anthropic_id.map(String::from),
             Self::Gemini => google_id.map(String::from),
+            Self::ThaiLLM => thaillm_id.map(String::from),
             Self::OpenRouter => {
                 if let Some(id) = anthropic_id {
                     return Some(format!("openrouter/anthropic/{id}"));
@@ -326,6 +359,12 @@ impl ProviderKind {
             // is needed — same shape as Anthropic's `claude-` and OpenAI's
             // `gpt-`. Prefix is NOT stripped on the wire.
             Some(Self::DeepSeek)
+        } else if model.starts_with("thaillm/") {
+            // NSTDA Thai LLM aggregator. Models look like
+            // thaillm/OpenThaiGPT-ThaiLLM-8B-Instruct-v7.2 — the
+            // "thaillm/" prefix is stripped before the request reaches
+            // the OpenAI-compatible upstream at thaillm.or.th.
+            Some(Self::ThaiLLM)
         } else if model.starts_with("zai/") {
             // Z.ai (GLM Coding Plan). Models look like zai/glm-4.6.
             // The "zai/" prefix is stripped before forwarding to the
@@ -610,6 +649,87 @@ mod tests {
             ProviderKind::OpenRouter
         )
         .is_none());
+    }
+
+    #[test]
+    fn alias_lookup_is_case_insensitive_for_thaillm_and_anthropic() {
+        // ThaiLLM model aliases — the canonical model id has mixed
+        // casing (OpenThaiGPT, THaLLE), so the alias table must accept
+        // any casing the user types. Resolved id keeps upstream casing.
+        assert_eq!(
+            ProviderKind::resolve_alias("OpenThaiGPT"),
+            "thaillm/OpenThaiGPT-ThaiLLM-8B-Instruct-v7.2"
+        );
+        assert_eq!(
+            ProviderKind::resolve_alias("openthaigpt"),
+            "thaillm/OpenThaiGPT-ThaiLLM-8B-Instruct-v7.2"
+        );
+        assert_eq!(
+            ProviderKind::resolve_alias("OPENTHAIGPT"),
+            "thaillm/OpenThaiGPT-ThaiLLM-8B-Instruct-v7.2"
+        );
+        assert_eq!(
+            ProviderKind::resolve_alias("THaLLE"),
+            "thaillm/THaLLE-0.2-ThaiLLM-8B-fa"
+        );
+        assert_eq!(
+            ProviderKind::resolve_alias("typhoon"),
+            "thaillm/Typhoon-S-ThaiLLM-8B-Instruct"
+        );
+        assert_eq!(
+            ProviderKind::resolve_alias("Pathumma"),
+            "thaillm/Pathumma-ThaiLLM-qwen3-8b-think-3.0.0"
+        );
+
+        // Existing Anthropic / Google aliases still resolve, including
+        // mixed casing — proves the lowercase fold doesn't regress them.
+        assert_eq!(ProviderKind::resolve_alias("Sonnet"), "claude-sonnet-4-6");
+        assert_eq!(ProviderKind::resolve_alias("FLASH"), "gemini-2.5-flash");
+
+        // Unknown input passes through with original casing intact —
+        // upstream model ids are case-sensitive, so we must NOT lowercase
+        // the returned id when there's no alias hit.
+        assert_eq!(
+            ProviderKind::resolve_alias("Custom-Model-V2"),
+            "Custom-Model-V2"
+        );
+    }
+
+    #[test]
+    fn alias_for_provider_only_resolves_within_correct_provider() {
+        // `openthaigpt` resolves only when current provider is ThaiLLM —
+        // SpawnTeammate uses this to keep a worktree on its parent
+        // provider rather than surprise-switching mid-team.
+        assert_eq!(
+            ProviderKind::resolve_alias_for_provider("openthaigpt", ProviderKind::ThaiLLM)
+                .as_deref(),
+            Some("thaillm/OpenThaiGPT-ThaiLLM-8B-Instruct-v7.2")
+        );
+        assert!(
+            ProviderKind::resolve_alias_for_provider("OpenThaiGPT", ProviderKind::Anthropic)
+                .is_none()
+        );
+        assert!(
+            ProviderKind::resolve_alias_for_provider("sonnet", ProviderKind::ThaiLLM).is_none()
+        );
+    }
+
+    #[test]
+    fn detect_thaillm_prefix_routes_to_thaillm_provider() {
+        assert_eq!(
+            ProviderKind::detect("thaillm/OpenThaiGPT-ThaiLLM-8B-Instruct-v7.2"),
+            Some(ProviderKind::ThaiLLM)
+        );
+        assert_eq!(
+            ProviderKind::detect("thaillm/Typhoon-S-ThaiLLM-8B-Instruct"),
+            Some(ProviderKind::ThaiLLM)
+        );
+        assert_eq!(ProviderKind::ThaiLLM.api_key_env(), Some("THAILLM_API_KEY"));
+        assert_eq!(
+            ProviderKind::ThaiLLM.default_endpoint(),
+            Some("http://thaillm.or.th/api/v1")
+        );
+        assert_eq!(ProviderKind::ThaiLLM.name(), "thaillm");
     }
 
     #[test]

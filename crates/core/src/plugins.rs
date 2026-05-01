@@ -127,6 +127,12 @@ where
 
 impl McpServerEntry {
     pub fn to_config(&self, name: &str) -> McpServerConfig {
+        // Plugin-installed MCP servers are trusted: they came in
+        // through the plugin install flow which the user explicitly
+        // ran, and the marketplace is the curation layer for those
+        // installs. Hand-added entries in `.mcp.json` go through
+        // `config.rs::parse_mcp_json` where the trusted flag must be
+        // set explicitly. See dev-log/112.
         McpServerConfig {
             name: name.to_string(),
             transport: self.transport.clone(),
@@ -135,6 +141,7 @@ impl McpServerEntry {
             env: self.env.clone(),
             url: self.url.clone(),
             headers: self.headers.clone(),
+            trusted: true,
         }
     }
 }
