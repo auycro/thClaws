@@ -70,6 +70,10 @@ enum UserEvent {
     FileTree(String),
     FileContent(String),
     QuitRequested,
+    /// Settings → Appearance changed `guiScale`. Carries the new
+    /// (clamped) factor so the event loop can apply it via
+    /// `webview.zoom()` without re-reading config. Issue #47.
+    ZoomChanged(f64),
 }
 
 const MAX_RECENT_DIRS: usize = 3;
@@ -865,12 +869,7 @@ fn ospath(path: &str) -> String {
 /// Windows MessageBox enforces "Yes"/"No" labels; `yes_label`/`no_label`
 /// are only honoured on macOS and Linux, with the message text carrying
 /// the intent on Windows.
-pub(crate) fn native_confirm(
-    title: &str,
-    message: &str,
-    yes_label: &str,
-    no_label: &str,
-) -> bool {
+pub(crate) fn native_confirm(title: &str, message: &str, yes_label: &str, no_label: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
         let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
@@ -1186,7 +1185,22 @@ async fn build_all_models_payload() -> String {
         let mut model_ids: std::collections::BTreeMap<String, Option<u32>> =
             std::collections::BTreeMap::new();
         for (id, entry) in cat.list_models_for_provider(name) {
-            model_ids.insert(id, entry.context);
+            // Normalise to the canonical thclaws-routable form: if
+            // `ProviderKind::detect` doesn't already resolve `id` to
+            // the current provider, prepend the provider name as a
+            // prefix so the picker ships ids that survive the round
+            // trip through `model_set` → `detect` → `build_provider`.
+            // OpenRouter is the live case — its catalogue stores rows
+            // like `qwen/qwen-2.5-72b-instruct` (the upstream wire id),
+            // and without this normalisation `detect` would route them
+            // to DashScope on the leading `qwen` prefix and the wrong
+            // provider would 404 on a model it doesn't ship.
+            let canonical = if ProviderKind::detect(&id) == Some(*kind) {
+                id
+            } else {
+                format!("{name}/{id}")
+            };
+            model_ids.insert(canonical, entry.context);
         }
         if matches!(kind, ProviderKind::Ollama) {
             for id in &ollama_live {
@@ -1227,14 +1241,15 @@ pub fn run_gui() {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
-    let (win_w, win_h) = crate::config::ProjectConfig::load()
+    let (win_w, win_h, initial_zoom) = crate::config::ProjectConfig::load()
         .map(|c| {
             (
                 c.window_width.unwrap_or(1200.0),
                 c.window_height.unwrap_or(800.0),
+                c.gui_scale.unwrap_or(1.0),
             )
         })
-        .unwrap_or((1200.0, 800.0));
+        .unwrap_or((1200.0, 800.0, 1.0));
     let window = WindowBuilder::new()
         .with_title(&crate::branding::current().name)
         .with_inner_size(LogicalSize::new(win_w, win_h))
@@ -1514,6 +1529,32 @@ pub fn run_gui() {
                         ));
                         let _ = shared_for_ipc.input_tx.send(ShellInput::ReloadConfig);
                     }
+                }
+                "gui_scale_get" => {
+                    // Settings menu asking for the persisted zoom on
+                    // mount so the dropdown shows the right preset.
+                    let scale = crate::config::ProjectConfig::load()
+                        .and_then(|c| c.gui_scale)
+                        .unwrap_or(1.0);
+                    let payload = serde_json::json!({
+                        "type": "gui_scale_value",
+                        "scale": scale,
+                    });
+                    let _ = proxy_for_ipc
+                        .send_event(UserEvent::SessionLoaded(payload.to_string()));
+                }
+                "gui_set_zoom" => {
+                    // Settings panel slider / hotkey reset asking us to
+                    // change the GUI zoom factor. Persist to project
+                    // config and apply live; webview.zoom() is on the
+                    // event-loop side, so emit a UserEvent the loop
+                    // picks up below. Issue #47.
+                    let scale = msg.get("scale").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                    let mut project = crate::config::ProjectConfig::load().unwrap_or_default();
+                    project.set_gui_scale(scale);
+                    let _ = project.save();
+                    let clamped = project.gui_scale.unwrap_or(scale);
+                    let _ = proxy_for_ipc.send_event(UserEvent::ZoomChanged(clamped));
                 }
                 "request_all_models" => {
                     // Sidebar's inline model picker dropdown asking for
@@ -2836,6 +2877,14 @@ pub fn run_gui() {
         .build_gtk(window.default_vbox().unwrap())
         .expect("webview build (gtk)");
 
+    // Apply persisted GUI zoom so HiDPI / 4K users get the scale they
+    // last picked instead of the WebView's native 1.0 every launch.
+    // Skips the call when `guiScale` is exactly 1.0 — saves the
+    // round-trip on the common case. Issue #47.
+    if (initial_zoom - 1.0).abs() > f64::EPSILON {
+        let _ = webview.zoom(initial_zoom);
+    }
+
     #[cfg(target_os = "macos")]
     let mut macos_modifiers = ModifiersState::empty();
 
@@ -2911,6 +2960,9 @@ pub fn run_gui() {
             }
             Event::UserEvent(UserEvent::QuitRequested) => {
                 request_gui_shutdown(&shared_for_events, control_flow);
+            }
+            Event::UserEvent(UserEvent::ZoomChanged(scale)) => {
+                let _ = webview.zoom(scale);
             }
             #[cfg(target_os = "macos")]
             Event::WindowEvent {
