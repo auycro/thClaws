@@ -7,6 +7,7 @@
 pub mod agent;
 pub mod agent_defs;
 pub mod branding;
+pub mod cancel;
 mod cli_completer;
 pub mod commands;
 pub mod compaction;
@@ -35,6 +36,7 @@ pub mod secrets;
 pub mod session;
 #[cfg(feature = "gui")]
 pub mod shared_session;
+pub mod shell_bang;
 #[cfg(feature = "gui")]
 pub mod shell_dispatch;
 pub mod skills;

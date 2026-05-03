@@ -146,6 +146,12 @@ pub enum ViewEvent {
     ToolCallStart {
         name: String,
         label: String,
+        /// Raw JSON input the model passed to the tool. Carried so the
+        /// chat translator can render rich cards for tools whose input
+        /// is itself the user-visible payload (TodoWrite's `todos`
+        /// array, for instance). Most tools' inputs aren't worth
+        /// surfacing — the translator decides per tool name.
+        input: serde_json::Value,
     },
     ToolCallResult {
         name: String,
@@ -209,6 +215,26 @@ pub enum ViewEvent {
     /// `UserEvent::QuitRequested` so the tao loop runs the same
     /// save-and-exit path as the window-close button. Issue #52.
     QuitRequested,
+    /// Active plan changed. `Some(plan)` for submit / update_step,
+    /// `None` for clear. The translator forwards this as a
+    /// `chat_plan_update` IPC envelope to the right-side
+    /// `PlanSidebar`. Plan-mode rebuild M1.
+    PlanUpdate(Option<crate::tools::plan_state::Plan>),
+    /// Permission mode changed (M2). Carried to the sidebar so the
+    /// status pill / mode badge can update without polling. Fired by
+    /// EnterPlanMode / ExitPlanMode, `/plan`, sidebar Approve / Cancel.
+    PermissionModeChanged(crate::permissions::PermissionMode),
+    /// Stalled-turn detector tripped (M4.4). The model has finished N
+    /// consecutive turns without a plan mutation while a plan is
+    /// active and a step is in progress. Sidebar shows a yellow
+    /// "model seems stuck" banner with Continue / Abort buttons.
+    /// `step_id` and `step_title` identify the step the model
+    /// appears to be stuck on; `turns` is the consecutive count.
+    PlanStalled {
+        step_id: String,
+        step_title: String,
+        turns: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -280,7 +306,12 @@ impl DisplayMessage {
 pub struct SharedSessionHandle {
     pub input_tx: mpsc::Sender<ShellInput>,
     pub events_tx: broadcast::Sender<ViewEvent>,
-    pub cancel: Arc<AtomicBool>,
+    /// Cooperative cancel handle (M6.17 BUGs H1 + M3). Replaces the
+    /// bare `Arc<AtomicBool>` so the worker can `select!` on async
+    /// cancellation rather than polling the flag only between stream
+    /// events. Call `request_cancel()` to flip the flag AND wake
+    /// every active `cancelled().await`.
+    pub cancel: crate::cancel::CancelToken,
     /// Frontend signals this once it's past the launch modals so
     /// deferred startup (MCP spawn, etc.) can start making user-facing
     /// prompts. Calling `signal()` multiple times is fine.
@@ -293,7 +324,7 @@ impl SharedSessionHandle {
     }
 
     pub fn request_cancel(&self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        self.cancel.cancel();
     }
 }
 
@@ -337,6 +368,11 @@ pub struct WorkerState {
     /// this mirror the Team tab has no lead entry. `None` inside the
     /// mutex means the file could not be opened; writes are silent.
     pub lead_log: std::sync::Arc<std::sync::Mutex<Option<std::fs::File>>>,
+    /// Cooperative cancel handle, shared with the worker loop and
+    /// (via `with_cancel`) the agent. M6.17 BUG H1 + M3 — wired into
+    /// `rebuild_agent` so a `/model` swap doesn't lose the cancel
+    /// plumbing.
+    pub cancel: crate::cancel::CancelToken,
 }
 
 impl WorkerState {
@@ -364,7 +400,8 @@ impl WorkerState {
             &self.config.model,
             &self.system_prompt,
         )
-        .with_approver(self.approver.clone());
+        .with_approver(self.approver.clone())
+        .with_cancel(self.cancel.clone());
         self.agent = new_agent;
         self.agent.permission_mode = prev_perm;
         self.agent.thinking_budget = prev_thinking;
@@ -430,6 +467,61 @@ pub fn build_system_prompt(
     let guard = skill_store.lock().ok();
     if let Some(store) = guard.as_ref() {
         if !store.skills.is_empty() {
+            // dev-plan/06 P2: branch on the user's chosen strategy.
+            // - "full" preserves the original behavior (every skill
+            //   listed with name + description + trigger)
+            // - "names-only" lists names only, refers the model to
+            //   the SkillSearch / SkillList / Skill tools for detail
+            // - "discover-tool-only" lists no skills at all; just
+            //   names the discovery tools
+            let strategy = config.skills_listing_strategy.as_str();
+            append_skills_section(&mut system, store, strategy);
+        }
+    }
+
+    system
+}
+
+/// dev-plan/06 P2 helper. Renders the Available-skills section of the
+/// system prompt according to the configured strategy.
+fn append_skills_section(system: &mut String, store: &crate::skills::SkillStore, strategy: &str) {
+    let mut entries: Vec<&crate::skills::SkillDef> = store.skills.values().collect();
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+    match strategy {
+        "discover-tool-only" => {
+            system.push_str("\n\n# Available skills (MANDATORY usage)\n");
+            system.push_str(
+                "Bundled skills are available but not listed inline (you have \
+                 a large catalog). Discover them via `SkillList()` for the full \
+                 catalog or `SkillSearch(query: \"...\")` for a substring \
+                 lookup. When a user request sounds like it might match a \
+                 bundled workflow (\"make a PDF\", \"scaffold a skill\", \
+                 \"extract data from xlsx\", etc.), you MUST call SkillList \
+                 or SkillSearch FIRST before implementing the task manually. \
+                 Once you find a relevant skill, call `Skill(name: \"<name>\")` \
+                 to load its expert instructions and follow them.\n",
+            );
+        }
+        "names-only" => {
+            system.push_str("\n\n# Available skills (MANDATORY usage)\n");
+            system.push_str(
+                "The `Skill` tool loads expert instructions for a bundled \
+                 workflow. Skill names are listed below; for descriptions and \
+                 trigger criteria call `SkillSearch(query: \"...\")` or \
+                 `SkillList()`. If a user request might match any of these \
+                 skills, you MUST call Skill (or SkillSearch first) FIRST — \
+                 before any Bash, Write, Edit, or other tool calls for that \
+                 task. Announce the skill at the start of your reply.\n\n",
+            );
+            let names: Vec<&str> = entries.iter().map(|s| s.name.as_str()).collect();
+            // Render as a comma-separated list to keep token cost minimal
+            // — one line per N skills, ~30 chars per name.
+            system.push_str(&names.join(", "));
+            system.push('\n');
+        }
+        _ => {
+            // "full" (default) — preserves the original behavior.
             system.push_str("\n\n# Available skills (MANDATORY usage)\n");
             system.push_str(
                 "The `Skill` tool loads expert instructions for a bundled workflow. \
@@ -444,8 +536,6 @@ pub fn build_system_prompt(
                  Do NOT implement the task yourself when a matching skill exists — \
                  the skill encodes conventions and scripts you don't have built in.\n\n",
             );
-            let mut entries: Vec<&crate::skills::SkillDef> = store.skills.values().collect();
-            entries.sort_by(|a, b| a.name.cmp(&b.name));
             for skill in entries {
                 system.push_str(&format!("- **{}** — {}", skill.name, skill.description));
                 if !skill.when_to_use.is_empty() {
@@ -455,8 +545,6 @@ pub fn build_system_prompt(
             }
         }
     }
-
-    system
 }
 
 pub fn spawn() -> SharedSessionHandle {
@@ -472,7 +560,7 @@ pub fn spawn_with_approver(
 ) -> SharedSessionHandle {
     let (input_tx, input_rx) = mpsc::channel::<ShellInput>();
     let (events_tx, _) = broadcast::channel::<ViewEvent>(256);
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = crate::cancel::CancelToken::new();
     let ready_gate = Arc::new(ReadyGate::new());
 
     let events_tx_for_thread = events_tx.clone();
@@ -516,7 +604,7 @@ async fn run_worker(
     input_rx: mpsc::Receiver<ShellInput>,
     input_tx_self: mpsc::Sender<ShellInput>,
     events_tx: broadcast::Sender<ViewEvent>,
-    cancel: Arc<AtomicBool>,
+    cancel: crate::cancel::CancelToken,
     approver: std::sync::Arc<dyn crate::permissions::ApprovalSink>,
     ready_gate: Arc<ReadyGate>,
 ) {
@@ -529,10 +617,46 @@ async fn run_worker(
         std::sync::Arc::new(std::sync::Mutex::new(crate::skills::SkillStore::discover()));
 
     let mut tools = ToolRegistry::with_builtins();
+
+    // Plan-state → ViewEvent bridge + JSONL persistence (M1). Every
+    // time a plan tool calls `submit` / `update_step` / `clear`, the
+    // broadcaster registered here:
+    //   1. turns the snapshot into a `ViewEvent::PlanUpdate` so the
+    //      right-side sidebar redraws
+    //   2. appends a `plan_snapshot` event to the active session's
+    //      JSONL (path tracked via the arc below; updated whenever
+    //      `state.session` is reassigned — `/new`, `/load`, `/fork`)
+    //
+    // Registered before any tool can run so an early SubmitPlan call
+    // from the model still gets both the broadcast and the persisted
+    // snapshot. Replaces any prior registration — there's only one
+    // active worker per GUI process at a time.
+    let plan_persist_path: std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    {
+        let plan_tx = events_tx.clone();
+        let path_arc = plan_persist_path.clone();
+        crate::tools::plan_state::set_broadcaster(move |plan_opt| {
+            let _ = plan_tx.send(ViewEvent::PlanUpdate(plan_opt.clone()));
+            if let Ok(g) = path_arc.lock() {
+                if let Some(p) = g.as_ref() {
+                    let _ = crate::session::append_plan_snapshot(p, plan_opt.as_ref());
+                }
+            }
+        });
+    }
+
     if !config.kms_active.is_empty() {
         tools.register(std::sync::Arc::new(crate::tools::KmsReadTool));
         tools.register(std::sync::Arc::new(crate::tools::KmsSearchTool));
     }
+
+    // M6.11 (H1): daily auto-refresh of the marketplace catalog. No-op
+    // when the cache is < 24h old; otherwise spawns a fail-silent
+    // background fetch so newly-added skills appear without the user
+    // having to remember /skill marketplace --refresh. Mirrors the
+    // pattern the model catalogue uses.
+    crate::marketplace::spawn_daily_auto_refresh();
     let team_enabled = crate::config::ProjectConfig::load()
         .and_then(|c| c.team_enabled)
         .unwrap_or(false);
@@ -549,6 +673,14 @@ async fn run_worker(
     crate::team::set_is_team_lead(team_enabled && !is_teammate);
     let skill_tool = crate::skills::SkillTool::new_from_handle(skill_store.clone());
     tools.register(std::sync::Arc::new(skill_tool));
+    // dev-plan/06 P2: SkillList + SkillSearch are always registered
+    // (regardless of skills_listing_strategy) so any strategy can use
+    // them. Under "names-only" / "discover-tool-only" the system
+    // prompt explicitly directs the model to call these.
+    let skill_list = crate::skills::SkillListTool::new_from_handle(skill_store.clone());
+    tools.register(std::sync::Arc::new(skill_list));
+    let skill_search = crate::skills::SkillSearchTool::new_from_handle(skill_store.clone());
+    tools.register(std::sync::Arc::new(skill_search));
 
     // MCP servers are spawned in background tasks so a pending
     // approval modal can't block worker startup. The worker's main
@@ -655,8 +787,9 @@ async fn run_worker(
             "no LLM provider configured — open Settings → Provider API keys to add one",
         ))
     });
-    let mut agent =
-        Agent::new(provider, tools.clone(), &config.model, &system).with_approver(approver.clone());
+    let mut agent = Agent::new(provider, tools.clone(), &config.model, &system)
+        .with_approver(approver.clone())
+        .with_cancel(cancel.clone());
     // Respect the user's configured permission mode (project
     // `.thclaws/settings.json` can set it to "ask"). Without this the
     // GUI's Ask mode flag had no effect because the Agent was built
@@ -666,9 +799,45 @@ async fn run_worker(
     } else {
         crate::permissions::PermissionMode::Ask
     };
+    // Mirror the configured mode into the process-wide global so
+    // `permissions::current_mode()` (read by the agent's tool-dispatch
+    // gate, M2+) starts on the right value before any EnterPlanMode /
+    // sidebar-Approve flip can change it.
+    crate::permissions::set_current_mode(agent.permission_mode);
+
+    // Permission-mode → ViewEvent bridge (M2). Mirrors the plan-state
+    // broadcaster — every set_current_mode_and_broadcast() call
+    // (EnterPlanMode, ExitPlanMode, /plan, sidebar Approve/Cancel)
+    // turns into a `ViewEvent::PermissionModeChanged` so the sidebar
+    // status pill updates without polling.
+    {
+        let mode_tx = events_tx.clone();
+        crate::permissions::set_mode_broadcaster(move |mode| {
+            let _ = mode_tx.send(ViewEvent::PermissionModeChanged(mode));
+        });
+    }
 
     let session_store = SessionStore::default_path().map(SessionStore::new);
     let current_session = Session::new(&config.model, cwd.to_string_lossy());
+    // Point the plan-persistence arc at the initial session's JSONL
+    // path so any SubmitPlan / UpdatePlanStep call before the first
+    // /load gets persisted. Subsequent session swaps reassign this
+    // arc — see the helper at the call sites below.
+    if let (Some(store), Ok(mut g)) = (session_store.as_ref(), plan_persist_path.lock()) {
+        let path = store.path_for(&current_session.id);
+        // Write the header BEFORE pointing plan_persist_path at this
+        // file. Otherwise the first plan_state mutation (typically
+        // restore_from_session below) races append_plan_snapshot to
+        // the empty path, creates the file headerless, and the
+        // session becomes invisible to SessionStore::list. Same
+        // pattern at every other Session::new site below.
+        let _ = current_session.write_header_if_missing(&path);
+        *g = Some(path);
+    }
+    // Reset plan_state to whatever the initial session has (None for
+    // a fresh `Session::new`, but Some(plan) for a session loaded
+    // off disk that already had a plan_snapshot in its JSONL).
+    crate::tools::plan_state::restore_from_session(current_session.plan.clone());
 
     // Lead status + output log so the Team tab can show a 'lead' pane.
     // `run_repl` writes these from the CLI loop; in GUI mode nobody does,
@@ -701,6 +870,7 @@ async fn run_worker(
         mcp_clients,
         warned_file_size: false,
         lead_log,
+        cancel: cancel.clone(),
     };
 
     // Lead inbox poller — parity with repl.rs:1524. Without this, teammates
@@ -731,18 +901,37 @@ async fn run_worker(
     while let Ok(input) = input_rx.recv() {
         match input {
             ShellInput::Line(text) => {
-                cancel.store(false, Ordering::Relaxed);
-                handle_line(text, &mut state, &events_tx, &cancel).await;
+                cancel.reset();
+                handle_line(text, &mut state, &events_tx, &cancel, &input_tx_self).await;
             }
             ShellInput::LineWithImages { text, images } => {
-                cancel.store(false, Ordering::Relaxed);
-                handle_line_with_images(text, images, &mut state, &events_tx, &cancel).await;
+                cancel.reset();
+                handle_line_with_images(
+                    text,
+                    images,
+                    &mut state,
+                    &events_tx,
+                    &cancel,
+                    &input_tx_self,
+                )
+                .await;
             }
             ShellInput::NewSession => {
                 save_history(&state.agent, &mut state.session, &state.session_store);
                 state.agent.clear_history();
                 state.session = Session::new(&state.config.model, state.cwd.to_string_lossy());
                 state.warned_file_size = false;
+                // New session = clean slate for plan state and the
+                // persistence path. Broadcasts `PlanUpdate(None)` so
+                // the sidebar dismisses if it was open.
+                if let (Some(store), Ok(mut g)) =
+                    (state.session_store.as_ref(), plan_persist_path.lock())
+                {
+                    let path = store.path_for(&state.session.id);
+                    let _ = state.session.write_header_if_missing(&path);
+                    *g = Some(path);
+                }
+                crate::tools::plan_state::clear();
                 let _ = events_tx.send(ViewEvent::HistoryReplaced(Vec::new()));
                 let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
                     &state.session_store,
@@ -823,6 +1012,23 @@ async fn run_worker(
                 state.agent.set_history(loaded.messages.clone());
                 state.session = loaded;
                 state.warned_file_size = false;
+                // /load: repoint persistence at the loaded session's
+                // JSONL and restore plan_state so the sidebar comes
+                // back populated if the loaded session had a plan
+                // snapshot. M1+ — decision #1 in dev-plan/03.
+                if let (Some(store), Ok(mut g)) =
+                    (state.session_store.as_ref(), plan_persist_path.lock())
+                {
+                    *g = Some(store.path_for(&state.session.id));
+                }
+                crate::tools::plan_state::restore_from_session(state.session.plan.clone());
+                // M6.9 (Bug E1): reset the per-step attempt counter
+                // on session swap. The counter is process-global and
+                // would otherwise leak across sessions — if the prior
+                // session had attempts at 2/3 on a step.id that the
+                // loaded session also uses, the driver would
+                // immediately force-Failed on its first nudge.
+                crate::tools::plan_state::reset_step_attempts_external();
                 let display = DisplayMessage::from_messages(&state.session.messages);
                 let _ = events_tx.send(ViewEvent::HistoryReplaced(display));
                 // Refresh so the sidebar's "current session" highlight
@@ -837,7 +1043,7 @@ async fn run_worker(
                 break;
             }
             ShellInput::TeamMessages(msgs) => {
-                cancel.store(false, Ordering::Relaxed);
+                cancel.reset();
                 handle_team_messages(msgs, &mut state, &events_tx, &cancel).await;
             }
             ShellInput::McpReady {
@@ -873,28 +1079,68 @@ async fn run_worker(
                 arguments,
             } => {
                 // Widget asked us to invoke a tool on its originating
-                // MCP server (app.callServerTool). Trust gate already
-                // applied when the widget was rendered (only trusted
-                // servers ship a `ui_resource` in the first place);
-                // direct invoke here.
+                // MCP server (app.callServerTool). Trust at widget-
+                // render time only gates HTML rendering, NOT
+                // unattended tool execution — M6.15 BUG 2 routes
+                // widget tool-calls through the same approval gate
+                // the agent loop uses so a trusted server's widget
+                // can't silently invoke `delete_*`-style tools when
+                // the user has set permission_mode = "ask".
                 let tool = state.tool_registry.get(&qualified_name);
                 let (content, is_error) = match tool {
-                    Some(t) => match t.call_multimodal(arguments).await {
-                        Ok(result) => {
-                            // Convert ToolResultContent → MCP
-                            // CallToolResult.content shape. Phase 1
-                            // is text-only — image blocks degrade to
-                            // their text summary via to_text. Pinn.ai
-                            // image2image returns a URL string, so
-                            // text-only is sufficient.
-                            let text = result.to_text();
-                            (serde_json::json!([{ "type": "text", "text": text }]), false)
+                    Some(t) => {
+                        let mode = crate::permissions::current_mode();
+                        let needs_approval = matches!(
+                            mode,
+                            crate::permissions::PermissionMode::Ask
+                                | crate::permissions::PermissionMode::Plan,
+                        ) && t.requires_approval(&arguments);
+                        let denied = if needs_approval {
+                            let req = crate::permissions::ApprovalRequest {
+                                tool_name: qualified_name.clone(),
+                                input: arguments.clone(),
+                                summary: Some(format!(
+                                    "MCP-App widget requested `{qualified_name}`. Allow?"
+                                )),
+                            };
+                            matches!(
+                                state.approver.approve(&req).await,
+                                crate::permissions::ApprovalDecision::Deny
+                            )
+                        } else {
+                            false
+                        };
+                        if denied {
+                            (
+                                serde_json::json!([{
+                                    "type": "text",
+                                    "text": format!("denied by user: {qualified_name}"),
+                                }]),
+                                true,
+                            )
+                        } else {
+                            match t.call_multimodal(arguments).await {
+                                Ok(result) => {
+                                    // Convert ToolResultContent → MCP
+                                    // CallToolResult.content shape.
+                                    // Phase 1 is text-only — image
+                                    // blocks degrade to their text
+                                    // summary via to_text. Pinn.ai
+                                    // image2image returns a URL
+                                    // string, so text-only suffices.
+                                    let text = result.to_text();
+                                    (
+                                        serde_json::json!([{ "type": "text", "text": text }]),
+                                        false,
+                                    )
+                                }
+                                Err(e) => (
+                                    serde_json::json!([{ "type": "text", "text": format!("error: {e}") }]),
+                                    true,
+                                ),
+                            }
                         }
-                        Err(e) => (
-                            serde_json::json!([{ "type": "text", "text": format!("error: {e}") }]),
-                            true,
-                        ),
-                    },
+                    }
                     None => (
                         serde_json::json!([{ "type": "text", "text": format!("unknown tool: {qualified_name}") }]),
                         true,
@@ -940,6 +1186,14 @@ async fn run_worker(
                                 state.cwd.to_string_lossy(),
                             );
                             state.warned_file_size = false;
+                            if let (Some(store), Ok(mut g)) =
+                                (state.session_store.as_ref(), plan_persist_path.lock())
+                            {
+                                let path = store.path_for(&state.session.id);
+                                let _ = state.session.write_header_if_missing(&path);
+                                *g = Some(path);
+                            }
+                            crate::tools::plan_state::clear();
                             let _ = events_tx.send(ViewEvent::HistoryReplaced(Vec::new()));
                         }
                         let provider_name = state.config.detect_provider().unwrap_or("unknown");
@@ -983,6 +1237,14 @@ async fn run_worker(
                     }
                 }
 
+                // Rebuild `session_store` against the NEW cwd. Without
+                // this, `save_history` and `build_session_list` stay
+                // pinned to the previous workspace's `.thclaws/sessions/`,
+                // so saves land in the wrong project and the sidebar
+                // never reflects the new project's sessions.
+                state.session_store =
+                    crate::session::SessionStore::default_path().map(SessionStore::new);
+
                 // If the model changed, rebuild the agent without history
                 // — the new provider's message schema may not match the
                 // old conversation, same logic as `/model` swap.
@@ -999,12 +1261,28 @@ async fn run_worker(
                             &state.config.model,
                             state.cwd.to_string_lossy(),
                         );
+                        if let (Some(store), Ok(mut g)) =
+                            (state.session_store.as_ref(), plan_persist_path.lock())
+                        {
+                            let path = store.path_for(&state.session.id);
+                            let _ = state.session.write_header_if_missing(&path);
+                            *g = Some(path);
+                        }
+                        crate::tools::plan_state::clear();
                     }
                 }
 
                 // Always rebuild the system prompt — the cwd it embeds
                 // changed, even if the model didn't.
                 state.rebuild_system_prompt();
+
+                // Broadcast the new project's session list so the
+                // sidebar redraws. Mirrors what `/new` and `/load` do
+                // after they mutate the same store.
+                let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
+                    &state.session_store,
+                    &state.session.id,
+                )));
 
                 let _ = events_tx.send(ViewEvent::SlashOutput(format!(
                     "[cwd] {} → model: {} (was: {})",
@@ -1056,7 +1334,8 @@ async fn handle_line(
     text: String,
     state: &mut WorkerState,
     events_tx: &broadcast::Sender<ViewEvent>,
-    cancel: &Arc<AtomicBool>,
+    cancel: &crate::cancel::CancelToken,
+    input_tx: &mpsc::Sender<ShellInput>,
 ) {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -1069,17 +1348,43 @@ async fn handle_line(
         &format!("\n\x1b[36m❯ {trimmed}\x1b[0m\n\x1b[32m"),
     );
 
+    // `!<cmd>` shell escape — user-initiated shell command that doesn't
+    // touch the agent. Output is shown via SlashOutput and is NOT
+    // pushed to agent history (same shape as slash commands). Routes
+    // through BashTool so it inherits sandbox cwd restriction, the
+    // M6.8 non-interactive env vars, venv auto-activation, and the
+    // destructive-command + lead/teammate guards.
+    if let Some(cmd) = crate::shell_bang::parse_bang(trimmed) {
+        match crate::shell_bang::run_bang_command(cmd).await {
+            Ok(output) => {
+                let _ = events_tx.send(ViewEvent::SlashOutput(format!("[!] {cmd}\n{output}")));
+            }
+            Err(e) => {
+                let _ = events_tx.send(ViewEvent::ErrorText(format!("[!] {cmd}\n{e}")));
+            }
+        }
+        let _ = events_tx.send(ViewEvent::TurnDone);
+        return;
+    }
+
     if trimmed.starts_with('/') {
-        // `/<skill-name> [args]` shortcut — same UX as the CLI repl
-        // (see repl.rs:2406). If `parse_slash` returns Unknown AND the
-        // first word matches an installed skill name, rewrite to a
-        // normal user prompt and fall through to the regular agent
-        // pipeline; the model then calls `Skill(name: …)` to load the
-        // skill content. Without this, every plugin-contributed skill
-        // surfaced as "unknown command" in the GUI even when the
-        // skill was loaded into the registry.
+        // `/<word> [args]` shortcut — same UX + resolution order as
+        // the CLI repl (see repl.rs:2601-2632). If `parse_slash`
+        // returns Unknown, try to resolve `<word>` against:
+        //   1. installed skills → rewrite into a "call Skill(...)"
+        //      prompt
+        //   2. user / plugin prompt commands (.md templates) →
+        //      render the template body with $ARGUMENTS substitution
+        // and fall through to the regular agent pipeline. Without
+        // this fallback, every custom command surfaced via the
+        // slash popup landed as "unknown command" in the GUI even
+        // though the command was discoverable in the popup.
         if let Some(crate::repl::SlashCommand::Unknown(what)) = crate::repl::parse_slash(trimmed) {
             let word = what.split_whitespace().next().unwrap_or("").to_string();
+            let body = trimmed.strip_prefix('/').unwrap_or("").trim_start();
+            let args = body.strip_prefix(&word).unwrap_or("").trim();
+
+            // (1) Skill lookup.
             let skill_present = state
                 .skill_store
                 .lock()
@@ -1087,8 +1392,6 @@ async fn handle_line(
                 .map(|s| s.skills.contains_key(&word))
                 .unwrap_or(false);
             if skill_present {
-                let body = trimmed.strip_prefix('/').unwrap_or("").trim_start();
-                let args = body.strip_prefix(&word).unwrap_or("").trim();
                 let args_note = if args.is_empty() {
                     String::new()
                 } else {
@@ -1097,14 +1400,30 @@ async fn handle_line(
                 let rewritten = format!(
                     "The user ran the `/{word}` slash command. Call `Skill(name: \"{word}\")` right away and follow the instructions it returns.{args_note}"
                 );
-                // Fall through to the regular agent pipeline below
-                // with the rewritten prompt instead of dispatching as
-                // a slash command.
                 emit_skill_resolution_hint(events_tx, &word);
                 let stream = Box::pin(state.agent.run_turn(rewritten));
                 let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
                 let _ = lead_mb.write_status("lead", "working", None);
-                drive_turn_stream(stream, state, events_tx, cancel, &lead_mb).await;
+                drive_turn_stream(stream, state, events_tx, cancel, &lead_mb, input_tx).await;
+                return;
+            }
+
+            // (2) Custom command (.md template) lookup. Re-discover
+            // each call so freshly-installed plugins surface without
+            // a restart — matches the popup's discover-each-render
+            // pattern in gui.rs:1835. The plugin_command_dirs
+            // extras include both user-scope and project-scope
+            // plugin contributions.
+            let command_store = crate::commands::CommandStore::discover_with_extra(
+                &crate::plugins::plugin_command_dirs(),
+            );
+            if let Some(cmd) = command_store.get(&word).cloned() {
+                let rewritten = cmd.render(args);
+                emit_command_resolution_hint(events_tx, &word, &cmd.source);
+                let stream = Box::pin(state.agent.run_turn(rewritten));
+                let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
+                let _ = lead_mb.write_status("lead", "working", None);
+                drive_turn_stream(stream, state, events_tx, cancel, &lead_mb, input_tx).await;
                 return;
             }
         }
@@ -1126,7 +1445,7 @@ async fn handle_line(
     let _ = lead_mb.write_status("lead", "working", None);
 
     let stream = Box::pin(state.agent.run_turn(trimmed.to_string()));
-    drive_turn_stream(stream, state, events_tx, cancel, &lead_mb).await;
+    drive_turn_stream(stream, state, events_tx, cancel, &lead_mb, input_tx).await;
 }
 
 /// Multipart variant of `handle_line` — used when the chat composer
@@ -1139,7 +1458,8 @@ async fn handle_line_with_images(
     images: Vec<(String, String)>,
     state: &mut WorkerState,
     events_tx: &broadcast::Sender<ViewEvent>,
-    cancel: &Arc<AtomicBool>,
+    cancel: &crate::cancel::CancelToken,
+    input_tx: &mpsc::Sender<ShellInput>,
 ) {
     let trimmed = text.trim();
     if trimmed.is_empty() && images.is_empty() {
@@ -1189,7 +1509,7 @@ async fn handle_line_with_images(
     }
 
     let stream = Box::pin(state.agent.run_turn_multipart(user_content));
-    drive_turn_stream(stream, state, events_tx, cancel, &lead_mb).await;
+    drive_turn_stream(stream, state, events_tx, cancel, &lead_mb, input_tx).await;
 }
 
 /// Drive an agent run_turn stream to completion, emitting ViewEvents
@@ -1201,22 +1521,33 @@ async fn drive_turn_stream(
     >,
     state: &mut WorkerState,
     events_tx: &broadcast::Sender<ViewEvent>,
-    cancel: &Arc<AtomicBool>,
+    cancel: &crate::cancel::CancelToken,
     lead_mb: &crate::team::Mailbox,
+    input_tx: &mpsc::Sender<ShellInput>,
 ) {
-    while let Some(ev) = stream.next().await {
-        if cancel.load(Ordering::Relaxed) {
-            let _ = events_tx.send(ViewEvent::ErrorText("(interrupted)".into()));
-            write_lead_log(&state.lead_log, "\x1b[0m\n\x1b[33m[cancelled]\x1b[0m\n");
-            save_history(&state.agent, &mut state.session, &state.session_store);
-            let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
-                &state.session_store,
-                &state.session.id,
-            )));
-            let _ = events_tx.send(ViewEvent::TurnDone);
-            let _ = lead_mb.write_status("lead", "active", None);
-            return;
-        }
+    loop {
+        // M6.17 BUG H1: race the next stream event against the cancel
+        // signal so a long tool run / stalled provider stream doesn't
+        // delay the user's Stop button. Pre-fix the cancel flag was
+        // only checked between events, so the user could click Stop
+        // and wait seconds to minutes before anything happened.
+        let ev = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                let _ = events_tx.send(ViewEvent::ErrorText("(interrupted)".into()));
+                write_lead_log(&state.lead_log, "\x1b[0m\n\x1b[33m[cancelled]\x1b[0m\n");
+                save_history(&state.agent, &mut state.session, &state.session_store);
+                let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
+                    &state.session_store,
+                    &state.session.id,
+                )));
+                let _ = events_tx.send(ViewEvent::TurnDone);
+                let _ = lead_mb.write_status("lead", "active", None);
+                return;
+            }
+            ev = stream.next() => ev,
+        };
+        let Some(ev) = ev else { break };
         match ev {
             Ok(AgentEvent::Text(s)) => {
                 write_lead_log(&state.lead_log, &s);
@@ -1228,7 +1559,7 @@ async fn drive_turn_stream(
                     &state.lead_log,
                     &format!("\x1b[0m\n\x1b[90m[tool: {name}]\x1b[0m "),
                 );
-                let _ = events_tx.send(ViewEvent::ToolCallStart { name, label });
+                let _ = events_tx.send(ViewEvent::ToolCallStart { name, label, input });
             }
             Ok(AgentEvent::ToolCallResult {
                 name,
@@ -1276,6 +1607,185 @@ async fn drive_turn_stream(
             _ => {}
         }
     }
+
+    // Stalled-turn detector (M4.4). After every agent turn that ended
+    // naturally (not via cancellation — the early return above skips
+    // this branch), check if the plan made progress. If the active
+    // plan still has an InProgress step and no UpdatePlanStep
+    // mutation reset the counter, increment. Cross the threshold and
+    // we broadcast PlanStalled so the sidebar can prompt the user.
+    if let Some(plan) = crate::tools::plan_state::get() {
+        let in_progress = plan
+            .steps
+            .iter()
+            .find(|s| s.status == crate::tools::plan_state::StepStatus::InProgress);
+        if let Some(step) = in_progress {
+            let turns = crate::tools::plan_state::note_turn_completed_without_progress();
+            if turns >= crate::tools::plan_state::STALL_TURN_THRESHOLD {
+                let _ = events_tx.send(ViewEvent::PlanStalled {
+                    step_id: step.id.clone(),
+                    step_title: step.title.clone(),
+                    turns,
+                });
+            }
+        }
+    }
+
+    // Plan-execution driver (M6.1, "Ralph loop"). Replaces the older
+    // dumb "Continue with the plan." nudge with a step-aware loop:
+    // each turn end, we look at the plan, find the next actionable
+    // step, and push a focused per-step continuation prompt that wakes
+    // the worker loop with that one step in scope.
+    //
+    // Why this shape: the worker is an event loop driven by the
+    // `input_rx` channel. Pushing a `ShellInput::Line` here is the
+    // existing path for "run another turn" — we keep that, but make
+    // the message specific to the next step instead of a generic
+    // continue. The agent's system reminder (via build_execution_
+    // reminder) already narrows the model's view to the focused step,
+    // so the per-step user message is intentionally terse — it just
+    // says "go, your focus is step N".
+    //
+    // Per-step retry budget: `note_step_attempt` returns 1 on the
+    // first nudge for a given step id, 2 on the second, etc. Once we
+    // exceed `MAX_RETRIES_PER_STEP` (3 by default) on the same step
+    // without it transitioning to Done or Failed, we mark the step
+    // Failed automatically — the user gets the standard Retry / Skip /
+    // Abort sidebar path instead of the loop spinning forever. This
+    // is the "force iteration to completion" guarantee the Ralph
+    // architecture provides over the prior monolithic auto-continue.
+    //
+    // Bounded by:
+    //   - Plan completion (auto-restore flips mode out of Auto when
+    //     the last step transitions to Done — see plan_state).
+    //   - User cancel (clears the plan).
+    //   - User Approve flow (mode == Plan keeps the driver dormant
+    //     while the sidebar buttons are the contract).
+    //   - Per-step retry budget (force-Failed after N nudges).
+    //   - Stalled-turn detector — fires PlanStalled banner above so
+    //     the user can intervene via Continue / Abort if a step's
+    //     budget hasn't run out yet but the model is clearly stuck.
+    //   - Agent's own max_iterations cap (per inner run_turn call).
+    if let Some(plan) = crate::tools::plan_state::get() {
+        let mode = crate::permissions::current_mode();
+        let waiting_for_approval = matches!(mode, crate::permissions::PermissionMode::Plan);
+        if !waiting_for_approval {
+            // M6.7: yield to the user when the earliest non-Done step
+            // is Failed. The Layer-1 gate would reject any attempt to
+            // start a downstream Todo while a prior step is Failed, so
+            // pushing per-step prompts there only burns the retry
+            // budget on a step that can't possibly start. The user
+            // owns recovery via the sidebar's Retry / Skip / Abort
+            // buttons; the driver waits.
+            //
+            // Without this, the prior real-world test session
+            // bounced between attempt-1/2/3 prompts on step 3 while
+            // step 2 stayed Failed, eventually marking step 3 Failed
+            // for "max retries exceeded" — when step 3 was never
+            // actually unblocked.
+            use crate::tools::plan_state::StepStatus;
+            let earliest_unfinished = plan.steps.iter().find(|s| s.status != StepStatus::Done);
+            let upstream_failed = matches!(
+                earliest_unfinished.map(|s| s.status),
+                Some(StepStatus::Failed),
+            );
+            if upstream_failed {
+                // Plan blocked on user action — don't push another
+                // prompt. The sidebar already shows the Failed step
+                // with Retry / Skip / Abort.
+                return;
+            }
+            // Find the next actionable step: first one that's still
+            // Todo or InProgress. Failed and Done are skipped — Failed
+            // because the user owns that recovery, Done because we're
+            // moving past it.
+            let next = plan
+                .steps
+                .iter()
+                .find(|s| matches!(s.status, StepStatus::Todo | StepStatus::InProgress));
+            if let Some(step) = next {
+                let attempt = crate::tools::plan_state::note_step_attempt(&step.id);
+
+                // M6.2 step-boundary compaction. `attempt == 1` means
+                // the per-step counter just reset, which only happens
+                // when we cross a step boundary (different step id
+                // from last time). Combined with "at least one step
+                // is now Done" — there's actual completed work in
+                // history worth compacting — this fires the structural
+                // shrink before pushing the next per-step prompt, so
+                // the agent's upcoming turn starts with a leaner
+                // history. Plan-tool tool_results are preserved
+                // untouched (they're the breadcrumbs the model uses to
+                // know what's done); non-plan tool_results from
+                // pre-boundary messages are replaced with a short
+                // placeholder.
+                let any_done = plan.steps.iter().any(|s| s.status == StepStatus::Done);
+                if attempt == 1 && any_done {
+                    let mut history = state.agent.history_snapshot();
+                    // M6.4: strategy picked from config. Defaults to
+                    // "compact" (M6.2 structural shrink); "clear"
+                    // wipes history outright keeping only the first
+                    // user message for project-level grounding.
+                    let (changed, notice) = match state.config.plan_context_strategy.as_str() {
+                        "clear" => {
+                            let dropped = crate::compaction::clear_for_step_boundary(&mut history);
+                            (
+                                dropped > 0,
+                                format!("[step-boundary cleared: dropped {dropped} messages]"),
+                            )
+                        }
+                        _ => {
+                            let saved = crate::compaction::compact_for_step_boundary(&mut history);
+                            (
+                                saved > 0,
+                                format!("[step-boundary compacted: ~{saved} bytes saved]"),
+                            )
+                        }
+                    };
+                    if changed {
+                        state.agent.set_history(history.clone());
+                        // Persist the compaction marker into the
+                        // session JSONL so a `/load` after the fact
+                        // restores the trimmed history (matches the
+                        // existing `maybe_auto_compact` pattern).
+                        if let Some(store) = &state.session_store {
+                            let path = store.path_for(&state.session.id);
+                            let _ = state.session.append_compaction_to(&path, &history);
+                        }
+                        let _ = events_tx.send(ViewEvent::SlashOutput(notice));
+                    }
+                }
+
+                if attempt > crate::tools::plan_state::MAX_RETRIES_PER_STEP {
+                    // Budget exhausted on this step. Force-mark it
+                    // Failed so the user gets a recovery path; the
+                    // sidebar's Retry button resets the attempt
+                    // counter and lets the model try again.
+                    let reason = format!(
+                        "max retries per step exceeded ({} attempts) — \
+                         the agent looped without committing to done or \
+                         failed. Use the sidebar Retry / Skip / Abort \
+                         buttons to recover.",
+                        crate::tools::plan_state::MAX_RETRIES_PER_STEP,
+                    );
+                    let _ = crate::tools::plan_state::update_step(
+                        &step.id,
+                        StepStatus::Failed,
+                        Some(reason),
+                    );
+                    // Don't push another ShellInput — the Failed step
+                    // is now waiting on the user.
+                } else {
+                    let prompt = crate::agent::build_step_continuation_prompt(&plan, step, attempt);
+                    let _ = input_tx.send(ShellInput::Line(prompt));
+                }
+            }
+            // No next-actionable step → either all Done (the auto-
+            // restore in plan_state already flipped mode and cleared
+            // the path), or the only remaining work is Failed (user
+            // owns it). Either way: don't nudge.
+        }
+    }
 }
 
 /// Surface the `/skill → Skill(name: …)` resolution to the user the
@@ -1283,6 +1793,17 @@ async fn drive_turn_stream(
 fn emit_skill_resolution_hint(events_tx: &broadcast::Sender<ViewEvent>, name: &str) {
     let _ = events_tx.send(ViewEvent::SlashOutput(format!(
         "(/{name} → Skill(name: \"{name}\"))"
+    )));
+}
+
+fn emit_command_resolution_hint(
+    events_tx: &broadcast::Sender<ViewEvent>,
+    name: &str,
+    source: &std::path::Path,
+) {
+    let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+        "(/{name} → prompt from {})",
+        source.display()
     )));
 }
 
@@ -1300,7 +1821,7 @@ async fn handle_team_messages(
     msgs: Vec<crate::team::TeamMessage>,
     state: &mut WorkerState,
     events_tx: &broadcast::Sender<ViewEvent>,
-    cancel: &Arc<AtomicBool>,
+    cancel: &crate::cancel::CancelToken,
 ) {
     if msgs.is_empty() {
         return;
@@ -1348,19 +1869,28 @@ async fn handle_team_messages(
     let _ = lead_mb.write_status("lead", "working", None);
 
     let mut stream = Box::pin(state.agent.run_turn(prompt));
-    while let Some(ev) = stream.next().await {
-        if cancel.load(Ordering::Relaxed) {
-            let _ = events_tx.send(ViewEvent::ErrorText("(interrupted)".into()));
-            write_lead_log(&state.lead_log, "\x1b[0m\n\x1b[33m[cancelled]\x1b[0m\n");
-            save_history(&state.agent, &mut state.session, &state.session_store);
-            let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
-                &state.session_store,
-                &state.session.id,
-            )));
-            let _ = events_tx.send(ViewEvent::TurnDone);
-            let _ = lead_mb.write_status("lead", "active", None);
-            return;
-        }
+    loop {
+        // M6.17 BUG H1: race the next stream event against the cancel
+        // signal — same fix as drive_turn_stream above. handle_team_messages
+        // calls this function-shaped path inline rather than through
+        // drive_turn_stream so it needs its own select! arm.
+        let ev = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                let _ = events_tx.send(ViewEvent::ErrorText("(interrupted)".into()));
+                write_lead_log(&state.lead_log, "\x1b[0m\n\x1b[33m[cancelled]\x1b[0m\n");
+                save_history(&state.agent, &mut state.session, &state.session_store);
+                let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
+                    &state.session_store,
+                    &state.session.id,
+                )));
+                let _ = events_tx.send(ViewEvent::TurnDone);
+                let _ = lead_mb.write_status("lead", "active", None);
+                return;
+            }
+            ev = stream.next() => ev,
+        };
+        let Some(ev) = ev else { break };
         match ev {
             Ok(AgentEvent::Text(s)) => {
                 write_lead_log(&state.lead_log, &s);
@@ -1372,7 +1902,7 @@ async fn handle_team_messages(
                     &state.lead_log,
                     &format!("\x1b[0m\n\x1b[90m[tool: {name}]\x1b[0m "),
                 );
-                let _ = events_tx.send(ViewEvent::ToolCallStart { name, label });
+                let _ = events_tx.send(ViewEvent::ToolCallStart { name, label, input });
             }
             Ok(AgentEvent::ToolCallResult {
                 name,
@@ -1760,4 +2290,114 @@ pub(crate) fn maybe_warn_file_size(
     state.warned_file_size = true;
     let mb = meta.len() as f64 / (1024.0 * 1024.0);
     let _ = events_tx.send(ViewEvent::ContextWarning { file_size_mb: mb });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store_with_two() -> crate::skills::SkillStore {
+        let mut store = crate::skills::SkillStore::default();
+        store.skills.insert(
+            "pdf".into(),
+            crate::skills::SkillDef::new_eager(
+                "pdf".into(),
+                "Render PDFs".into(),
+                "When user wants a PDF".into(),
+                std::path::PathBuf::from("/tmp/pdf"),
+                "body-pdf".into(),
+            ),
+        );
+        store.skills.insert(
+            "xlsx".into(),
+            crate::skills::SkillDef::new_eager(
+                "xlsx".into(),
+                "Read xlsx files".into(),
+                String::new(),
+                std::path::PathBuf::from("/tmp/xlsx"),
+                "body-xlsx".into(),
+            ),
+        );
+        store
+    }
+
+    #[test]
+    fn skills_section_full_strategy_lists_descriptions_and_triggers() {
+        // dev-plan/06 P2: "full" strategy preserves the original
+        // behavior — every skill listed with description + trigger.
+        let mut out = String::new();
+        let store = store_with_two();
+        append_skills_section(&mut out, &store, "full");
+        assert!(out.contains("# Available skills (MANDATORY usage)"));
+        assert!(out.contains("**pdf**"), "name not bolded: {out}");
+        assert!(out.contains("Render PDFs"), "description missing: {out}");
+        assert!(out.contains("Trigger:"), "trigger missing: {out}");
+        assert!(
+            out.contains("ACTUALLY") || out.contains("MUST"),
+            "discipline weak: {out}"
+        );
+    }
+
+    #[test]
+    fn skills_section_names_only_strategy_omits_descriptions() {
+        // dev-plan/06 P2: "names-only" lists only names, points the
+        // model at SkillSearch / SkillList for detail. Big token
+        // savings for users with many skills.
+        let mut out = String::new();
+        let store = store_with_two();
+        append_skills_section(&mut out, &store, "names-only");
+        assert!(out.contains("# Available skills (MANDATORY usage)"));
+        // Names ARE listed.
+        assert!(out.contains("pdf"), "name missing: {out}");
+        assert!(out.contains("xlsx"), "name missing: {out}");
+        // Descriptions / triggers are NOT.
+        assert!(!out.contains("Render PDFs"), "description leaked: {out}");
+        assert!(!out.contains("Trigger:"), "trigger leaked: {out}");
+        // Discovery tools mentioned.
+        assert!(
+            out.contains("SkillSearch") || out.contains("SkillList"),
+            "no discovery hint: {out}"
+        );
+    }
+
+    #[test]
+    fn skills_section_discover_tool_only_omits_names_too() {
+        // dev-plan/06 P2: most aggressive — no skill names at all in
+        // the listing form. Constant-size system prompt regardless of
+        // skill count.
+        //
+        // Note: the discovery-hint copy contains illustrative examples
+        // ("make a PDF", "extract data from xlsx") that mention skill-
+        // adjacent words by design. The test asserts the LISTING
+        // format isn't present (no "- pdf —" / "**pdf**" / standalone
+        // skill name on a line), not raw substring absence.
+        let mut out = String::new();
+        let store = store_with_two();
+        append_skills_section(&mut out, &store, "discover-tool-only");
+        assert!(out.contains("# Available skills (MANDATORY usage)"));
+        // No skill listing — bullet markers + bolded names + comma
+        // joins shouldn't appear.
+        assert!(!out.contains("**pdf**"), "bolded listing leaked: {out}");
+        assert!(!out.contains("- pdf"), "bullet listing leaked: {out}");
+        assert!(!out.contains("- xlsx"), "bullet listing leaked: {out}");
+        // Discovery tools mentioned.
+        assert!(out.contains("SkillList"), "SkillList not named: {out}");
+        assert!(out.contains("SkillSearch"), "SkillSearch not named: {out}");
+        // MUST-call discipline preserved.
+        assert!(out.contains("MUST"), "MUST discipline missing: {out}");
+    }
+
+    #[test]
+    fn skills_section_unknown_strategy_falls_back_to_full() {
+        // Defensive: unknown strategy strings shouldn't break the
+        // system prompt. They should fall back to the safe "full"
+        // behavior. The config layer also validates and falls back to
+        // "full" silently, but defense-in-depth.
+        let mut out = String::new();
+        let store = store_with_two();
+        append_skills_section(&mut out, &store, "totally-bogus-strategy");
+        // Should look like the full-strategy output.
+        assert!(out.contains("**pdf**"));
+        assert!(out.contains("Render PDFs"));
+    }
 }

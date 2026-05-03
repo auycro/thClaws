@@ -206,7 +206,13 @@ impl PluginRegistry {
         }
         let pretty = serde_json::to_string_pretty(self)
             .map_err(|e| Error::Config(format!("serialize registry: {e}")))?;
-        std::fs::write(&path, pretty)?;
+        // M6.16 BUG M2: atomic write via tmp + rename. A crash mid-
+        // `std::fs::write` would corrupt plugins.json — next launch
+        // fails to deserialize, all installed plugins silently drop
+        // out of discovery. Same shape as McpAllowlist::save (M6.15).
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &pretty)?;
+        std::fs::rename(&tmp, &path)?;
         Ok(path)
     }
 
@@ -226,6 +232,22 @@ impl PluginRegistry {
         let idx = self.plugins.iter().position(|p| p.name == name)?;
         Some(self.plugins.remove(idx))
     }
+}
+
+/// Whether `name` is safe to use as a single filename component under
+/// the plugins directory. Allowed: ASCII alphanumeric + `.` `_` `-`,
+/// non-empty, NOT `.` or `..`. Rejects path separators (`/` `\`),
+/// control characters, leading dots beyond a single one (we allow
+/// names like `dot.config` but reject `.`, `..`, `.hidden` would be
+/// allowed since it has more after the dot — that's intentional, only
+/// the bare dot-aliases are problematic for path resolution).
+fn is_valid_plugin_name(name: &str) -> bool {
+    let n = name.trim();
+    if n.is_empty() || n == "." || n == ".." {
+        return false;
+    }
+    n.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
 }
 
 fn registry_path(user: bool) -> Result<PathBuf> {
@@ -306,6 +328,19 @@ pub async fn install(url: &str, user: bool) -> Result<Plugin> {
             "plugin manifest is missing a `name` field".into(),
         ));
     }
+    // M6.16 BUG M1: validate the name is a single safe path component
+    // before joining it onto dest_parent. `Path::join` doesn't normalize
+    // `..`, so an unchecked `"name": "../../etc/cron.d/x"` would
+    // resolve outside the plugins dir on rename. Bounded by FS perms
+    // in practice, but no reason to leave the trapdoor open.
+    if !is_valid_plugin_name(&manifest.name) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(Error::Config(format!(
+            "plugin manifest `name` '{}' is not a safe path component — \
+             only [A-Za-z0-9._-] allowed, no '.' / '..' / path separators",
+            manifest.name
+        )));
+    }
 
     // Move to final location. Refuse to overwrite an existing plugin —
     // remove first.
@@ -332,14 +367,43 @@ pub async fn install(url: &str, user: bool) -> Result<Plugin> {
     let plugin = Plugin {
         name: manifest.name.clone(),
         source: url.to_string(),
-        path: final_dir,
+        path: final_dir.clone(),
         version: manifest.version.clone(),
         enabled: true,
     };
 
-    let mut registry = PluginRegistry::load(user)?;
-    registry.upsert(plugin.clone());
-    registry.save(user)?;
+    // M6.16.1 BUG L4: rollback the rename if the registry save fails
+    // (FS full, permissions, JSON serialize error). Without rollback
+    // the user lands in a half-installed state — files on disk under
+    // the plugin's name, but registry doesn't know about them, so
+    // /plugin show / list / disable / remove all act like the plugin
+    // doesn't exist. Manual `rm -rf` is the only recovery.
+    //
+    // We defer the registry write to the very end so a failed load
+    // (corrupt plugins.json) also rolls the rename back.
+    let registry_result = (|| -> Result<()> {
+        let mut registry = PluginRegistry::load(user)?;
+        registry.upsert(plugin.clone());
+        registry.save(user)?;
+        Ok(())
+    })();
+    if let Err(e) = registry_result {
+        // Best-effort rollback: drop the just-installed dir so the
+        // user can retry. On rollback failure, surface BOTH the
+        // original error AND the orphaned path so they have a clear
+        // recovery action.
+        let rollback_failed = std::fs::remove_dir_all(&final_dir).err();
+        return Err(Error::Config(match rollback_failed {
+            None => format!(
+                "registry save failed ({e}); rolled back install (no files left on disk)"
+            ),
+            Some(rb) => format!(
+                "registry save failed ({e}); rollback ALSO failed ({rb}). \
+                 Plugin files orphaned at {} — run `rm -rf` to clean up before retrying",
+                final_dir.display()
+            ),
+        }));
+    }
 
     Ok(plugin)
 }
@@ -360,14 +424,22 @@ pub fn set_enabled(name: &str, user: bool, enabled: bool) -> Result<bool> {
 /// Look up an installed plugin by name across both scopes, project first
 /// (matches [`installed_plugins_all_scopes`]). Used by `/plugin show`.
 pub fn find_installed(name: &str) -> Option<Plugin> {
+    find_installed_with_scope(name).map(|(p, _)| p)
+}
+
+/// Same as [`find_installed`] but also returns the scope (`true` =
+/// user, `false` = project) the plugin was found under. Used by
+/// `/plugin show` to surface scope so the user knows which `--user`
+/// flag to pass to follow-up commands. M6.16.1 BUG L3.
+pub fn find_installed_with_scope(name: &str) -> Option<(Plugin, bool)> {
     if let Ok(reg) = PluginRegistry::load(false) {
         if let Some(p) = reg.plugins.into_iter().find(|p| p.name == name) {
-            return Some(p);
+            return Some((p, false));
         }
     }
     if let Ok(reg) = PluginRegistry::load(true) {
         if let Some(p) = reg.plugins.into_iter().find(|p| p.name == name) {
-            return Some(p);
+            return Some((p, true));
         }
     }
     None
@@ -386,6 +458,40 @@ pub fn remove(name: &str, user: bool) -> Result<bool> {
     }
     registry.save(user)?;
     Ok(true)
+}
+
+/// Garbage-collect zombie registry entries: those whose `path` no
+/// longer exists or whose `manifest()` can't be parsed (e.g. user
+/// manually `rm -rf`'d the plugin dir). Walks both scopes, returns
+/// the names of removed entries grouped by scope. Both registries
+/// are saved if anything was removed. M6.16.1 BUG L2.
+pub fn gc() -> Result<(Vec<String>, Vec<String>)> {
+    let mut removed_project = Vec::new();
+    let mut removed_user = Vec::new();
+    for (user, removed) in [(false, &mut removed_project), (true, &mut removed_user)] {
+        let Ok(mut registry) = PluginRegistry::load(user) else {
+            continue;
+        };
+        let before = registry.plugins.len();
+        registry.plugins.retain(|p| {
+            // Keep entries whose dir exists AND whose manifest parses.
+            // The manifest read is the more useful signal — a present
+            // dir without a valid plugin.json is also broken.
+            if !p.path.exists() {
+                removed.push(p.name.clone());
+                return false;
+            }
+            if read_manifest(&p.path).is_err() {
+                removed.push(p.name.clone());
+                return false;
+            }
+            true
+        });
+        if registry.plugins.len() != before {
+            registry.save(user)?;
+        }
+    }
+    Ok((removed_project, removed_user))
 }
 
 /// Collect every enabled plugin across both scopes, project first. Used
@@ -506,7 +612,7 @@ async fn fetch_into(url: &str, dest: &Path) -> Result<()> {
         let bytes = download_zip(url).await?;
         extract_zip(&bytes, dest)
     } else {
-        git_clone(url, dest)
+        git_clone(url, dest).await
     }
 }
 
@@ -517,8 +623,13 @@ fn is_zip_url(url: &str) -> bool {
 
 async fn download_zip(url: &str) -> Result<Vec<u8>> {
     const MAX_BYTES: u64 = 64 * 1024 * 1024;
+    // M6.16 BUG M4: 30 s end-to-end timeout. Mirrors the M6.14 fix
+    // that landed for skills::download_zip — same shape, never copy-
+    // pasted across. A hostile / slow server can no longer hang
+    // `/plugin install` indefinitely.
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(5))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| Error::Config(format!("http client: {e}")))?;
     let resp = client
@@ -588,7 +699,7 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> Result<()> {
     Ok(())
 }
 
-fn git_clone(url: &str, dest: &Path) -> Result<()> {
+async fn git_clone(url: &str, dest: &Path) -> Result<()> {
     // Support the marketplace-style `<url>#<branch>:<subpath>`
     // extension so a plugin can be installed out of a multi-plugin
     // monorepo (mirrors what skills::install_from_url already does).
@@ -615,10 +726,33 @@ fn git_clone(url: &str, dest: &Path) -> Result<()> {
     args.push(base_url.clone());
     args.push(stage_dir.to_string_lossy().into_owned());
 
-    let out = std::process::Command::new("git")
-        .args(&args)
-        .output()
-        .map_err(|e| Error::Config(format!("spawn git: {e}")))?;
+    // M6.16 BUG M3: 60 s timeout via tokio::process + tokio::time::
+    // timeout. Pre-fix this was a sync std::process::Command::output()
+    // that blocked indefinitely on a hung git server (TLS stall, DNS
+    // hang, hostile peer). 60 s gives a real clone room (the largest
+    // plugin repos take ~20–30 s on a fresh ARM macOS at depth 1).
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(&args).kill_on_drop(true);
+    let out = match tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        cmd.output(),
+    )
+    .await
+    {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            let _ = std::fs::remove_dir_all(&stage_dir);
+            return Err(Error::Config(format!("spawn git: {e}")));
+        }
+        Err(_) => {
+            // Tokio aborted the future; kill_on_drop on the Command
+            // takes care of the child when `cmd` drops.
+            let _ = std::fs::remove_dir_all(&stage_dir);
+            return Err(Error::Config(
+                "git clone timed out after 60s".into(),
+            ));
+        }
+    };
     if !out.status.success() {
         let _ = std::fs::remove_dir_all(&stage_dir);
         return Err(Error::Config(format!(
@@ -776,5 +910,151 @@ mod tests {
         assert!(is_zip_url("https://example.com/a.ZIP?t=1"));
         assert!(is_zip_url("https://example.com/a.zip#frag"));
         assert!(!is_zip_url("https://github.com/u/r.git"));
+    }
+
+    /// M6.16 BUG M1: `manifest.name` must be a single safe path
+    /// component before being joined onto the plugins dir. Pre-fix a
+    /// malicious plugin could escape the install root via `../`-laden
+    /// names. `Path::join` doesn't normalize `..`, so the rename in
+    /// install() would land outside the intended dir.
+    #[test]
+    fn rejects_unsafe_plugin_names() {
+        assert!(!is_valid_plugin_name(""));
+        assert!(!is_valid_plugin_name("."));
+        assert!(!is_valid_plugin_name(".."));
+        assert!(!is_valid_plugin_name("../foo"));
+        assert!(!is_valid_plugin_name("../../etc/cron.d/x"));
+        assert!(!is_valid_plugin_name("foo/bar"));
+        assert!(!is_valid_plugin_name(r"foo\bar"));
+        assert!(!is_valid_plugin_name("foo\0null"));
+        assert!(!is_valid_plugin_name("space inside"));
+        assert!(!is_valid_plugin_name("emoji-🦀"));
+    }
+
+    #[test]
+    fn accepts_typical_plugin_names() {
+        assert!(is_valid_plugin_name("foo"));
+        assert!(is_valid_plugin_name("foo-bar"));
+        assert!(is_valid_plugin_name("foo_bar"));
+        assert!(is_valid_plugin_name("foo.bar"));
+        assert!(is_valid_plugin_name("Foo123"));
+        assert!(is_valid_plugin_name(".hidden")); // leading dot is fine; only bare `.`/`..` rejected
+        assert!(is_valid_plugin_name("a")); // single char
+    }
+
+    /// M6.16 BUG M2: PluginRegistry::save now uses tmp + rename so a
+    /// crash mid-write can't leave a half-written plugins.json that
+    /// fails to deserialize on next launch (which would silently drop
+    /// every installed plugin from discovery).
+    ///
+    /// We can't directly trigger a crash, but we can verify the
+    /// expected on-disk layout: the save path exists, the .tmp file
+    /// does NOT (it was renamed away), and the contents round-trip.
+    /// Serialize tests that mutate process-global env vars (HOME) so
+    /// they don't race against parallel sibling tests. Shares the
+    /// crate-wide lock with kms / oauth tests for the same reason —
+    /// `set_var` / `set_current_dir` are process-wide effects.
+    struct UserScopeGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev_home: Option<String>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Drop for UserScopeGuard {
+        fn drop(&mut self) {
+            match &self.prev_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    fn scoped_user_home() -> UserScopeGuard {
+        let lock = crate::kms::test_env_lock();
+        let prev = std::env::var("HOME").ok();
+        let dir = tempdir().unwrap();
+        std::env::set_var("HOME", dir.path());
+        UserScopeGuard {
+            _lock: lock,
+            prev_home: prev,
+            _dir: dir,
+        }
+    }
+
+    /// M6.16.1 BUG L2: `gc()` removes registry entries whose plugin
+    /// directory is missing. Pinned via the user scope (HOME-based)
+    /// to avoid CWD races with parallel sibling tests.
+    #[test]
+    fn gc_removes_entries_with_missing_dir() {
+        let guard = scoped_user_home();
+        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+
+        // One real plugin (with a valid manifest), one zombie (path
+        // doesn't exist on disk).
+        let real_path = home.join("real-plugin");
+        write_manifest(&real_path, r#"{"name": "real"}"#);
+        let zombie_path = home.join("vanished-plugin"); // never created
+
+        let mut reg = PluginRegistry::default();
+        reg.upsert(Plugin {
+            name: "real".into(),
+            source: String::new(),
+            path: real_path.clone(),
+            version: "1".into(),
+            enabled: true,
+        });
+        reg.upsert(Plugin {
+            name: "zombie".into(),
+            source: String::new(),
+            path: zombie_path,
+            version: "1".into(),
+            enabled: true,
+        });
+        reg.save(true).unwrap();
+
+        let (proj, user) = gc().unwrap();
+        assert!(proj.is_empty(), "no project-scope changes expected");
+        assert_eq!(user, vec!["zombie".to_string()]);
+
+        // After gc: only "real" remains in user scope.
+        let reloaded = PluginRegistry::load(true).unwrap();
+        assert_eq!(reloaded.plugins.len(), 1);
+        assert_eq!(reloaded.plugins[0].name, "real");
+
+        drop(guard);
+    }
+
+    #[test]
+    fn registry_save_atomic_uses_tmp_then_rename() {
+        let guard = scoped_user_home();
+        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+
+        let mut reg = PluginRegistry::default();
+        reg.upsert(Plugin {
+            name: "atomic-test".into(),
+            source: "https://example.com/x.git".into(),
+            path: home.join("atomic-test"),
+            version: "1.0.0".into(),
+            enabled: true,
+        });
+        let saved_path = reg.save(true).expect("save");
+
+        // .tmp must NOT linger after a successful rename.
+        let tmp = saved_path.with_extension("json.tmp");
+        assert!(
+            !tmp.exists(),
+            "save left .tmp file behind: {}",
+            tmp.display()
+        );
+        // The real file must be there with valid JSON.
+        let body = std::fs::read_to_string(&saved_path).expect("read");
+        assert!(body.contains("\"atomic-test\""));
+
+        // Round-trip via load.
+        let reloaded = PluginRegistry::load(true).expect("reload");
+        assert_eq!(reloaded.plugins.len(), 1);
+        assert_eq!(reloaded.plugins[0].name, "atomic-test");
+
+        drop(guard);
     }
 }

@@ -26,11 +26,32 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use tokio::time::{timeout, Duration};
+
+/// Whether `THCLAWS_MCP_DEBUG=1` is set in the env. Cached on first
+/// read so per-POST logging doesn't pay an env-var lookup. Used by
+/// the `mcp_debug!` macro to gate routine HTTP-transport noise out
+/// of shipped binaries — M6.15 BUG 8.
+fn mcp_debug_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("THCLAWS_MCP_DEBUG").is_ok())
+}
+
+/// `eprintln!` that fires only when `THCLAWS_MCP_DEBUG=1`. Use for
+/// per-request routine logging (POST bodies, redirect chases, probe
+/// ping results). Real errors and one-shot setup notices stay on
+/// plain `eprintln!` so users see them by default.
+macro_rules! mcp_debug {
+    ($($arg:tt)*) => {
+        if crate::mcp::mcp_debug_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}
 
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -113,7 +134,14 @@ impl McpAllowlist {
             let _ = std::fs::create_dir_all(parent);
         }
         let json = serde_json::to_string_pretty(self).unwrap_or_default();
-        let _ = std::fs::write(&path, json);
+        // M6.15 BUG 5: atomic write via tmp + rename. A crash mid-write
+        // with `std::fs::write` would leave a half-written file that
+        // fails to deserialize, dropping the user's whole allowlist.
+        // Same pattern as marketplace::write_cache.
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, &json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 
     fn contains(&self, cmd: &str) -> bool {
@@ -279,6 +307,12 @@ pub struct McpClient {
     /// MCP-Apps widget rendering and widget→host tool calls — see
     /// dev-log/112.
     trusted: bool,
+    /// Set when the reader task observes EOF (or an error) on the
+    /// transport. New requests fast-fail with "transport closed"
+    /// instead of writing into a dead pipe and waiting 30 s for the
+    /// timeout to fire (M6.15 BUG 4). Shared `Arc` so the reader
+    /// task can flip the same instance the McpClient reads.
+    closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for McpClient {
@@ -316,6 +350,8 @@ impl McpClient {
     {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let pending_for_reader = pending.clone();
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let closed_for_reader = closed.clone();
 
         let reader_task = tokio::spawn(async move {
             let mut buf_reader = BufReader::new(reader);
@@ -336,6 +372,10 @@ impl McpClient {
                     Err(_) => break,
                 }
             }
+            // Mark closed BEFORE draining so any concurrent `request`
+            // call already past its closed-check still gets the
+            // drained "transport closed" error from its oneshot.
+            closed_for_reader.store(true, std::sync::atomic::Ordering::SeqCst);
             let pending: Vec<_> = pending_for_reader
                 .lock()
                 .unwrap()
@@ -355,6 +395,7 @@ impl McpClient {
             reader_task,
             _child: Mutex::new(None),
             trusted,
+            closed,
         })
     }
 
@@ -514,12 +555,14 @@ impl McpClient {
 
                 let current_token = token.lock().await.clone();
                 let current_session = session.lock().await.clone();
-                eprintln!(
+                // M6.15 BUG 8: gate behind THCLAWS_MCP_DEBUG and DROP
+                // the bearer-prefix leak. Logging the first 12 chars
+                // of an OAuth access token is small but non-zero
+                // exfil risk; presence boolean is enough for
+                // debugging which auth path a request took.
+                mcp_debug!(
                     "\x1b[2m[mcp-http] bridge POST: token={}, session={}, body_len={}\x1b[0m",
-                    current_token
-                        .as_ref()
-                        .map(|t| format!("{}…", &t[..t.len().min(12)]))
-                        .unwrap_or("None".into()),
+                    if current_token.is_some() { "present" } else { "none" },
                     current_session.as_deref().unwrap_or("None"),
                     trimmed.len(),
                 );
@@ -535,7 +578,7 @@ impl McpClient {
                     Ok(r) if r.status().as_u16() == 401 => {
                         let hdrs = format!("{:?}", r.headers());
                         let body_preview = r.text().await.unwrap_or_default();
-                        eprintln!(
+                        mcp_debug!(
                             "\x1b[36m[mcp-http] {} → 401\x1b[0m\n\x1b[2m  headers: {}\n  body: {}\x1b[0m",
                             name_for_task,
                             hdrs.chars().take(300).collect::<String>(),
@@ -600,7 +643,7 @@ impl McpClient {
                         {
                             let body = r.text().await.unwrap_or_default();
                             if body.contains("Session not found") {
-                                eprintln!(
+                                mcp_debug!(
                                     "\x1b[33m[mcp-http] session expired, retrying without session ID\x1b[0m"
                                 );
                                 *session.lock().await = None;
@@ -674,6 +717,15 @@ impl McpClient {
 
     /// Send a JSON-RPC request and wait for the matching response.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        // M6.15 BUG 4: fast-fail when the transport is already known
+        // dead (reader task hit EOF). Without this, callers wait 30 s
+        // for the timeout to fire before learning the connection is
+        // gone. Notifications still go through `notify` and may
+        // legitimately race with shutdown — gate only the
+        // request/response path here.
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Provider("mcp transport closed".into()));
+        }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
@@ -1072,7 +1124,7 @@ async fn write_response_lines(
             } else {
                 loc.to_string()
             };
-            eprintln!("\x1b[2m[mcp-http] following redirect → {fixed}\x1b[0m");
+            mcp_debug!("\x1b[2m[mcp-http] following redirect → {fixed}\x1b[0m");
             let mut req = client
                 .post(&fixed)
                 .header("content-type", "application/json")
@@ -1102,13 +1154,13 @@ async fn write_response_lines(
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("")
                         .to_string();
-                    eprintln!(
+                    mcp_debug!(
                         "\x1b[2m[mcp-http] redirected response: status={rstatus}, content-type={ct}\x1b[0m"
                     );
                     match redirected.text().await {
                         Ok(rbody) => {
                             if !rbody.is_empty() {
-                                eprintln!(
+                                mcp_debug!(
                                     "\x1b[2m[mcp-http] redirected body ({}B): {}\x1b[0m",
                                     rbody.len(),
                                     rbody.chars().take(300).collect::<String>()
@@ -1149,7 +1201,7 @@ async fn write_response_lines(
 
     if let Ok(body) = resp.text().await {
         if !body.is_empty() {
-            eprintln!(
+            mcp_debug!(
                 "\x1b[2m[mcp-http] body ({}B): {}\x1b[0m",
                 body.len(),
                 body.chars().take(300).collect::<String>()
@@ -1179,14 +1231,14 @@ async fn resolve_token_upfront(
         if crate::oauth::is_valid(entry) {
             candidate = Some(entry.access_token.clone());
         } else if entry.refresh_token.is_some() {
-            eprintln!("\x1b[36m[mcp-http] {server_name}: refreshing expired token…\x1b[0m");
+            mcp_debug!("\x1b[36m[mcp-http] {server_name}: refreshing expired token…\x1b[0m");
             match crate::oauth::refresh(client, entry).await {
                 Ok(new_entry) => {
                     candidate = Some(new_entry.access_token.clone());
                     store.set(mcp_url, new_entry);
                 }
                 Err(e) => {
-                    eprintln!("\x1b[33m[mcp-http] {server_name}: refresh failed ({e})\x1b[0m");
+                    mcp_debug!("\x1b[33m[mcp-http] {server_name}: refresh failed ({e})\x1b[0m");
                     store.remove(mcp_url);
                 }
             }
@@ -1208,7 +1260,7 @@ async fn resolve_token_upfront(
         req = req.header("authorization", format!("Bearer {t}"));
     }
 
-    eprintln!(
+    mcp_debug!(
         "\x1b[2m[mcp-http] {server_name}: probing with ping (token: {})\x1b[0m",
         if candidate.is_some() { "yes" } else { "none" }
     );
@@ -1216,14 +1268,16 @@ async fn resolve_token_upfront(
     match probe {
         Ok(r) if r.status().as_u16() == 401 => {
             if candidate.is_some() {
-                eprintln!("\x1b[33m[mcp-http] {server_name}: token rejected (401)\x1b[0m");
+                mcp_debug!("\x1b[33m[mcp-http] {server_name}: token rejected (401)\x1b[0m");
                 store.remove(mcp_url);
             }
+            // KEEP this on by default — a browser window is about to
+            // pop up and the user needs to know why.
             eprintln!("\x1b[36m[mcp-http] {server_name}: server requires OAuth — starting browser flow…\x1b[0m");
         }
         Ok(r) => {
             let status = r.status();
-            eprintln!("\x1b[2m[mcp-http] {server_name}: probe → {status} (auth OK)\x1b[0m");
+            mcp_debug!("\x1b[2m[mcp-http] {server_name}: probe → {status} (auth OK)\x1b[0m");
             return candidate;
         }
         Err(e) => {
@@ -1266,14 +1320,14 @@ async fn resolve_oauth_token(
             return Some(entry.access_token.clone());
         }
         if entry.refresh_token.is_some() {
-            eprintln!("\x1b[36m[mcp-http] {server_name}: refreshing expired token…\x1b[0m");
+            mcp_debug!("\x1b[36m[mcp-http] {server_name}: refreshing expired token…\x1b[0m");
             match crate::oauth::refresh(client, entry).await {
                 Ok(new_entry) => {
                     store.set(mcp_url, new_entry.clone());
                     return Some(new_entry.access_token);
                 }
                 Err(e) => {
-                    eprintln!("\x1b[33m[mcp-http] {server_name}: refresh failed ({e}), re-authorizing…\x1b[0m");
+                    mcp_debug!("\x1b[33m[mcp-http] {server_name}: refresh failed ({e}), re-authorizing…\x1b[0m");
                     store.remove(mcp_url);
                 }
             }
@@ -1798,6 +1852,46 @@ mod tests {
         assert!(
             msg.contains("transport closed") || msg.contains("channel dropped"),
             "got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_after_transport_close_fails_fast_without_30s_timeout() {
+        // M6.15 BUG 4: when the reader task observes EOF it sets the
+        // shared `closed` flag, and subsequent `request` calls
+        // short-circuit with "transport closed" instead of writing to
+        // a dead pipe and waiting REQUEST_TIMEOUT_SECS for the
+        // tokio::time::timeout to fire.
+        let (client, (s_read, s_write)) = paired_streams();
+
+        // Drop server stream halves immediately so the client reader
+        // sees EOF and flips the closed flag.
+        drop(s_read);
+        drop(s_write);
+
+        // Give the reader task a beat to process the EOF and flip the
+        // flag. 50 ms is way under the 30 s timeout we'd otherwise
+        // wait for, but more than enough for the tokio scheduler.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let started = std::time::Instant::now();
+        let err = client
+            .request("tools/list", json!({}))
+            .await
+            .expect_err("should fast-fail after close");
+        let elapsed = started.elapsed();
+
+        // Must NOT have waited for REQUEST_TIMEOUT_SECS — anything
+        // close to that would mean we wrote into the dead pipe and
+        // hit the timeout path instead of the closed-flag path.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "fast-fail expected, took {elapsed:?}",
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transport closed"),
+            "expected 'transport closed', got: {msg}",
         );
     }
 }

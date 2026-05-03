@@ -29,6 +29,119 @@ const COLOR_GREEN: &str = "\x1b[32m";
 const COLOR_CYAN: &str = "\x1b[36m";
 const COLOR_YELLOW: &str = "\x1b[33m";
 const COLOR_BOLD: &str = "\x1b[1m";
+const COLOR_RED: &str = "\x1b[31m";
+
+const REPL_PROMPT: &str = "❯ ";
+
+fn readline_config() -> rustyline::Config {
+    let builder = rustyline::Config::builder();
+    #[cfg(windows)]
+    let builder = builder.behavior(rustyline::Behavior::PreferTerm);
+    builder.build()
+}
+/// Render the current plan as a coloured ANSI block for the CLI
+/// terminal — analogue of the right-side `PlanSidebar` component the
+/// GUI chat tab gets. M5 CLI parity. Called from the agent loop after
+/// any plan-tool ToolCallResult so the user sees the live state inline:
+///
+/// ```text
+/// ─── plan: 4 steps · 2 done · current step 3 ───────
+///   ✓ 1. Scaffold project
+///   ✓ 2. Install dependencies
+///   ◉ 3. Run tests
+///     4. Deploy
+/// ─────────────────────────────────────────────────
+/// ```
+///
+/// Status glyphs: ✓ done · ◉ in_progress (yellow) · ✕ failed (red) ·
+/// space todo. Notes (failure reasons, "skipped by user") render
+/// dim-italic-ish below the step.
+fn format_plan_for_cli(plan: &crate::tools::plan_state::Plan) -> String {
+    use crate::tools::plan_state::StepStatus;
+    let total = plan.steps.len();
+    let done = plan
+        .steps
+        .iter()
+        .filter(|s| s.status == StepStatus::Done)
+        .count();
+    let current = plan
+        .steps
+        .iter()
+        .position(|s| s.status == StepStatus::InProgress);
+
+    let header = match current {
+        Some(idx) => format!(
+            "─── plan: {total} step{plural} · {done} done · current step {n} ───",
+            plural = if total == 1 { "" } else { "s" },
+            n = idx + 1,
+        ),
+        None if done == total => format!("─── plan: {total} steps · all complete ───"),
+        None => format!(
+            "─── plan: {total} step{plural} · {done} done ───",
+            plural = if total == 1 { "" } else { "s" },
+        ),
+    };
+
+    let mut out = String::new();
+    out.push_str(&format!("\n{COLOR_CYAN}{header}{COLOR_RESET}\n"));
+    for (i, step) in plan.steps.iter().enumerate() {
+        let (glyph, color) = match step.status {
+            StepStatus::Done => ("✓", COLOR_GREEN),
+            StepStatus::InProgress => ("◉", COLOR_YELLOW),
+            StepStatus::Failed => ("✕", COLOR_RED),
+            StepStatus::Todo => (" ", COLOR_DIM),
+        };
+        out.push_str(&format!(
+            "  {color}{glyph}{COLOR_RESET} {dim}{n}.{COLOR_RESET} {title}\n",
+            n = i + 1,
+            dim = if step.status == StepStatus::Todo {
+                COLOR_DIM
+            } else {
+                ""
+            },
+            title = step.title,
+        ));
+        if let Some(note) = &step.note {
+            if !note.trim().is_empty() {
+                let note_color = if step.status == StepStatus::Failed {
+                    COLOR_RED
+                } else {
+                    COLOR_DIM
+                };
+                out.push_str(&format!("       {note_color}({note}){COLOR_RESET}\n"));
+            }
+        }
+        // M6.3: render the cross-step output below the title for Done
+        // steps so the user can see what each step produced. Truncate
+        // long values for the CLI; the sidebar gets to show more.
+        if let Some(output) = &step.output {
+            if !output.trim().is_empty() {
+                let preview: String = output.chars().take(120).collect();
+                let suffix = if output.chars().count() > 120 {
+                    "…"
+                } else {
+                    ""
+                };
+                out.push_str(&format!(
+                    "       {COLOR_DIM}→ {preview}{suffix}{COLOR_RESET}\n",
+                ));
+            }
+        }
+    }
+    let footer = "─".repeat(header.chars().count());
+    out.push_str(&format!("{COLOR_CYAN}{footer}{COLOR_RESET}\n"));
+    out
+}
+
+/// Set of tool names that mutate plan state — used to gate the CLI
+/// plan-block render so we don't print a plan after every Read or
+/// Bash. Matches the registry names exactly.
+const PLAN_TOOL_NAMES: &[&str] = &[
+    "SubmitPlan",
+    "UpdatePlanStep",
+    "EnterPlanMode",
+    "ExitPlanMode",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommand {
@@ -100,6 +213,9 @@ pub enum SlashCommand {
     PluginShow {
         name: String,
     },
+    /// `/plugin gc` — remove registry entries whose plugin directory
+    /// is missing or whose manifest fails to parse. M6.16.1 BUG L2.
+    PluginGc,
     Tasks,
     Context,
     Version,
@@ -160,6 +276,11 @@ pub enum SlashCommand {
     /// `/plugin info <name>` — detail for a marketplace plugin entry.
     PluginInfo(String),
     Permissions(String),
+    /// `/plan` — toggle plan mode (M2). With no args, flips the
+    /// session into plan mode (mutating tools blocked, sidebar opens
+    /// when SubmitPlan fires). `/plan exit` / `/plan cancel` clears
+    /// any active plan and restores the prior permission mode.
+    Plan(String),
     Team,
     Usage,
     Kms,
@@ -264,6 +385,10 @@ fn parse_plugin_subcommand(cmd: &str, args: &str) -> SlashCommand {
             Some(name) => SlashCommand::PluginShow { name: name.to_string() },
             None => SlashCommand::Unknown("usage: /plugin show <name>".into()),
         },
+        // `/plugin gc` removes registry entries whose plugin
+        // directory is missing or whose manifest can't be parsed.
+        // No args. M6.16.1 BUG L2.
+        "gc" => SlashCommand::PluginGc,
         "marketplace" => {
             let refresh = rest.split_whitespace().any(|p| p == "--refresh");
             SlashCommand::PluginMarketplace { refresh }
@@ -284,7 +409,7 @@ fn parse_plugin_subcommand(cmd: &str, args: &str) -> SlashCommand {
             None => SlashCommand::Unknown("usage: /plugin info <name>".into()),
         },
         other => SlashCommand::Unknown(format!(
-            "unknown plugin subcommand: '{other}' (try: /plugin, /plugin install, /plugin remove, /plugin enable, /plugin disable, /plugin show, /plugin marketplace, /plugin search, /plugin info)"
+            "unknown plugin subcommand: '{other}' (try: /plugin, /plugin install, /plugin remove, /plugin enable, /plugin disable, /plugin show, /plugin gc, /plugin marketplace, /plugin search, /plugin info)"
         )),
     }
 }
@@ -604,6 +729,7 @@ pub fn parse_slash(input: &str) -> Option<SlashCommand> {
             }
         }
         "permissions" | "perms" => SlashCommand::Permissions(args.to_string()),
+        "plan" => SlashCommand::Plan(args.trim().to_string()),
         "team" => SlashCommand::Team,
         "usage" => SlashCommand::Usage,
         "memory" => {
@@ -794,6 +920,23 @@ fn resolve_skill_install_target(
     }
 }
 
+/// Sorted list of MCP server names a plugin contributes (or `None`
+/// if the plugin isn't found / has no MCP servers / manifest unread).
+/// Used by /plugin enable / disable / remove to render an emphasized
+/// hint listing the actual server names so the user knows what's
+/// coming after `/quit` + relaunch. M6.16.1 — replaces the older
+/// `plugin_has_mcp_servers` boolean.
+pub fn plugin_mcp_server_names(name: &str) -> Option<Vec<String>> {
+    let plugin = crate::plugins::find_installed(name)?;
+    let manifest = plugin.manifest().ok()?;
+    if manifest.mcp_servers.is_empty() {
+        return None;
+    }
+    let mut names: Vec<String> = manifest.mcp_servers.keys().cloned().collect();
+    names.sort();
+    Some(names)
+}
+
 /// `/plugin install <X>` mirror of `resolve_skill_install_target`. If
 /// `arg` looks like a URL, pass it through; otherwise look it up in
 /// the marketplace's `plugins` array by name and return that entry's
@@ -947,6 +1090,7 @@ pub fn built_in_commands() -> &'static [BuiltInCommand] {
         BuiltInCommand { name: "providers", description: "List all supported providers",              category: "Model", usage: "" },
         BuiltInCommand { name: "thinking",  description: "Set extended-thinking token budget",        category: "Model", usage: "BUDGET" },
         BuiltInCommand { name: "permissions", description: "Show or set the permission mode",         category: "Model", usage: "[auto|ask]" },
+        BuiltInCommand { name: "plan",        description: "Toggle plan mode (read-only + sidebar)", category: "Model", usage: "[enter|exit|status]" },
 
         // Context / memory / knowledge
         BuiltInCommand { name: "context",  description: "Show context-window usage breakdown",        category: "Context", usage: "" },
@@ -976,7 +1120,14 @@ pub fn built_in_commands() -> &'static [BuiltInCommand] {
 }
 
 pub fn render_help() -> &'static str {
-    "Slash commands:\n  \
+    "Shell escape:\n  \
+     !<command>        Run <command> in a subshell — sandbox-restricted to \n  \
+                       the project directory, non-interactive env vars set \n  \
+                       (CI=1, NPM_CONFIG_YES, TERM=dumb, etc.). Output is \n  \
+                       displayed but NOT pushed to agent history. Use this \n  \
+                       for quick checks between turns (`!git status`, \n  \
+                       `!cargo check`). The agent doesn't see the output. \n\n\
+     Slash commands:\n  \
      /help             Show this help\n  \
      /quit             Exit\n  \
      /clear            Clear conversation history\n  \
@@ -1575,6 +1726,12 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
     let ctx = ProjectContext::discover(&cwd)?;
     let memory_store = MemoryStore::default_path().map(MemoryStore::new);
 
+    // M6.11 (H1): daily auto-refresh of the marketplace catalog so
+    // CLI users get fresh entries without having to remember
+    // /skill marketplace --refresh. Same pattern the GUI worker uses;
+    // no-op when the cache is < 24h old.
+    crate::marketplace::spawn_daily_auto_refresh();
+
     // Append memory section to the project system prompt, if any memory exists.
     let system_fallback = if config.system_prompt.is_empty() {
         crate::prompts::defaults::SYSTEM
@@ -1732,8 +1889,19 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
              instructions using any args that appeared after the name.\n",
         );
         let skill_tool = crate::skills::SkillTool::new(skill_store);
-        skill_store_handle = Some(skill_tool.store_handle());
+        let store_handle = skill_tool.store_handle();
+        skill_store_handle = Some(store_handle.clone());
         tool_registry.register(Arc::new(skill_tool));
+        // dev-plan/06 P2: discovery tools register alongside Skill so
+        // the "names-only" / "discover-tool-only" strategies have
+        // something to point at. Always-registered for symmetry with
+        // the GUI worker.
+        tool_registry.register(Arc::new(crate::skills::SkillListTool::new_from_handle(
+            store_handle.clone(),
+        )));
+        tool_registry.register(Arc::new(crate::skills::SkillSearchTool::new_from_handle(
+            store_handle,
+        )));
     }
     let (mut mcp_clients, mut mcp_summary) =
         load_mcp_servers(&config.mcp_servers, &mut tool_registry).await;
@@ -2254,7 +2422,8 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
     let mut rl: rustyline::Editor<
         crate::cli_completer::SlashCompleter,
         rustyline::history::DefaultHistory,
-    > = rustyline::Editor::new().map_err(|e| Error::Agent(format!("readline init: {e}")))?;
+    > = rustyline::Editor::with_config(readline_config())
+        .map_err(|e| Error::Agent(format!("readline init: {e}")))?;
     rl.set_helper(Some(crate::cli_completer::SlashCompleter));
     let rl_mutex = std::sync::Arc::new(std::sync::Mutex::new(rl));
 
@@ -2392,7 +2561,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
         let rl_clone = rl_mutex.clone();
         let readline_task = tokio::task::spawn_blocking(move || {
             let mut rl = rl_clone.lock().unwrap();
-            match rl.readline(&format!("{COLOR_CYAN}❯ {COLOR_RESET}")) {
+            match rl.readline(REPL_PROMPT) {
                 Ok(line) => {
                     let trimmed = line.trim().to_string();
                     if !trimmed.is_empty() {
@@ -2424,13 +2593,32 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                 Some(msgs) = inbox_rx.recv() => {
                     process_team_messages!(msgs);
                     // Reprint prompt hint since our output pushed it up.
-                    print!("{COLOR_CYAN}❯ {COLOR_RESET}");
+                    print!("{COLOR_CYAN}{REPL_PROMPT}{COLOR_RESET}");
                     let _ = std::io::stdout().flush();
                 }
             }
         }
 
         if line.is_empty() {
+            continue;
+        }
+
+        // `!<cmd>` shell escape — user-initiated shell command, runs
+        // through BashTool (sandbox cwd, non-interactive env, etc.)
+        // and prints the output. Doesn't touch agent history. Mirrors
+        // the GUI handle_line path in shared_session.rs.
+        if let Some(cmd) = crate::shell_bang::parse_bang(&line) {
+            println!("{COLOR_DIM}[!] {cmd}{COLOR_RESET}");
+            match crate::shell_bang::run_bang_command(cmd).await {
+                Ok(output) => {
+                    if !output.is_empty() {
+                        println!("{output}");
+                    }
+                }
+                Err(e) => {
+                    println!("{COLOR_YELLOW}{e}{COLOR_RESET}");
+                }
+            }
             continue;
         }
 
@@ -3151,19 +3339,37 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                                     *store = refreshed;
                                 }
                             }
-                            // MCP servers / commands still need a restart
-                            // (the live tool registry doesn't track per-
-                            // plugin contributions). Be honest about it
-                            // when the manifest declares those.
+                            // Skills + commands are live (skill store
+                            // refreshed above; commands re-discover per
+                            // /-resolution call). MCP servers are the
+                            // one piece that still needs a restart —
+                            // the live tool registry doesn't track per-
+                            // plugin server lifecycle. Surface a
+                            // prominent, actionable message listing the
+                            // server names so the user knows exactly
+                            // what they're getting after `/quit` →
+                            // relaunch. M6.16.1 follow-up — pre-fix
+                            // mentioned "commands" too which was no
+                            // longer accurate.
                             if let Some(m) = manifest.as_ref() {
-                                if !m.commands.is_empty() || !m.mcp_servers.is_empty() {
+                                if !m.mcp_servers.is_empty() {
+                                    let names: Vec<&str> = m
+                                        .mcp_servers
+                                        .keys()
+                                        .map(String::as_str)
+                                        .collect();
                                     println!(
-                                        "{COLOR_YELLOW}restart {} to activate the plugin's commands / MCP servers (skills already callable in this session){COLOR_RESET}",
-                                        crate::branding::current().name
+                                        "{COLOR_YELLOW}⚠  restart {} to spawn {} new MCP server(s): {}{COLOR_RESET}",
+                                        crate::branding::current().name,
+                                        names.len(),
+                                        names.join(", ")
+                                    );
+                                    println!(
+                                        "{COLOR_DIM}   skills + commands already callable in this session.{COLOR_RESET}"
                                     );
                                 } else {
                                     println!(
-                                        "{COLOR_DIM}skills callable in this session — no restart needed{COLOR_RESET}"
+                                        "{COLOR_DIM}skills + commands callable in this session — no restart needed{COLOR_RESET}"
                                     );
                                 }
                             }
@@ -3175,9 +3381,30 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                 }
                 SlashCommand::PluginEnable { name, user } => {
                     match crate::plugins::set_enabled(&name, user, true) {
-                        Ok(true) => println!(
-                            "{COLOR_DIM}plugin '{name}' enabled (restart to pick up its contributions){COLOR_RESET}"
-                        ),
+                        Ok(true) => {
+                            // M6.16 BUG H1: refresh in-process skill store
+                            // so plugin-contributed skills become callable
+                            // immediately. MCP servers still need a
+                            // restart — surfaced explicitly with names.
+                            let refreshed = crate::skills::SkillStore::discover();
+                            skill_names = refreshed.skills.keys().cloned().collect();
+                            if let Some(handle) = &skill_store_handle {
+                                if let Ok(mut store) = handle.lock() {
+                                    *store = refreshed;
+                                }
+                            }
+                            println!(
+                                "{COLOR_DIM}plugin '{name}' enabled{COLOR_RESET}"
+                            );
+                            if let Some(names) = plugin_mcp_server_names(&name) {
+                                println!(
+                                    "{COLOR_YELLOW}⚠  restart {} to spawn {} MCP server(s): {}{COLOR_RESET}",
+                                    crate::branding::current().name,
+                                    names.len(),
+                                    names.join(", ")
+                                );
+                            }
+                        }
                         Ok(false) => println!(
                             "{COLOR_YELLOW}no plugin named '{name}' in that scope{COLOR_RESET}"
                         ),
@@ -3185,10 +3412,31 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     }
                 }
                 SlashCommand::PluginDisable { name, user } => {
+                    // Capture MCP names BEFORE disabling — symmetric
+                    // with PluginRemove, where the manifest is gone
+                    // after the call.
+                    let mcp_to_drop = plugin_mcp_server_names(&name);
                     match crate::plugins::set_enabled(&name, user, false) {
-                        Ok(true) => println!(
-                            "{COLOR_DIM}plugin '{name}' disabled (restart to drop its contributions){COLOR_RESET}"
-                        ),
+                        Ok(true) => {
+                            let refreshed = crate::skills::SkillStore::discover();
+                            skill_names = refreshed.skills.keys().cloned().collect();
+                            if let Some(handle) = &skill_store_handle {
+                                if let Ok(mut store) = handle.lock() {
+                                    *store = refreshed;
+                                }
+                            }
+                            println!(
+                                "{COLOR_DIM}plugin '{name}' disabled{COLOR_RESET}"
+                            );
+                            if let Some(names) = mcp_to_drop {
+                                println!(
+                                    "{COLOR_YELLOW}⚠  restart {} to drop {} MCP server(s) it contributed: {}{COLOR_RESET}",
+                                    crate::branding::current().name,
+                                    names.len(),
+                                    names.join(", ")
+                                );
+                            }
+                        }
                         Ok(false) => println!(
                             "{COLOR_YELLOW}no plugin named '{name}' in that scope{COLOR_RESET}"
                         ),
@@ -3196,14 +3444,19 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     }
                 }
                 SlashCommand::PluginShow { name } => {
-                    match crate::plugins::find_installed(&name) {
-                        Some(p) => {
+                    match crate::plugins::find_installed_with_scope(&name) {
+                        Some((p, is_user)) => {
                             let status = if p.enabled { "enabled" } else { "disabled" };
+                            // M6.16.1 BUG L3: include scope so the
+                            // user knows which `--user` flag to pass
+                            // to follow-up /plugin commands.
+                            let scope = if is_user { "user" } else { "project" };
                             println!(
-                                "{COLOR_DIM}  {} v{} ({}){COLOR_RESET}",
+                                "{COLOR_DIM}  {} v{} ({}, {}){COLOR_RESET}",
                                 p.name,
                                 if p.version.is_empty() { "-" } else { &p.version },
-                                status
+                                status,
+                                scope
                             );
                             println!(
                                 "{COLOR_DIM}  path: {}{COLOR_RESET}",
@@ -3268,12 +3521,66 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         ),
                     }
                 }
+                SlashCommand::PluginGc => match crate::plugins::gc() {
+                    Ok((proj, user)) => {
+                        if proj.is_empty() && user.is_empty() {
+                            println!(
+                                "{COLOR_DIM}no zombie entries — registry is clean{COLOR_RESET}"
+                            );
+                        } else {
+                            println!(
+                                "{COLOR_DIM}removed zombie entries:{COLOR_RESET}"
+                            );
+                            for n in &proj {
+                                println!("{COLOR_DIM}  - {n} (project){COLOR_RESET}");
+                            }
+                            for n in &user {
+                                println!("{COLOR_DIM}  - {n} (user){COLOR_RESET}");
+                            }
+                            // Refresh in case any zombie was contributing
+                            // skills cached in this session.
+                            let refreshed = crate::skills::SkillStore::discover();
+                            skill_names = refreshed.skills.keys().cloned().collect();
+                            if let Some(handle) = &skill_store_handle {
+                                if let Ok(mut store) = handle.lock() {
+                                    *store = refreshed;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => println!("{COLOR_YELLOW}gc failed: {e}{COLOR_RESET}"),
+                },
                 SlashCommand::PluginRemove { name, user } => {
+                    // Capture MCP names BEFORE removal — once remove()
+                    // succeeds the manifest is gone and find_installed
+                    // returns None.
+                    let mcp_to_drop = plugin_mcp_server_names(&name);
                     match crate::plugins::remove(&name, user) {
                         Ok(true) => {
+                            // M6.16 BUG H1: refresh skill store so the
+                            // removed plugin's skills stop being callable
+                            // immediately. Without this the model could
+                            // still invoke a removed skill and lazy-read
+                            // the now-missing SKILL.md → empty body
+                            // cached forever.
+                            let refreshed = crate::skills::SkillStore::discover();
+                            skill_names = refreshed.skills.keys().cloned().collect();
+                            if let Some(handle) = &skill_store_handle {
+                                if let Ok(mut store) = handle.lock() {
+                                    *store = refreshed;
+                                }
+                            }
                             println!(
-                                "{COLOR_DIM}plugin '{name}' removed (restart to drop its contributions){COLOR_RESET}"
+                                "{COLOR_DIM}plugin '{name}' removed{COLOR_RESET}"
                             );
+                            if let Some(names) = mcp_to_drop {
+                                println!(
+                                    "{COLOR_YELLOW}⚠  restart {} to fully drop {} MCP server(s) it was running: {}{COLOR_RESET}",
+                                    crate::branding::current().name,
+                                    names.len(),
+                                    names.join(", ")
+                                );
+                            }
                         }
                         Ok(false) => {
                             println!(
@@ -3534,24 +3841,72 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                 }
                 SlashCommand::Permissions(mode) => {
                     if mode.is_empty() {
+                        let cur = crate::permissions::current_mode();
+                        let label = match cur {
+                            PermissionMode::Auto => "auto",
+                            PermissionMode::Ask => "ask",
+                            PermissionMode::Plan => "plan",
+                        };
                         println!(
-                            "{COLOR_DIM}permissions: {} (auto = never prompt, ask = prompt on mutating tools){COLOR_RESET}",
-                            if agent.permission_mode == PermissionMode::Auto { "auto" } else { "ask" }
+                            "{COLOR_DIM}permissions: {label} (auto = never prompt, ask = prompt on mutating tools, plan = read-only exploration){COLOR_RESET}"
                         );
                     } else {
                         match mode.as_str() {
                             "auto" | "yolo" => {
                                 agent.permission_mode = PermissionMode::Auto;
+                                crate::permissions::set_current_mode_and_broadcast(PermissionMode::Auto);
                                 println!("{COLOR_DIM}permissions → auto (no prompts){COLOR_RESET}");
                             }
                             "ask" | "default" => {
                                 agent.permission_mode = PermissionMode::Ask;
+                                crate::permissions::set_current_mode_and_broadcast(PermissionMode::Ask);
                                 println!("{COLOR_DIM}permissions → ask{COLOR_RESET}");
                             }
                             _ => {
                                 println!("{COLOR_YELLOW}usage: /permissions auto|ask{COLOR_RESET}");
                             }
                         }
+                    }
+                }
+                SlashCommand::Plan(arg) => {
+                    let arg = arg.trim().to_lowercase();
+                    let cur = crate::permissions::current_mode();
+                    match arg.as_str() {
+                        "" | "on" | "enter" | "start" => {
+                            if matches!(cur, PermissionMode::Plan) {
+                                println!("{COLOR_DIM}Already in plan mode.{COLOR_RESET}");
+                            } else {
+                                crate::permissions::stash_pre_plan_mode(cur);
+                                crate::permissions::set_current_mode_and_broadcast(PermissionMode::Plan);
+                                println!(
+                                    "{COLOR_DIM}plan mode active — mutating tools blocked. Ask the model to call SubmitPlan.{COLOR_RESET}"
+                                );
+                            }
+                        }
+                        "exit" | "off" | "cancel" | "stop" | "abort" => {
+                            let restored = crate::permissions::take_pre_plan_mode()
+                                .unwrap_or(PermissionMode::Ask);
+                            crate::permissions::set_current_mode_and_broadcast(restored);
+                            crate::tools::plan_state::clear();
+                            println!(
+                                "{COLOR_DIM}plan mode cleared — restored to {restored:?}.{COLOR_RESET}"
+                            );
+                        }
+                        "status" | "show" => {
+                            let plan = crate::tools::plan_state::get();
+                            let summary = match plan {
+                                Some(p) => format!(
+                                    " — active plan {} ({} step(s))",
+                                    p.id,
+                                    p.steps.len()
+                                ),
+                                None => String::new(),
+                            };
+                            println!(
+                                "{COLOR_DIM}permission mode: {cur:?}{summary}{COLOR_RESET}"
+                            );
+                        }
+                        _ => println!("{COLOR_YELLOW}usage: /plan [enter | exit | status]{COLOR_RESET}"),
                     }
                 }
                 SlashCommand::Sso { sub } => {
@@ -3745,10 +4100,14 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         }
                     }
                     let mp = crate::marketplace::load();
+                    let age_suffix = match crate::marketplace::cache_age_label() {
+                        Some(label) => format!(", {label}"),
+                        None => String::new(),
+                    };
                     println!(
-                        "{COLOR_DIM}marketplace ({}, {} skill(s)){COLOR_RESET}",
+                        "{COLOR_DIM}marketplace ({}, {} skill(s){age_suffix}){COLOR_RESET}",
                         mp.source,
-                        mp.skills.len()
+                        mp.skills.len(),
                     );
                     // Group by category so the listing reads like a catalog.
                     let mut by_cat: std::collections::BTreeMap<String, Vec<&crate::marketplace::MarketplaceSkill>> =
@@ -3764,12 +4123,9 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     for (cat, skills) in by_cat {
                         println!("{COLOR_DIM}── {cat} ──{COLOR_RESET}");
                         for s in skills {
-                            let tier_tag = match s.license_tier.as_str() {
-                                "linked-only" => " [linked-only]",
-                                _ => "",
-                            };
+                            let tags = crate::marketplace::entry_tags(s);
                             println!(
-                                "{COLOR_DIM}  {:<24}{tier_tag} — {}{COLOR_RESET}",
+                                "{COLOR_DIM}  {:<24}{tags} — {}{COLOR_RESET}",
                                 s.name,
                                 s.short_line()
                             );
@@ -3865,10 +4221,14 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         }
                     }
                     let mp = crate::marketplace::load();
+                    let age_suffix = match crate::marketplace::cache_age_label() {
+                        Some(label) => format!(", {label}"),
+                        None => String::new(),
+                    };
                     println!(
-                        "{COLOR_DIM}MCP marketplace ({}, {} server(s)){COLOR_RESET}",
+                        "{COLOR_DIM}MCP marketplace ({}, {} server(s){age_suffix}){COLOR_RESET}",
                         mp.source,
-                        mp.mcp_servers.len()
+                        mp.mcp_servers.len(),
                     );
                     let mut by_cat: std::collections::BTreeMap<String, Vec<&crate::marketplace::MarketplaceMcpServer>> =
                         std::collections::BTreeMap::new();
@@ -3880,9 +4240,11 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         println!("{COLOR_DIM}── {cat} ──{COLOR_RESET}");
                         for s in servers {
                             let tport = if s.transport == "sse" { " [hosted]" } else { "" };
+                            let tags = crate::marketplace::entry_tags(s);
                             println!(
-                                "{COLOR_DIM}  {:<24}{tport} — {}{COLOR_RESET}",
-                                s.name, s.short_line()
+                                "{COLOR_DIM}  {:<24}{tport}{tags} — {}{COLOR_RESET}",
+                                s.name,
+                                s.short_line()
                             );
                         }
                     }
@@ -3968,10 +4330,14 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         }
                     }
                     let mp = crate::marketplace::load();
+                    let age_suffix = match crate::marketplace::cache_age_label() {
+                        Some(label) => format!(", {label}"),
+                        None => String::new(),
+                    };
                     println!(
-                        "{COLOR_DIM}plugin marketplace ({}, {} plugin(s)){COLOR_RESET}",
+                        "{COLOR_DIM}plugin marketplace ({}, {} plugin(s){age_suffix}){COLOR_RESET}",
                         mp.source,
-                        mp.plugins.len()
+                        mp.plugins.len(),
                     );
                     let mut by_cat: std::collections::BTreeMap<String, Vec<&crate::marketplace::MarketplacePlugin>> =
                         std::collections::BTreeMap::new();
@@ -3982,9 +4348,11 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     for (cat, plugins) in by_cat {
                         println!("{COLOR_DIM}── {cat} ──{COLOR_RESET}");
                         for p in plugins {
+                            let tags = crate::marketplace::entry_tags(p);
                             println!(
-                                "{COLOR_DIM}  {:<24} — {}{COLOR_RESET}",
-                                p.name, p.short_line()
+                                "{COLOR_DIM}  {:<24}{tags} — {}{COLOR_RESET}",
+                                p.name,
+                                p.short_line()
                             );
                         }
                     }
@@ -4236,7 +4604,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
 
         // Run a turn and stream the output live.
         // Ctrl-C during streaming cancels the turn cleanly.
-        lead_log!("\n{COLOR_CYAN}❯ {line}{COLOR_RESET}\n{COLOR_GREEN}");
+        lead_log!("\n{COLOR_CYAN}{REPL_PROMPT}{line}{COLOR_RESET}\n{COLOR_GREEN}");
         print!("{COLOR_GREEN}");
         let _ = std::io::stdout().flush();
         let turn_start = std::time::Instant::now();
@@ -4301,7 +4669,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     lead_log!("{COLOR_RESET}\n{COLOR_DIM}[tool: {name}{detail}]{COLOR_RESET}");
                     let _ = std::io::stdout().flush();
                 }
-                Ok(AgentEvent::ToolCallResult { output, .. }) => {
+                Ok(AgentEvent::ToolCallResult { name, output, .. }) => {
                     match output {
                         Ok(_) => {
                             print!(" {COLOR_DIM}✓{COLOR_RESET}");
@@ -4310,6 +4678,19 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         Err(ref e) => {
                             print!(" {COLOR_YELLOW}✗ {e}{COLOR_RESET}");
                             lead_log!(" {COLOR_YELLOW}✗ {e}{COLOR_RESET}\n{COLOR_GREEN}");
+                        }
+                    }
+                    // CLI parity for plan-mode (M5). When a plan tool
+                    // mutates state, render the current plan as a
+                    // coloured ANSI block — analogue of the GUI
+                    // sidebar's live update. Only fires for the four
+                    // plan tools so we don't print a plan block
+                    // after every Read / Bash / Edit.
+                    if PLAN_TOOL_NAMES.contains(&name.as_str()) {
+                        if let Some(plan) = crate::tools::plan_state::get() {
+                            let block = format_plan_for_cli(&plan);
+                            print!("{block}");
+                            lead_log!("{block}");
                         }
                     }
                     print!("{COLOR_RESET}\n{COLOR_GREEN}");
@@ -4389,6 +4770,17 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readline_config_matches_platform() {
+        #[cfg(windows)]
+        assert_eq!(
+            readline_config().behavior(),
+            rustyline::Behavior::PreferTerm
+        );
+        #[cfg(not(windows))]
+        assert_eq!(readline_config().behavior(), rustyline::Behavior::Stdio);
+    }
 
     #[test]
     fn parse_slash_returns_none_for_plain_text() {
@@ -4840,6 +5232,8 @@ mod tests {
                 name: "code-review".into()
             })
         );
+        // M6.16.1 BUG L2: /plugin gc parses with no args.
+        assert_eq!(parse_slash("/plugin gc"), Some(SlashCommand::PluginGc));
     }
 
     #[test]

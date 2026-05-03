@@ -668,12 +668,40 @@ async fn wait_for_callback(
             })?
             .map_err(|e| Error::Provider(format!("oauth accept: {e}")))?;
 
-    let mut buf = vec![0u8; 4096];
-    let n = stream
-        .read(&mut buf)
+    // M6.15 BUG 6: accumulate until we've read at least the full
+    // request line (terminated by `\r\n`). A single `stream.read()`
+    // could return a fragmented prefix on a busy host or with strict
+    // TCP_NODELAY tuning — rare on localhost but not guaranteed —
+    // and the URL with `?code=...&state=...` would be lost.
+    //
+    // 8 KiB cap protects against a hostile peer streaming forever.
+    // Per-read timeout (5 s) protects against a peer that connects
+    // and stalls without ever sending the request line.
+    let mut accumulated: Vec<u8> = Vec::with_capacity(2048);
+    let mut chunk = vec![0u8; 2048];
+    loop {
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read(&mut chunk),
+        )
         .await
+        .map_err(|_| Error::Provider("oauth: timed out reading callback request".into()))?
         .map_err(|e| Error::Provider(format!("oauth read: {e}")))?;
-    let request = String::from_utf8_lossy(&buf[..n]);
+        if n == 0 {
+            break;
+        }
+        accumulated.extend_from_slice(&chunk[..n]);
+        // We only need the request line + (optionally) headers; the
+        // body is empty for a GET. Stop as soon as we see the
+        // request-line terminator.
+        if accumulated.windows(2).any(|w| w == b"\r\n") {
+            break;
+        }
+        if accumulated.len() >= 8192 {
+            break;
+        }
+    }
+    let request = String::from_utf8_lossy(&accumulated);
 
     // Parse the GET /callback?code=...&state=... line.
     let first_line = request.lines().next().unwrap_or("");
@@ -875,5 +903,49 @@ mod tests {
             .is_none());
         // But the raw `get` still returns it so we can garbage-collect.
         assert!(store.get("https://mcp.example").is_some());
+    }
+
+    /// M6.15 BUG 6: drive `wait_for_callback` against a fragmented
+    /// browser-style request — first packet has only the `GET` verb,
+    /// the `?code=…&state=…` query lands in a follow-up write. The
+    /// pre-fix single `read()` would parse just the verb and bail
+    /// with "missing code" because the URL hadn't arrived yet.
+    #[tokio::test]
+    async fn wait_for_callback_handles_fragmented_request() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0u16))
+            .await
+            .expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let expected = "abc123";
+
+        // Client task — open the connection, write the request in two
+        // chunks with a brief pause between them. Mirrors a real
+        // browser sending a small GET split across TCP segments.
+        let client_task = tokio::spawn(async move {
+            let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            // First fragment: just up to the path, no query string.
+            s.write_all(b"GET /callback").await.unwrap();
+            s.flush().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            // Second fragment: query + the rest of the request line +
+            // headers terminator.
+            s.write_all(b"?code=THE_CODE&state=abc123 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .await
+                .unwrap();
+            s.flush().await.unwrap();
+            // Read + discard the 200 OK response.
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut s, &mut buf).await;
+        });
+
+        let code = wait_for_callback(listener, expected)
+            .await
+            .expect("should accumulate fragmented request");
+        client_task.await.unwrap();
+
+        assert_eq!(code, "THE_CODE");
     }
 }

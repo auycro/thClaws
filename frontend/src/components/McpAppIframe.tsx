@@ -423,10 +423,13 @@ export function McpAppIframe({
           case "ui/message": {
             // Widget injecting a chat message (app.sendMessage).
             // Phase 1: extract text from content blocks and route
-            // through the same `chat_user_message` IPC the chat
-            // composer uses. Multi-block / image content blocks are
-            // flattened to text — image attachment via this path
-            // can be added later if a widget actually needs it.
+            // through the same `shell_input` IPC the chat composer
+            // uses (M6.15 BUG 1: was `chat_user_message`, which is
+            // an OUTBOUND event type from the backend with no
+            // matching IPC handler — the message silently dropped).
+            // Multi-block / image content blocks are flattened to
+            // text — image attachment via this path can be added
+            // later if a widget actually needs it.
             const params = msg.params as
               | { role?: string; content?: Array<{ type?: string; text?: string }> }
               | undefined;
@@ -436,8 +439,12 @@ export function McpAppIframe({
               .map((b) => b?.text ?? "")
               .join("");
             if (text.trim()) {
-              send({ type: "chat_user_message", text });
-              respond(id, { isError: false });
+              send({ type: "shell_input", text });
+              // M6.15 BUG 3: include `content: []` so the response
+              // is a valid CallToolResult. The MCP-Apps SDK's Zod
+              // validator on the widget side rejects `{isError}`
+              // alone and throws inside app.sendMessage's promise.
+              respond(id, { content: [], isError: false });
             } else {
               respond(id, {
                 isError: true,
