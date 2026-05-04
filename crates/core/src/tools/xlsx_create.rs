@@ -157,13 +157,30 @@ fn value_to_cell(v: &Value) -> Cell {
 
 /// Per-cell type inference for CSV strings. Try number first, then
 /// boolean (case-insensitive), else fall through to text.
+///
+/// M6.23 BUG XT1: only coerce to Number when the f64 round-trip is
+/// byte-identical to the input. Pre-fix `parse::<f64>().is_ok()` was
+/// the sole gate, which silently corrupted:
+///   - Leading-zero IDs ("00123" → 123, lost zeros)
+///   - Phone-like strings ("+15551234567" → 15551234567, lost +)
+///   - Trailing-zero decimals ("3.14000" → 3.14, lost precision shown)
+///   - Scientific notation ("1e10" → 10000000000, lost notation)
+/// The byte-identical check catches all these by comparing the f64's
+/// canonical Display form against the trimmed input. Side effect:
+/// "5.0" stays as Text (round-trips as "5"), which is intentional —
+/// users who want "5.0" to render numeric should use the JSON
+/// 2D-array path with `5.0` as a typed value.
 fn string_to_cell(s: &str) -> Cell {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return Cell::Empty;
     }
     if let Ok(n) = trimmed.parse::<f64>() {
-        return Cell::Number(n);
+        // Byte-identical round-trip check
+        if format!("{n}") == trimmed {
+            return Cell::Number(n);
+        }
+        // Preserve original string representation
     }
     match trimmed.to_ascii_lowercase().as_str() {
         "true" => Cell::Bool(true),
@@ -293,5 +310,40 @@ mod tests {
         assert!(matches!(string_to_cell("True"), Cell::Bool(true)));
         assert!(matches!(string_to_cell("false"), Cell::Bool(false)));
         assert!(matches!(string_to_cell(""), Cell::Empty));
+    }
+
+    /// M6.23 BUG XT1: byte-identical round-trip for number coercion.
+    /// Pre-fix, any string that parsed as f64 became a Number — losing
+    /// leading zeros / + signs / scientific notation / trailing zeros.
+    /// New behavior: keep as Text unless the f64 round-trips identically.
+    #[test]
+    fn cell_inference_preserves_lossy_strings_as_text() {
+        // Leading-zero IDs — must NOT be coerced (would lose leading zeros)
+        assert!(matches!(string_to_cell("00123"), Cell::Text(_)));
+        assert!(matches!(string_to_cell("007"), Cell::Text(_)));
+
+        // Phone-like with leading + — must NOT be coerced
+        assert!(matches!(string_to_cell("+15551234567"), Cell::Text(_)));
+
+        // Scientific notation — Display formats as plain decimal
+        assert!(matches!(string_to_cell("1e10"), Cell::Text(_)));
+        assert!(matches!(string_to_cell("1.5e3"), Cell::Text(_)));
+
+        // Trailing zeros after decimal — Display strips them
+        assert!(matches!(string_to_cell("3.14000"), Cell::Text(_)));
+        // Note: "5.0" round-trips as "5" so it's now Text. Documented
+        // regression — JSON 2D-array path with `5.0` typed value
+        // preserves the float intent.
+        assert!(matches!(string_to_cell("5.0"), Cell::Text(_)));
+
+        // Zero-prefix decimal IS round-trip safe
+        assert!(matches!(string_to_cell("0.5"), Cell::Number(_)));
+        // Negative integers round-trip
+        assert!(matches!(string_to_cell("-42"), Cell::Number(_)));
+        // Small decimals round-trip
+        assert!(matches!(string_to_cell("3.14"), Cell::Number(_)));
+        // Plain integers still work
+        assert!(matches!(string_to_cell("42"), Cell::Number(_)));
+        assert!(matches!(string_to_cell("0"), Cell::Number(_)));
     }
 }

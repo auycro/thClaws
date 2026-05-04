@@ -70,10 +70,23 @@ enum BlockState {
 /// gate the lookahead-buffer hack in `assemble`. Be conservative: only the
 /// specific families that need it. Other families (qwen2.5-coder, qwen-vl,
 /// generic *r1 finetunes) must NOT match or every turn pays a 1KB delay.
+///
+/// M6.21 BUG M1: vision/multimodal Qwen3 variants (`qwen3-vl-plus`,
+/// `qwen3-omni`, etc.) DO NOT emit `<think>...</think>` blocks. Pre-fix
+/// the broad `contains("qwen3")` match pre-seeded `ThinkState::in_block`
+/// for them too — when those models then emitted plain text without
+/// `</think>`, every byte got routed to `Thinking` events and the user
+/// saw an empty chat. Exclude `-vl`, `vision`, `-omni` substrings.
 fn is_implicit_thinking_model(model: &str) -> bool {
     let m = model.to_lowercase();
     // Qwen3 thinking variants. Plain "qwen" / "qwen2" must not match.
-    if m.contains("qwen3") || m.contains("qwq") {
+    // Vision / multimodal variants (qwen3-vl, qwen3-omni) also don't
+    // emit `<think>` blocks — exclude them.
+    if (m.contains("qwen3") || m.contains("qwq"))
+        && !m.contains("-vl")
+        && !m.contains("vision")
+        && !m.contains("-omni")
+    {
         return true;
     }
     // DeepSeek R1 family (and OpenRouter prefix form).
@@ -361,6 +374,40 @@ mod tests {
         assert_eq!(r.tool_uses.len(), 0);
         assert_eq!(r.stop_reason.as_deref(), Some("end_turn"));
         assert_eq!(r.usage.unwrap().output_tokens, 2);
+    }
+
+    /// M6.21 BUG M1: vision/multimodal Qwen3 variants don't emit
+    /// `<think>...</think>` blocks. Pre-fix the broad `contains("qwen3")`
+    /// match pre-seeded `ThinkState::in_block` for them too, swallowing
+    /// every TextDelta as Thinking. Verify `is_implicit_thinking_model`
+    /// rejects the vision/omni siblings.
+    #[test]
+    fn implicit_thinking_excludes_vision_and_omni_qwen3_variants() {
+        // Should match (real thinking models)
+        assert!(is_implicit_thinking_model("qwen3"));
+        assert!(is_implicit_thinking_model("qwen3-235b"));
+        assert!(is_implicit_thinking_model("Qwen3-Thinking-30B"));
+        assert!(is_implicit_thinking_model("qwq-32b-preview"));
+        assert!(is_implicit_thinking_model("deepseek-r1"));
+        assert!(is_implicit_thinking_model(
+            "openrouter/deepseek/deepseek-r1"
+        ));
+
+        // Must NOT match (vision/multimodal — emit plain text without
+        // </think> close tags; pre-fix this would have hung the user
+        // with an empty chat bubble).
+        assert!(!is_implicit_thinking_model("qwen3-vl"));
+        assert!(!is_implicit_thinking_model("qwen3-vl-plus"));
+        assert!(!is_implicit_thinking_model("Qwen3-VL-72B-Instruct"));
+        assert!(!is_implicit_thinking_model("qwen3-omni"));
+        assert!(!is_implicit_thinking_model("qwen3-vision"));
+        assert!(!is_implicit_thinking_model("qwq-vision-preview"));
+
+        // Must NOT match (other model families that happen to share substrings)
+        assert!(!is_implicit_thinking_model("qwen2.5-coder"));
+        assert!(!is_implicit_thinking_model("qwen-vl-7b"));
+        assert!(!is_implicit_thinking_model("claude-sonnet-4-5"));
+        assert!(!is_implicit_thinking_model("gpt-4o"));
     }
 
     #[tokio::test]

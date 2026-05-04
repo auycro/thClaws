@@ -401,6 +401,32 @@ impl ProviderKind {
 
 pub use assemble::{assemble, collect_turn, AssembledEvent, TurnResult};
 
+/// Find the first occurrence of `needle` in `haystack` (byte-slice equivalent
+/// of `str::find`). Used by every streaming provider to locate event
+/// boundaries (`b"\n\n"` for SSE, `b"\n"` for NDJSON, `b"\r\n\r\n"` for
+/// Gemini's CRLF SSE) on a `Vec<u8>` buffer rather than a `String`.
+///
+/// M6.21 BUG H1: pre-fix every provider buffered chunks as
+/// `String::from_utf8_lossy(&chunk)`. When TCP delivered a chunk that
+/// ended mid-multi-byte-UTF-8-char (any 2-3 byte char split at the packet
+/// boundary), `from_utf8_lossy` inserted U+FFFD for the trailing partial
+/// byte, AND for the next chunk's leading continuation byte — corrupting
+/// the original character into two replacement chars. Affected every
+/// non-ASCII response (Thai, Chinese, Japanese, emoji, accented Latin)
+/// when the response was large enough to span TCP packets.
+///
+/// Fix: buffer raw bytes, find the event boundary on bytes (the boundary
+/// markers themselves are ASCII-safe), then decode only the complete
+/// event before parsing. Complete SSE/NDJSON events are valid UTF-8 by
+/// construction (the JSON inside is well-formed UTF-8), so the decode is
+/// always safe at the boundary.
+pub(crate) fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 /// Scrub an API key from an error response body before surfacing it.
 ///
 /// Some LLM providers echo the offending `Authorization` header (or the
@@ -579,6 +605,79 @@ pub trait Provider: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M6.21 BUG H1: `find_bytes` must locate `\n\n` (and other
+    /// boundaries) on raw byte slices, allowing providers to buffer
+    /// chunks as `Vec<u8>` rather than `String::from_utf8_lossy(&chunk)`
+    /// per-chunk (which corrupts multi-byte UTF-8 chars at TCP packet
+    /// boundaries). The fix's correctness hinges on this helper
+    /// returning the same byte index `str::find` would for the same
+    /// content.
+    #[test]
+    fn find_bytes_locates_sse_and_ndjson_boundaries() {
+        // Empty needle → None
+        assert_eq!(find_bytes(b"hello", b""), None);
+        // Needle larger than haystack → None
+        assert_eq!(find_bytes(b"hi", b"hello"), None);
+        // Needle absent → None
+        assert_eq!(find_bytes(b"hello world", b"\n\n"), None);
+        // Standard SSE boundary
+        assert_eq!(find_bytes(b"data: {}\n\nmore", b"\n\n"), Some(8));
+        // CRLF SSE boundary (Gemini)
+        assert_eq!(find_bytes(b"data: {}\r\n\r\nmore", b"\r\n\r\n"), Some(8));
+        // NDJSON boundary
+        assert_eq!(find_bytes(b"{\"a\":1}\n{\"b\":2}", b"\n"), Some(7));
+        // First occurrence wins
+        assert_eq!(find_bytes(b"a\n\nb\n\nc", b"\n\n"), Some(1));
+    }
+
+    /// M6.21 BUG H1: regression test for the actual UTF-8 corruption
+    /// scenario. A multi-byte UTF-8 char split across two byte chunks
+    /// must round-trip cleanly when reassembled via the byte-buffer
+    /// pattern; pre-fix `from_utf8_lossy(&chunk)` per-chunk produced
+    /// U+FFFD pairs.
+    #[test]
+    fn byte_buffer_preserves_utf8_split_across_chunks() {
+        // The Thai char ก (U+0E01) encodes as 0xE0 0xB8 0x81 — 3 bytes.
+        // SSE event `data: {"text":"ก"}\n\n` split between bytes 16 and 17
+        // (mid-Thai-char):
+        let chunk1: &[u8] = &[
+            b'd', b'a', b't', b'a', b':', b' ', b'{', b'"', b't', b'e', b'x', b't', b'"', b':',
+            b'"', 0xE0, 0xB8, // first 2 bytes of ก
+        ];
+        let chunk2: &[u8] = &[
+            0x81, b'"', b'}', b'\n', b'\n', // last byte of ก + closing
+        ];
+
+        // PRE-FIX equivalent: from_utf8_lossy each chunk, push to String
+        let mut bad_buffer = String::new();
+        bad_buffer.push_str(&String::from_utf8_lossy(chunk1));
+        bad_buffer.push_str(&String::from_utf8_lossy(chunk2));
+        assert!(
+            bad_buffer.contains('\u{FFFD}'),
+            "pre-fix path must produce U+FFFD chars (got: {bad_buffer:?})"
+        );
+        assert!(
+            !bad_buffer.contains('ก'),
+            "pre-fix path corrupts ก into replacement chars"
+        );
+
+        // POST-FIX path: byte buffer, decode at boundary
+        let mut good_buffer: Vec<u8> = Vec::new();
+        good_buffer.extend_from_slice(chunk1);
+        good_buffer.extend_from_slice(chunk2);
+        let boundary = find_bytes(&good_buffer, b"\n\n").expect("event boundary present");
+        let event_bytes = &good_buffer[..boundary + 2];
+        let event_text = String::from_utf8_lossy(event_bytes);
+        assert!(
+            event_text.contains('ก'),
+            "post-fix path preserves ก (got: {event_text:?})"
+        );
+        assert!(
+            !event_text.contains('\u{FFFD}'),
+            "post-fix path produces no replacement chars"
+        );
+    }
 
     /// Provider-aware alias resolution must keep the alias inside the
     /// caller's namespace. The whole point is to stop a passive agent-def

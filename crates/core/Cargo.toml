@@ -12,6 +12,13 @@ thiserror = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "process", "io-util", "time", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 futures = "0.3"
+# M6.36: Axum HTTP server + WebSocket upgrade powering `--serve` mode
+# (single-user webapp; see docs/serve mode). Minimal feature set —
+# http1 + tokio runtime + ws upgrade — keeps binary footprint small.
+# Always-on (not feature-gated) per M6.36 design decision: dependency
+# delta is negligible vs the wry+tao GUI deps; CLI + GUI binaries
+# both ship serve mode.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }
 async-trait = "0.1"
 async-stream = "0.3"
 bytes = "1"
@@ -120,6 +127,10 @@ path = "src/bin/policy_tool.rs"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 wiremock = "0.6"
+# M6.36 SERVE7: WS client for the --serve integration test. Spins up
+# `server::run` in a background task, connects via tokio-tungstenite,
+# round-trips shell_input → chat_* / terminal_* envelopes.
+tokio-tungstenite = "0.29"
 
 # Embed the .ico resource into the Windows PE so Explorer / taskbar /
 # alt-tab pick up the icon. Only pulled in for Windows targets; macOS

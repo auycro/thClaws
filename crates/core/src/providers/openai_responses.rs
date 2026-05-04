@@ -233,17 +233,20 @@ impl Provider for OpenAIResponsesProvider {
 
         let raw_dump = super::RawDump::new(format!("openai-responses {}", req.model));
         let event_stream = try_stream! {
-            let mut buffer = String::new();
+            // M6.21 BUG H1: byte buffer to avoid UTF-8 corruption at
+            // chunk boundaries. See providers::find_bytes doc.
+            let mut buffer: Vec<u8> = Vec::new();
             let mut byte_stream = Box::pin(byte_stream);
             let mut seen_start = false;
             let mut raw = raw_dump;
 
             while let Some(chunk) = byte_stream.next().await {
                 let chunk = chunk.map_err(|e| Error::Provider(format!("stream: {e}")))?;
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                buffer.extend_from_slice(&chunk);
 
-                while let Some(boundary) = buffer.find("\n\n") {
-                    let event_text: String = buffer.drain(..boundary + 2).collect();
+                while let Some(boundary) = super::find_bytes(&buffer, b"\n\n") {
+                    let event_bytes: Vec<u8> = buffer.drain(..boundary + 2).collect();
+                    let event_text = String::from_utf8_lossy(&event_bytes);
                     let events = parse_response_event(&event_text, &mut seen_start, &id_slot_stream)?;
                     for ev in events {
                         if let ProviderEvent::TextDelta(ref s) = ev { raw.push(s); }
@@ -379,16 +382,35 @@ fn parse_response_event(
             // Text output complete — could emit ContentBlockStop if needed.
         }
         "response.completed" => {
-            let usage = v
-                .get("response")
-                .and_then(|r| r.get("usage"))
-                .map(|u| Usage {
-                    input_tokens: u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
-                    output_tokens: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0)
-                        as u32,
+            let usage = v.get("response").and_then(|r| r.get("usage")).map(|u| {
+                let total_input = u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                let output = u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+                // M6.22 BUG G2: surface Responses API's auto-cache.
+                // Responses puts cached counts under
+                // `response.usage.input_tokens_details.cached_tokens`
+                // (parallel to Chat Completions' `prompt_tokens_details`,
+                // but renamed since Responses uses `input_tokens` not
+                // `prompt_tokens`). Pre-fix this was hardcoded None,
+                // hiding the auto-cache savings (and the implicit
+                // server-side history continuation via previous_response_id)
+                // from the per-turn pill and daily totals.
+                //
+                // Subtract cached from total_input so the canonical
+                // `Usage.input_tokens` is the UNCACHED new portion —
+                // matching Anthropic semantics. Without this, daily
+                // totals would double-count (input + cache_read).
+                let cached = u
+                    .pointer("/input_tokens_details/cached_tokens")
+                    .and_then(Value::as_u64);
+                let cached_count = cached.unwrap_or(0);
+                let uncached_input = total_input.saturating_sub(cached_count);
+                Usage {
+                    input_tokens: uncached_input as u32,
+                    output_tokens: output as u32,
                     cache_creation_input_tokens: None,
-                    cache_read_input_tokens: None,
-                });
+                    cache_read_input_tokens: cached.map(|v| v as u32),
+                }
+            });
             let stop_reason = v
                 .get("response")
                 .and_then(|r| r.get("status"))
@@ -500,6 +522,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(id_slot.lock().unwrap().as_deref(), Some("resp_xyz"));
+    }
+
+    /// M6.22 BUG G2: Responses API auto-cache stats must surface from
+    /// `response.usage.input_tokens_details.cached_tokens`. Pre-fix this
+    /// was hardcoded None, hiding the cache savings from the user even
+    /// though the server-side cache + previous_response_id continuation
+    /// was applying the discount.
+    #[test]
+    fn response_completed_extracts_cached_tokens_from_input_tokens_details() {
+        let events = parse_events(&[(
+            "response.completed",
+            r#"{"type":"response.completed","response":{"id":"resp_xyz","status":"completed","usage":{"input_tokens":5000,"output_tokens":200,"input_tokens_details":{"cached_tokens":4500}}}}"#,
+        )]);
+        let stop = events
+            .iter()
+            .find_map(|e| match e {
+                ProviderEvent::MessageStop { usage: Some(u), .. } => Some(u),
+                _ => None,
+            })
+            .expect("MessageStop with usage");
+        // input_tokens reports the UNCACHED portion (5000 total - 4500 cached = 500 new).
+        // Daily-totals math: input + cache_read = 500 + 4500 = 5000 (correct billable).
+        assert_eq!(stop.input_tokens, 500);
+        assert_eq!(stop.output_tokens, 200);
+        assert_eq!(stop.cache_read_input_tokens, Some(4500));
+        assert_eq!(stop.cache_creation_input_tokens, None);
     }
 
     #[test]

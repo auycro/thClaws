@@ -26,6 +26,8 @@ use futures::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 pub const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 
@@ -76,6 +78,15 @@ pub struct GeminiProvider {
     client: Client,
     api_key: String,
     base_url: String,
+    /// M6.21 BUG H2: monotonic counter for synthesized tool-call ids,
+    /// SHARED across all streams from this provider instance. Pre-fix
+    /// the counter lived per-`ParseState` and reset to 0 every stream,
+    /// so id `gemini-call-0` from turn 1 collided with id
+    /// `gemini-call-0` from turn 2. The `id_to_name` HashMap built in
+    /// `messages_to_gemini` had last-write-wins semantics, so turn 1's
+    /// ToolResult got mislabeled with turn 2's tool name in the wire
+    /// `functionResponse.name` field — breaking multi-turn tool sessions.
+    next_tool_id: Arc<AtomicU64>,
 }
 
 impl GeminiProvider {
@@ -84,6 +95,7 @@ impl GeminiProvider {
             client: Client::new(),
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
+            next_tool_id: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -352,10 +364,18 @@ impl Provider for GeminiProvider {
         // protocol/formatting issues without leaving the terminal.
         let debug_log = open_debug_log(&body, &req.model);
         let raw_dump = super::RawDump::new(format!("gemini {}", req.model));
+        // M6.21 BUG H2: pass the provider's shared tool-id counter into
+        // the parser so synthesized ids stay unique across streams.
+        let counter = self.next_tool_id.clone();
         let event_stream = try_stream! {
-            let mut buffer = String::new();
+            // M6.21 BUG H1: byte buffer to avoid UTF-8 corruption at
+            // chunk boundaries. Critical for Gemini because Gemini-served
+            // models often emit non-ASCII text (Thai, CJK) and the
+            // streamGenerateContent endpoint returns CRLF-framed events
+            // that frequently span TCP packets.
+            let mut buffer: Vec<u8> = Vec::new();
             let mut byte_stream = Box::pin(byte_stream);
-            let mut state = ParseState::default();
+            let mut state = ParseState::with_counter(counter);
             // For Gemma: track whether we're currently inside a
             // `<thinking>...</thinking>` block across chunk boundaries so we
             // can wrap inner text with ANSI dim codes.
@@ -370,17 +390,17 @@ impl Provider for GeminiProvider {
                     let _ = f.write_all(&chunk);
                     let _ = f.flush();
                 }
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                buffer.extend_from_slice(&chunk);
 
                 // SSE event boundaries can be either `\n\n` (unix) or
                 // `\r\n\r\n` (HTTP-spec). Google Gen Lang returns CRLF on
                 // streamGenerateContent, so a plain `\n\n` search silently
                 // buffers forever and yields zero events.
-                while let Some((boundary, sep_len)) = buffer
-                    .find("\r\n\r\n").map(|p| (p, 4))
-                    .or_else(|| buffer.find("\n\n").map(|p| (p, 2)))
+                while let Some((boundary, sep_len)) = super::find_bytes(&buffer, b"\r\n\r\n").map(|p| (p, 4))
+                    .or_else(|| super::find_bytes(&buffer, b"\n\n").map(|p| (p, 2)))
                 {
-                    let event_text: String = buffer.drain(..boundary + sep_len).collect();
+                    let event_bytes: Vec<u8> = buffer.drain(..boundary + sep_len).collect();
+                    let event_text = String::from_utf8_lossy(&event_bytes);
                     let trimmed = event_text
                         .trim_end_matches(|c: char| c == '\n' || c == '\r');
                     for event in parse_sse_event(trimmed, &mut state)? {
@@ -413,10 +433,34 @@ impl Provider for GeminiProvider {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct ParseState {
     pub seen_message_start: bool,
-    pub next_tool_id: u64,
+    /// M6.21 BUG H2: now an `Arc<AtomicU64>` shared across streams via
+    /// the parent provider so synthesized tool ids stay unique.
+    /// `Default::default()` mints a fresh local counter for tests.
+    pub next_tool_id: Arc<AtomicU64>,
+}
+
+impl Default for ParseState {
+    fn default() -> Self {
+        Self {
+            seen_message_start: false,
+            next_tool_id: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl ParseState {
+    /// Construct with a shared counter from the parent provider.
+    /// Production code uses this so synthesized ids are unique across
+    /// all streams from the same `GeminiProvider`.
+    pub fn with_counter(counter: Arc<AtomicU64>) -> Self {
+        Self {
+            seen_message_start: false,
+            next_tool_id: counter,
+        }
+    }
 }
 
 /// Parse one SSE event from the Gemini stream. Stateful across events.
@@ -471,8 +515,12 @@ pub fn parse_sse_event(raw: &str, state: &mut ParseState) -> Result<Vec<Provider
                     .unwrap_or("")
                     .to_string();
                 let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
-                let id = format!("gemini-call-{}", state.next_tool_id);
-                state.next_tool_id += 1;
+                // M6.21 BUG H2: fetch_add on the shared counter so ids
+                // stay unique across streams. Pre-fix the per-stream
+                // counter reset to 0 every turn, colliding ids across
+                // turns.
+                let counter_value = state.next_tool_id.fetch_add(1, Ordering::Relaxed);
+                let id = format!("gemini-call-{counter_value}");
                 out.push(ProviderEvent::ToolUseStart { id, name });
                 out.push(ProviderEvent::ToolUseDelta {
                     partial_json: args.to_string(),
@@ -484,17 +532,32 @@ pub fn parse_sse_event(raw: &str, state: &mut ParseState) -> Result<Vec<Provider
 
     // finishReason → MessageStop
     if let Some(reason) = candidate.get("finishReason").and_then(Value::as_str) {
-        let usage = v.get("usageMetadata").map(|u| Usage {
-            input_tokens: u
+        let usage = v.get("usageMetadata").map(|u| {
+            let total_input = u
                 .get("promptTokenCount")
                 .and_then(Value::as_u64)
-                .unwrap_or(0) as u32,
-            output_tokens: u
-                .get("candidatesTokenCount")
-                .and_then(Value::as_u64)
-                .unwrap_or(0) as u32,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
+                .unwrap_or(0);
+            // M6.22 BUG G3: surface Gemini's implicit prompt cache
+            // (auto-caches prefixes ≥4096 tokens on Pro/Flash, 25%
+            // discount on the cached portion). Pre-fix this was
+            // hardcoded None, hiding the savings from the per-turn
+            // pill and daily totals.
+            //
+            // Subtract cached from promptTokenCount so the canonical
+            // `Usage.input_tokens` is the UNCACHED new portion —
+            // matching Anthropic semantics.
+            let cached = u.get("cachedContentTokenCount").and_then(Value::as_u64);
+            let cached_count = cached.unwrap_or(0);
+            let uncached_input = total_input.saturating_sub(cached_count);
+            Usage {
+                input_tokens: uncached_input as u32,
+                output_tokens: u
+                    .get("candidatesTokenCount")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as u32,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: cached.map(|v| v as u32),
+            }
         });
         out.push(ProviderEvent::MessageStop {
             stop_reason: Some(reason.to_string()),
@@ -669,6 +732,99 @@ mod tests {
             }
             e => panic!("expected MessageStop, got {:?}", e),
         }
+    }
+
+    /// M6.22 BUG G3: surface Gemini's implicit prompt cache. Pre-fix
+    /// `usageMetadata.cachedContentTokenCount` was hardcoded None,
+    /// hiding the auto-cache savings (25% discount on cached portion
+    /// for prefixes ≥4096 tokens on Pro/Flash) from the user.
+    #[test]
+    fn parse_extracts_cached_content_token_count_from_usage_metadata() {
+        let events = parse_all(&[
+            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"hi\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5000,\"candidatesTokenCount\":200,\"cachedContentTokenCount\":4500,\"totalTokenCount\":5200},\"modelVersion\":\"gemini-2.0-flash\"}",
+        ]);
+        let stop = events
+            .iter()
+            .find_map(|e| match e {
+                ProviderEvent::MessageStop { usage: Some(u), .. } => Some(u),
+                _ => None,
+            })
+            .expect("MessageStop with usage");
+        // input_tokens reports the UNCACHED portion (5000 - 4500 = 500).
+        // Total billable = input + cache_read = 500 + 4500 = 5000 (matches promptTokenCount).
+        assert_eq!(stop.input_tokens, 500);
+        assert_eq!(stop.output_tokens, 200);
+        assert_eq!(stop.cache_read_input_tokens, Some(4500));
+        assert_eq!(stop.cache_creation_input_tokens, None);
+    }
+
+    #[test]
+    fn parse_handles_usage_without_cached_content_token_count() {
+        // Pre-cache turns / models without implicit caching: the field
+        // is absent. Must still produce Usage with cache_read None.
+        let events = parse_all(&[
+            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"hi\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":50,\"candidatesTokenCount\":3},\"modelVersion\":\"gemini-2.0-flash\"}",
+        ]);
+        let stop = events
+            .iter()
+            .find_map(|e| match e {
+                ProviderEvent::MessageStop { usage: Some(u), .. } => Some(u),
+                _ => None,
+            })
+            .expect("MessageStop with usage");
+        assert_eq!(stop.input_tokens, 50);
+        assert_eq!(stop.output_tokens, 3);
+        assert_eq!(stop.cache_read_input_tokens, None);
+    }
+
+    /// M6.21 BUG H2: synthesized tool ids must NOT collide across
+    /// streams. Pre-fix the per-`ParseState` counter reset to 0 every
+    /// stream, so `gemini-call-0` from turn 1 collided with
+    /// `gemini-call-0` from turn 2 — `messages_to_gemini`'s id_to_name
+    /// HashMap then last-wrote turn 2's tool name onto turn 1's
+    /// ToolResult, producing a wire `functionResponse: {name: <wrong>}`.
+    /// Verify a shared `Arc<AtomicU64>` counter keeps ids unique
+    /// across streams.
+    #[test]
+    fn synthesized_tool_ids_stay_unique_across_streams() {
+        let shared = Arc::new(AtomicU64::new(0));
+
+        // Turn 1
+        let mut state = ParseState::with_counter(shared.clone());
+        let events_t1 = parse_sse_event(
+            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"Read\",\"args\":{}}}]},\"finishReason\":\"STOP\"}],\"modelVersion\":\"gemini-2.0-flash\"}",
+            &mut state,
+        ).unwrap();
+
+        // Turn 2 — fresh ParseState (simulates new stream) but same shared counter
+        let mut state = ParseState::with_counter(shared.clone());
+        let events_t2 = parse_sse_event(
+            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"Bash\",\"args\":{}}}]},\"finishReason\":\"STOP\"}],\"modelVersion\":\"gemini-2.0-flash\"}",
+            &mut state,
+        ).unwrap();
+
+        // Extract the synthesized ids from each turn
+        let t1_id = events_t1
+            .iter()
+            .find_map(|e| match e {
+                ProviderEvent::ToolUseStart { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("turn 1 ToolUseStart");
+        let t2_id = events_t2
+            .iter()
+            .find_map(|e| match e {
+                ProviderEvent::ToolUseStart { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("turn 2 ToolUseStart");
+
+        assert_ne!(
+            t1_id, t2_id,
+            "ids must be unique across streams to prevent id_to_name HashMap collision"
+        );
+        assert_eq!(t1_id, "gemini-call-0");
+        assert_eq!(t2_id, "gemini-call-1");
     }
 
     #[test]

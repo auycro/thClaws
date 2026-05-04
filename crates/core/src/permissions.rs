@@ -147,6 +147,13 @@ pub enum ApprovalDecision {
 #[async_trait]
 pub trait ApprovalSink: Send + Sync {
     async fn approve(&self, req: &ApprovalRequest) -> ApprovalDecision;
+
+    /// Reset any "allow for session" state held by this sink. Called on
+    /// `NewSession` / `LoadSession` / `SessionDeletedExternal` so a yolo
+    /// decision in session A doesn't auto-approve calls in session B.
+    /// M6.20 BUG M2. Default is a no-op for sinks that don't track
+    /// session-scoped state (Auto/Deny/Scripted).
+    fn reset_session_flag(&self) {}
 }
 
 /// Always-allow sink. Matches `PermissionMode::Auto` behavior but can also be
@@ -231,6 +238,10 @@ impl Default for ReplApprover {
 
 #[async_trait]
 impl ApprovalSink for ReplApprover {
+    fn reset_session_flag(&self) {
+        self.session_allowed.store(false, Ordering::Relaxed);
+    }
+
     async fn approve(&self, req: &ApprovalRequest) -> ApprovalDecision {
         if self.session_allowed.load(Ordering::Relaxed) {
             return ApprovalDecision::Allow;
@@ -341,6 +352,10 @@ impl GuiApprover {
 
 #[async_trait]
 impl ApprovalSink for GuiApprover {
+    fn reset_session_flag(&self) {
+        self.session_allowed.store(false, Ordering::Relaxed);
+    }
+
     async fn approve(&self, req: &ApprovalRequest) -> ApprovalDecision {
         if self.session_allowed.load(Ordering::Relaxed) {
             return ApprovalDecision::Allow;
@@ -480,6 +495,54 @@ mod tests {
             summary: None,
         };
         assert_eq!(approver.approve(&req).await, ApprovalDecision::Deny);
+    }
+
+    /// M6.20 BUG M2: AllowForSession's "yolo" flag must be cleared on
+    /// `reset_session_flag()` so a session swap forces fresh prompts
+    /// instead of inheriting auto-approve from the prior session.
+    #[tokio::test]
+    async fn gui_approver_reset_session_flag_clears_yolo() {
+        let (approver, mut rx) = GuiApprover::new();
+        let req = ApprovalRequest {
+            tool_name: "Bash".into(),
+            input: serde_json::json!({"command": "ls"}),
+            summary: None,
+        };
+        // Set the yolo flag.
+        let approver_c = approver.clone();
+        let req_c = req.clone();
+        let first = tokio::spawn(async move { approver_c.approve(&req_c).await });
+        let outbound = rx.recv().await.unwrap();
+        approver.resolve(outbound.id, ApprovalDecision::AllowForSession);
+        assert_eq!(first.await.unwrap(), ApprovalDecision::Allow);
+        // Reset — flag should clear.
+        ApprovalSink::reset_session_flag(approver.as_ref());
+        // Next call must forward a fresh request (proves flag is off);
+        // resolve with Deny to check the round-trip works.
+        let approver_c = approver.clone();
+        let req_c = req.clone();
+        let second = tokio::spawn(async move { approver_c.approve(&req_c).await });
+        let outbound = rx.recv().await.expect("request forwarded again");
+        approver.resolve(outbound.id, ApprovalDecision::Deny);
+        assert_eq!(second.await.unwrap(), ApprovalDecision::Deny);
+    }
+
+    /// M6.20 BUG M2: same contract for the CLI sink.
+    #[tokio::test]
+    async fn repl_approver_reset_session_flag_clears_yolo() {
+        let approver = ReplApprover::new();
+        // Simulate yolo flip via the internal flag (no stdin in tests).
+        approver.session_allowed.store(true, Ordering::Relaxed);
+        let req = ApprovalRequest {
+            tool_name: "Bash".into(),
+            input: serde_json::json!({"command": "ls"}),
+            summary: None,
+        };
+        // Flag set → auto-allow.
+        assert_eq!(approver.approve(&req).await, ApprovalDecision::Allow);
+        // Reset clears it.
+        ApprovalSink::reset_session_flag(approver.as_ref());
+        assert!(!approver.session_allowed.load(Ordering::Relaxed));
     }
 
     #[test]

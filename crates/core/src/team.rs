@@ -23,6 +23,37 @@ use std::sync::Arc;
 
 pub const POLL_INTERVAL_MS: u64 = 1000;
 
+/// M6.34 TEAM1: validate agent / member names before they're used to build
+/// filesystem paths (`.thclaws/team/inboxes/<name>.json`,
+/// `.thclaws/team/agents/<name>/...`, `.worktrees/<name>`) or git refs
+/// (`team/<name>`). Pre-fix `name` flowed straight from
+/// model-controlled tool input (`TeamCreate`, `SpawnTeammate`,
+/// `SendMessage.to`, GUI `team_send_message.to`) into `format!` /
+/// `join`, so `name = "../../sessions/sess-..."` would overwrite
+/// arbitrary files in the project tree.
+///
+/// Rule: 1–64 chars, first char alphanumeric or `_`, subsequent chars
+/// alphanumeric / `_` / `-`. Rejects `..`, `.`, leading dash, slashes,
+/// backslashes, control chars, NUL, anything else exotic. The 64-char
+/// cap is well under FS NAME_MAX (255) and git refname limits.
+///
+/// Special case: `*` (broadcast) and `lead` are valid agent names too —
+/// `lead` matches the regex; `*` is whitelisted at SendMessage's `to`
+/// validator and never reaches this function.
+pub fn is_valid_agent_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 64 {
+        return false;
+    }
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphanumeric() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 /// Set at session startup by `repl::run_repl_with_state`. True when this
 /// process is the team lead (team mode is on AND we're not running as a
 /// named teammate). Consulted by tools (e.g. BashTool) to apply lead-only
@@ -36,6 +67,58 @@ pub fn set_is_team_lead(b: bool) {
 
 pub fn is_team_lead() -> bool {
     IS_TEAM_LEAD.load(Ordering::Relaxed)
+}
+
+/// M6.34 TEAM3: lead's canonical team_dir captured at startup. Used by
+/// `kill_my_teammates()` to build a `pkill -f` pattern that matches ONLY
+/// teammates spawned by this lead session — pre-fix `pkill -f team-agent`
+/// matched any process system-wide whose argv contained "team-agent",
+/// which killed teammates of OTHER thClaws sessions in other projects.
+///
+/// Set once at lead startup (`repl::run_repl_with_state` /
+/// `shared_session::run_worker`). Static rather than threaded through
+/// the EOF handlers because there are multiple EOF sites in repl.rs and
+/// passing an Option<String> through the readline / select! plumbing was
+/// noisier than the static.
+static LEAD_TEAM_DIR: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
+
+fn lead_team_dir_slot() -> &'static std::sync::Mutex<Option<String>> {
+    LEAD_TEAM_DIR.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Record the lead's absolute team_dir for later teammate cleanup.
+/// Idempotent — calling multiple times overwrites (lead may swap
+/// projects mid-session via ChangeCwd).
+pub fn set_lead_team_dir(team_dir: &Path) {
+    let abs = team_dir
+        .canonicalize()
+        .unwrap_or_else(|_| team_dir.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    if let Ok(mut g) = lead_team_dir_slot().lock() {
+        *g = Some(abs);
+    }
+}
+
+/// Kill every teammate process spawned by THIS lead session. Matches
+/// `pkill -f --team-dir <abs-path>` so we only target processes whose
+/// argv contains the exact `--team-dir <our team_dir>` flag pair —
+/// teammates of other projects (different team_dir) are untouched.
+///
+/// No-op when `LEAD_TEAM_DIR` was never set (we're not the lead, or
+/// teamEnabled was off). Best-effort — pkill failures are swallowed.
+pub fn kill_my_teammates() {
+    let dir = match lead_team_dir_slot().lock().ok().and_then(|g| g.clone()) {
+        Some(d) => d,
+        None => return,
+    };
+    // Match `--team-dir <abs path>` in cmdline. Most processes never
+    // carry that flag pair so the match is highly specific.
+    let pattern = format!("--team-dir {}", dir);
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", &pattern])
+        .status();
 }
 
 /// True when (a) a git merge is currently in progress in the repo that
@@ -378,8 +461,12 @@ impl TaskQueue {
         if !path.exists() {
             return Ok(None);
         }
-        let contents = std::fs::read_to_string(&path)?;
-        Ok(serde_json::from_str(&contents).ok())
+        // M6.34 TEAM6: shared lock so we don't observe a task file
+        // mid-rewrite from claim() / complete() / release().
+        with_file_lock_shared(&path, || {
+            let contents = std::fs::read_to_string(&path)?;
+            Ok(serde_json::from_str(&contents).ok())
+        })
     }
 
     pub fn claim(&self, task_id: &str, agent_id: &str) -> Result<TeamTask> {
@@ -485,11 +572,19 @@ impl TaskQueue {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            if let Ok(contents) = std::fs::read_to_string(&path) {
-                if let Ok(task) = serde_json::from_str::<TeamTask>(&contents) {
-                    if filter.is_none() || filter == Some(task.status) {
-                        tasks.push(task);
-                    }
+            // M6.34 TEAM6: shared lock per task file so we don't read a
+            // task that's being rewritten by a concurrent claim/complete.
+            // Errors swallowed (continue) to preserve original best-effort
+            // behavior — one corrupt task shouldn't fail the whole list.
+            let parsed: Option<TeamTask> = with_file_lock_shared(&path, || {
+                let contents = std::fs::read_to_string(&path)?;
+                Ok(serde_json::from_str::<TeamTask>(&contents).ok())
+            })
+            .ok()
+            .flatten();
+            if let Some(task) = parsed {
+                if filter.is_none() || filter == Some(task.status) {
+                    tasks.push(task);
                 }
             }
         }
@@ -558,6 +653,15 @@ impl Mailbox {
 
     /// Initialize directories for an agent.
     pub fn init_agent(&self, agent: &str) -> Result<()> {
+        // M6.34 TEAM1: defense-in-depth path-traversal guard. The
+        // public tool surfaces (TeamCreate / SpawnTeammate /
+        // SendMessage / GUI) validate too; this catches anything
+        // that bypasses them.
+        if !is_valid_agent_name(agent) {
+            return Err(Error::Tool(format!(
+                "invalid agent name '{agent}' — must be 1-64 chars, alphanumeric / _ / -, start with alphanumeric or _"
+            )));
+        }
         std::fs::create_dir_all(self.inboxes_dir())?;
         std::fs::create_dir_all(self.agents_dir().join(agent))?;
         // Create empty inbox if it doesn't exist.
@@ -590,6 +694,14 @@ impl Mailbox {
 
     /// Write a message to an agent's inbox (exclusive lock, append).
     pub fn write_to_mailbox(&self, agent: &str, msg: TeamMessage) -> Result<()> {
+        // M6.34 TEAM1: path-traversal guard. Defends against an
+        // agent name like `"../../sessions/sess-abc"` reaching the
+        // inbox path constructor.
+        if !is_valid_agent_name(agent) {
+            return Err(Error::Tool(format!(
+                "invalid recipient '{agent}' — must be 1-64 chars, alphanumeric / _ / -"
+            )));
+        }
         let path = self.inbox_path(agent);
         std::fs::create_dir_all(self.inboxes_dir())?;
         with_file_lock(&path, || {
@@ -623,6 +735,12 @@ impl Mailbox {
 
     /// Write agent status.
     pub fn write_status(&self, agent: &str, status: &str, task: Option<&str>) -> Result<()> {
+        // M6.34 TEAM1: path-traversal guard.
+        if !is_valid_agent_name(agent) {
+            return Err(Error::Tool(format!(
+                "invalid agent name '{agent}' — must be 1-64 chars, alphanumeric / _ / -"
+            )));
+        }
         let s = AgentStatus {
             agent: agent.into(),
             status: status.into(),
@@ -631,14 +749,29 @@ impl Mailbox {
         };
         let path = self.status_path(agent);
         std::fs::create_dir_all(path.parent().unwrap())?;
-        std::fs::write(&path, serde_json::to_string_pretty(&s)?)?;
-        Ok(())
+        // M6.34 TEAM6: write under exclusive lock. Pre-fix the heartbeat
+        // writer + GUI Team-tab refresher could race — reader observed
+        // partial JSON, `serde_json::from_str.ok()` returned None,
+        // status appeared as "agent missing" intermittently.
+        with_file_lock(&path, || {
+            std::fs::write(&path, serde_json::to_string_pretty(&s)?)?;
+            Ok(())
+        })
     }
 
     pub fn read_status(&self, agent: &str) -> Option<AgentStatus> {
         let path = self.status_path(agent);
-        let contents = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&contents).ok()
+        // M6.34 TEAM6: read under shared lock so we don't observe a
+        // status file that's being rewritten.
+        if !path.exists() {
+            return None;
+        }
+        with_file_lock_shared(&path, || {
+            let contents = std::fs::read_to_string(&path)?;
+            Ok(serde_json::from_str::<AgentStatus>(&contents).ok())
+        })
+        .ok()
+        .flatten()
     }
 
     pub fn all_status(&self) -> Result<Vec<AgentStatus>> {
@@ -701,6 +834,20 @@ fn with_file_lock_shared<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Resul
     let result = f();
     let _ = lock_file.unlock();
     result
+}
+
+/// M6.34 TEAM2: POSIX shell single-quote escape for values interpolated
+/// into a shell string. Wraps the value in `'…'` and escapes embedded
+/// single quotes via the standard `'\''` trick.
+///
+/// Used in `SpawnTeammate` for `name` / `team_dir` / `effective_cwd` —
+/// previously interpolated unquoted, so a name like `foo; rm -rf $HOME ;`
+/// would inject shell statements. TEAM1's `is_valid_agent_name` already
+/// rejects shell metachars in agent names, but `team_dir` /
+/// `effective_cwd` come from filesystem paths which can legally contain
+/// spaces / quotes — so escape is necessary defense for those.
+fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 fn now_secs() -> u64 {
@@ -767,6 +914,15 @@ impl Tool for SendMessageTool {
             .and_then(Value::as_str)
             .or_else(|| input.get("content").and_then(Value::as_str))
             .ok_or_else(|| Error::Tool("missing 'text' field".into()))?;
+
+        // M6.34 TEAM1: validate the recipient before any path
+        // construction. `*` is the broadcast sentinel (handled below);
+        // every other value must look like a real agent name.
+        if to != "*" && !is_valid_agent_name(to) {
+            return Err(Error::Tool(format!(
+                "invalid recipient '{to}' — must be `*` (broadcast) or a 1-64 char alphanumeric/_/- agent name"
+            )));
+        }
 
         // Reject sending to stopped agents.
         if to != "*" && to != "lead" {
@@ -979,6 +1135,15 @@ impl Tool for TeamCreateTool {
                 .get("name")
                 .and_then(Value::as_str)
                 .ok_or_else(|| Error::Tool("agent missing name".into()))?;
+            // M6.34 TEAM1: reject path-traversal / shell-metachar names
+            // BEFORE we start writing files. Pre-fix `name = "../foo"`
+            // would have status / inbox / output_log files land outside
+            // `.thclaws/team/`.
+            if !is_valid_agent_name(agent_name) {
+                return Err(Error::Tool(format!(
+                    "invalid agent name '{agent_name}' — must be 1-64 chars, alphanumeric / _ / -, start with alphanumeric or _. Reserved: agent names also become git branch names (`team/<name>`) and worktree dirs (`.worktrees/<name>`), so the same restriction applies."
+                )));
+            }
             self.mailbox.init_agent(agent_name)?;
             let prompt_text = a
                 .get("prompt")
@@ -1112,6 +1277,16 @@ impl Tool for SpawnTeammateTool {
         let prompt = crate::tools::req_str(&input, "prompt")?;
         let cwd = input.get("cwd").and_then(Value::as_str);
 
+        // M6.34 TEAM1: reject before any side effects (worktree creation,
+        // file writes, subprocess spawn). Pre-fix `name = "../foo"` would
+        // create a worktree at `<project_parent>/foo/` and a branch
+        // `team/../foo` (latter typically rejected by git, but the worktree
+        // dir was created first).
+        if !is_valid_agent_name(name) {
+            return Err(Error::Tool(format!(
+                "invalid agent name '{name}' — must be 1-64 chars, alphanumeric / _ / -, start with alphanumeric or _"
+            )));
+        }
         self.mailbox.init_agent(name)?;
 
         // Look up agent definition from .thclaws/agents/, agents.json, or
@@ -1164,9 +1339,18 @@ impl Tool for SpawnTeammateTool {
         let needs_cli = bin.ends_with("/thclaws") || bin.ends_with("\\thclaws");
         let cli_flag = if needs_cli { " --cli" } else { "" };
 
+        // M6.34 TEAM2: shell-escape every interpolated value. `name` is
+        // already restricted to [A-Za-z0-9_-] by TEAM1, but escape it
+        // anyway for consistency. `bin` is from std::env::current_exe and
+        // could legally contain spaces (macOS app bundle paths) — must
+        // escape. `team_dir` is the canonicalized absolute path which
+        // routinely contains spaces (macOS user dirs).
         let mut agent_cmd = format!(
             "{}{} --team-agent {} --team-dir {} --permission-mode auto --accept-all",
-            bin, cli_flag, name, team_dir
+            shell_escape(&bin),
+            cli_flag,
+            shell_escape(name),
+            shell_escape(&team_dir),
         );
 
         // Agent def model override. Resolution rules:
@@ -1183,7 +1367,11 @@ impl Tool for SpawnTeammateTool {
         if let Some(def) = agent_def {
             if let Some(ref model) = def.model {
                 if model.contains('-') {
-                    agent_cmd.push_str(&format!(" --model {}", model));
+                    // M6.34 TEAM2: escape — model strings from agent_def
+                    // can legally contain `/` (e.g.
+                    // `anthropic/claude-sonnet-4-6`); future model ids
+                    // could carry other shell-significant chars.
+                    agent_cmd.push_str(&format!(" --model {}", shell_escape(model)));
                 } else {
                     // Short alias — resolve provider-aware.
                     let current_provider = crate::config::AppConfig::load()
@@ -1198,7 +1386,8 @@ impl Tool for SpawnTeammateTool {
                                     "\x1b[33m[team] resolved agent def alias '{model}' → '{resolved}' (provider: {})\x1b[0m",
                                     provider.name()
                                 );
-                                agent_cmd.push_str(&format!(" --model {resolved}"));
+                                agent_cmd
+                                    .push_str(&format!(" --model {}", shell_escape(&resolved)));
                             }
                             None => {
                                 eprintln!(
@@ -1338,9 +1527,11 @@ impl Tool for SpawnTeammateTool {
             .or_else(|| Some(project_root_str.clone()));
         // Expose the original project root so teammates in worktrees know where to
         // write shared docs / artifacts that other teammates should see.
+        // M6.34 TEAM2: replace inline `replace('\'', "'\\''")` with the
+        // shared `shell_escape` helper for consistency.
         agent_cmd = format!(
-            "THCLAWS_PROJECT_ROOT='{}' {}",
-            project_root_str.replace('\'', "'\\''"),
+            "THCLAWS_PROJECT_ROOT={} {}",
+            shell_escape(&project_root_str),
             agent_cmd
         );
         // Stub out interactive editors. Even though BashTool redirects stdin
@@ -1359,7 +1550,11 @@ impl Tool for SpawnTeammateTool {
             agent_cmd = format!("THCLAWS_IN_WORKTREE=1 {}", agent_cmd);
         }
         if let Some(ref dir) = effective_cwd {
-            agent_cmd = format!("cd {} && {}", dir, agent_cmd);
+            // M6.34 TEAM2: shell-escape the cwd path so spaces /
+            // quotes in macOS user dirs don't break the cd. Pre-fix
+            // `cd /Users/Some One/proj && ...` would split into
+            // `cd /Users/Some` (wrong dir) + `One/proj` (404).
+            agent_cmd = format!("cd {} && {}", shell_escape(dir), agent_cmd);
         }
 
         // Update config: mark member active.
@@ -2132,6 +2327,122 @@ mod tests {
 
         let statuses = mb.all_status().unwrap();
         assert_eq!(statuses.len(), 2);
+    }
+
+    /// M6.34 TEAM1: agent name validator pins exactly which strings
+    /// can become filesystem path / git ref components. Anything
+    /// rejected here can never reach `inbox_path` /
+    /// `output_log_path` / `worktree_path` / `team/<name>` branch.
+    #[test]
+    fn is_valid_agent_name_accepts_normal_names() {
+        assert!(is_valid_agent_name("lead"));
+        assert!(is_valid_agent_name("frontend"));
+        assert!(is_valid_agent_name("backend-2"));
+        assert!(is_valid_agent_name("qa_team"));
+        assert!(is_valid_agent_name("a"));
+        assert!(is_valid_agent_name("agent01"));
+        assert!(is_valid_agent_name("_internal"));
+        assert!(is_valid_agent_name(&"x".repeat(64)));
+    }
+
+    #[test]
+    fn is_valid_agent_name_rejects_path_traversal() {
+        // Pre-fix these would have flowed straight into `format!("{name}.json")`
+        // and escaped the inboxes/ directory.
+        assert!(!is_valid_agent_name(".."));
+        assert!(!is_valid_agent_name("../foo"));
+        assert!(!is_valid_agent_name("../../sessions/abc"));
+        assert!(!is_valid_agent_name("foo/bar"));
+        assert!(!is_valid_agent_name("foo\\bar"));
+        assert!(!is_valid_agent_name(".hidden"));
+    }
+
+    #[test]
+    fn is_valid_agent_name_rejects_shell_metacharacters() {
+        // Pre-fix these could inject shell statements via SpawnTeammate's
+        // un-escaped `--team-agent {name}` interpolation.
+        assert!(!is_valid_agent_name("foo; rm -rf /"));
+        assert!(!is_valid_agent_name("foo`whoami`"));
+        assert!(!is_valid_agent_name("foo$bar"));
+        assert!(!is_valid_agent_name("foo bar"));
+        assert!(!is_valid_agent_name("foo\nbar"));
+        assert!(!is_valid_agent_name("foo'bar"));
+        assert!(!is_valid_agent_name("foo\"bar"));
+        assert!(!is_valid_agent_name("foo|bar"));
+        assert!(!is_valid_agent_name("foo&bar"));
+    }
+
+    #[test]
+    fn is_valid_agent_name_rejects_edges() {
+        assert!(!is_valid_agent_name(""));
+        assert!(!is_valid_agent_name(&"x".repeat(65)));
+        // Leading dash isn't allowed because `--team-agent -foo` would
+        // be parsed as an option by argparse.
+        assert!(!is_valid_agent_name("-foo"));
+    }
+
+    /// M6.34 TEAM1 defense-in-depth — Mailbox::init_agent must reject
+    /// invalid names at the storage boundary even when the caller
+    /// (TeamCreate / SpawnTeammate / SendMessage) skipped validation.
+    #[test]
+    fn mailbox_init_agent_rejects_invalid_name() {
+        let dir = tempdir().unwrap();
+        let mb = Mailbox::new(dir.path().to_path_buf());
+        let err = mb.init_agent("../escape").unwrap_err();
+        assert!(
+            format!("{err}").contains("invalid agent name"),
+            "expected path-traversal rejection, got: {err}"
+        );
+        // Verify NO files leaked outside the team_dir.
+        let escape_target = dir.path().parent().unwrap().join("escape");
+        assert!(
+            !escape_target.exists(),
+            "init_agent('../escape') must not create anything at {}",
+            escape_target.display()
+        );
+    }
+
+    #[test]
+    fn mailbox_write_to_mailbox_rejects_invalid_recipient() {
+        let dir = tempdir().unwrap();
+        let mb = Mailbox::new(dir.path().to_path_buf());
+        mb.init_agent("alice").unwrap();
+        let err = mb
+            .write_to_mailbox("../passwd", TeamMessage::new("attacker", "drop tables"))
+            .unwrap_err();
+        assert!(format!("{err}").contains("invalid recipient"));
+    }
+
+    /// M6.34 TEAM2: shell-escape helper pins POSIX single-quote
+    /// behavior. Critical paths are values that make it into
+    /// SpawnTeammate's agent_cmd shell string.
+    #[test]
+    fn shell_escape_wraps_in_single_quotes() {
+        assert_eq!(shell_escape("simple"), "'simple'");
+        assert_eq!(shell_escape("/tmp/path"), "'/tmp/path'");
+        assert_eq!(shell_escape(""), "''");
+    }
+
+    #[test]
+    fn shell_escape_handles_embedded_single_quote() {
+        // `it's` becomes `'it'\''s'` — the standard POSIX double-quote
+        // dance. Sequence: close quote, escaped quote, reopen quote.
+        assert_eq!(shell_escape("it's"), "'it'\\''s'");
+        assert_eq!(shell_escape("'"), "''\\'''");
+    }
+
+    #[test]
+    fn shell_escape_neutralizes_injection_metacharacters() {
+        // Pre-fix interpolation of these straight into a shell string
+        // would inject statements / subshells / variable expansion.
+        // After escape, they're literal arguments to the inner command.
+        let evil = "foo; rm -rf $HOME && echo `pwn`";
+        let escaped = shell_escape(evil);
+        // Must wrap in single quotes — every metachar inside is now literal.
+        assert!(escaped.starts_with('\''));
+        assert!(escaped.ends_with('\''));
+        // No bare metachars outside the quoted region.
+        assert!(!escaped.starts_with('"'));
     }
 
     #[test]

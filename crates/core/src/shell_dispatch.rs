@@ -23,10 +23,16 @@ use tokio::sync::broadcast;
 /// Entry point — dispatch a single slash line against the shared
 /// worker state, writing user-visible output to `events_tx` as
 /// `SlashOutput` events.
+///
+/// `input_tx` is needed for commands that spawn background tasks which
+/// re-feed input back into the worker queue (M6.29: `/loop` start —
+/// the spawned task fires `<body>` every interval via `input_tx.send`).
+/// Most commands ignore it.
 pub async fn dispatch(
     line: &str,
     state: &mut WorkerState,
     events_tx: &broadcast::Sender<ViewEvent>,
+    input_tx: &std::sync::mpsc::Sender<crate::shared_session::ShellInput>,
 ) {
     let Some(cmd) = parse_slash(line) else {
         emit(events_tx, format!("Not a slash command: {line}"));
@@ -836,6 +842,256 @@ pub async fn dispatch(
                 None => emit(events_tx, format!("memory entry '{name}' not found")),
             }
         }
+        // M6.26 BUG #2: GUI-side write/append/edit/delete dispatch.
+        // Editor flow isn't supported in the GUI (no terminal); user
+        // must pass --body. The agent-side MemoryWrite tool covers
+        // the "ask the model to author" use case.
+        SlashCommand::MemoryWrite {
+            name,
+            body,
+            type_,
+            description,
+        } => {
+            let Some(store) =
+                crate::memory::MemoryStore::default_path().map(crate::memory::MemoryStore::new)
+            else {
+                emit(events_tx, "no memory store".into());
+                return;
+            };
+            let Some(body_str) = body else {
+                emit(
+                    events_tx,
+                    "GUI /memory write requires --body \"...\". (Editor flow is CLI-only — \
+                     ask the agent to write a memory via the chat for free-form authoring.)"
+                        .into(),
+                );
+                return;
+            };
+            let final_content =
+                if (type_.is_some() || description.is_some()) && !body_str.starts_with("---") {
+                    let mut fm = std::collections::HashMap::new();
+                    if let Some(t) = type_ {
+                        fm.insert("type".to_string(), t);
+                    }
+                    if let Some(d) = description {
+                        fm.insert("description".to_string(), d);
+                    }
+                    crate::memory::write_frontmatter_map(&fm, &body_str)
+                } else {
+                    body_str
+                };
+            match crate::memory::write_entry(&store, &name, &final_content) {
+                Ok(path) => emit(
+                    events_tx,
+                    format!("wrote {} ({} bytes)", path.display(), final_content.len()),
+                ),
+                Err(e) => emit(events_tx, format!("write failed: {e}")),
+            }
+        }
+        SlashCommand::MemoryAppend { name, body } => {
+            let Some(store) =
+                crate::memory::MemoryStore::default_path().map(crate::memory::MemoryStore::new)
+            else {
+                emit(events_tx, "no memory store".into());
+                return;
+            };
+            match crate::memory::append_to_entry(&store, &name, &body) {
+                Ok(path) => emit(
+                    events_tx,
+                    format!("appended {} bytes → {}", body.len(), path.display()),
+                ),
+                Err(e) => emit(events_tx, format!("append failed: {e}")),
+            }
+        }
+        SlashCommand::MemoryEdit(_name) => {
+            // GUI doesn't have an editor surface yet; punt to a
+            // helpful error rather than silently no-op.
+            emit(
+                events_tx,
+                "GUI /memory edit isn't implemented yet (CLI-only). \
+                 Use /memory write <name> --body \"...\" to overwrite \
+                 with new content, or ask the agent to update via chat."
+                    .into(),
+            );
+        }
+        SlashCommand::MemoryDelete { name, yes: _yes } => {
+            // GUI: no interactive confirm — the slash command itself
+            // is treated as the confirm gesture (user typed it). If
+            // we want a modal later, route through ViewEvent.
+            let Some(store) =
+                crate::memory::MemoryStore::default_path().map(crate::memory::MemoryStore::new)
+            else {
+                emit(events_tx, "no memory store".into());
+                return;
+            };
+            match crate::memory::delete_entry(&store, &name) {
+                Ok(path) => emit(events_tx, format!("deleted {}", path.display())),
+                Err(e) => emit(events_tx, format!("delete failed: {e}")),
+            }
+        }
+
+        // ─── /loop + /goal (M6.29) ──────────────────────────────────
+        SlashCommand::Loop {
+            interval_secs,
+            body,
+        } => {
+            if state.active_loop.is_some() {
+                emit(
+                    events_tx,
+                    "loop already running — `/loop stop` first, then start a new one".into(),
+                );
+                return;
+            }
+            let interval = std::time::Duration::from_secs(interval_secs.unwrap_or(300));
+            let body_for_task = body.clone();
+            let input_tx_for_task = input_tx.clone();
+            let label_interval = interval_secs
+                .map(|s| format!("every {s}s"))
+                .unwrap_or_else(|| "self-paced (default 5min)".to_string());
+            let handle = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(interval).await;
+                    if input_tx_for_task
+                        .send(crate::shared_session::ShellInput::Line(
+                            body_for_task.clone(),
+                        ))
+                        .is_err()
+                    {
+                        // Channel closed (worker shut down); exit task.
+                        break;
+                    }
+                }
+            });
+            state.active_loop = Some(crate::shared_session::ActiveLoop {
+                interval_secs,
+                body: body.clone(),
+                started_at: now_secs(),
+                iterations_fired: 0,
+                abort: handle.abort_handle(),
+            });
+            emit(
+                events_tx,
+                format!("loop started ({label_interval}): {body}"),
+            );
+        }
+        SlashCommand::LoopStop => match state.active_loop.take() {
+            Some(loop_state) => {
+                loop_state.abort.abort();
+                emit(
+                    events_tx,
+                    format!(
+                        "loop stopped (ran {} iteration(s) firing `{}`)",
+                        loop_state.iterations_fired, loop_state.body,
+                    ),
+                );
+            }
+            None => emit(events_tx, "no active loop".into()),
+        },
+        SlashCommand::LoopStatus => match &state.active_loop {
+            Some(l) => emit(
+                events_tx,
+                format!(
+                    "loop active: body=`{}` interval={} iterations_fired={} started_at={}s ago",
+                    l.body,
+                    l.interval_secs
+                        .map(|s| format!("{s}s"))
+                        .unwrap_or_else(|| "self-paced".into()),
+                    l.iterations_fired,
+                    now_secs().saturating_sub(l.started_at),
+                ),
+            ),
+            None => emit(events_tx, "no active loop".into()),
+        },
+        SlashCommand::GoalStart {
+            objective,
+            budget_tokens,
+            budget_time_secs,
+        } => {
+            let new_goal = crate::goal_state::GoalState::new(
+                objective.clone(),
+                budget_tokens,
+                budget_time_secs,
+            );
+            crate::goal_state::set(Some(new_goal));
+            // Live-register UpdateGoal tool so the model can mark it
+            // complete / blocked.
+            state
+                .tool_registry
+                .register(std::sync::Arc::new(crate::tools::UpdateGoalTool));
+            state.rebuild_system_prompt();
+            if let Err(e) = state.rebuild_agent(true) {
+                emit(events_tx, format!("rebuild failed: {e}"));
+                return;
+            }
+            emit(
+                events_tx,
+                format!(
+                    "goal started: \"{}\" (budget_tokens={}, budget_time={}s)",
+                    objective,
+                    budget_tokens
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "unlimited".into()),
+                    budget_time_secs
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "unlimited".into()),
+                ),
+            );
+        }
+        SlashCommand::GoalStatus => match crate::goal_state::current() {
+            Some(g) => emit(events_tx, format_goal_status(&g)),
+            None => emit(
+                events_tx,
+                "no active goal — try /goal start \"<objective>\"".into(),
+            ),
+        },
+        SlashCommand::GoalShow => match crate::goal_state::current() {
+            Some(g) => emit(events_tx, format_goal_show(&g)),
+            None => emit(events_tx, "no active goal".into()),
+        },
+        SlashCommand::GoalContinue => {
+            // Handled in shared_session.rs::handle_line as a turn-rewrite
+            // BEFORE this dispatch is called (mirrors the
+            // KmsIngestSession pattern). If we reach here, the
+            // intercept missed for some reason — surface a clear error.
+            emit(
+                events_tx,
+                "/goal continue requires the agent loop — invoke from chat / CLI, \
+                 not via shell_dispatch directly."
+                    .into(),
+            );
+        }
+        SlashCommand::GoalComplete { reason } => {
+            if crate::goal_state::current().is_none() {
+                emit(events_tx, "no active goal".into());
+                return;
+            }
+            let r = reason.clone();
+            crate::goal_state::apply(|g| {
+                g.status = crate::goal_state::GoalStatus::Complete;
+                if let Some(r) = &r {
+                    g.last_message = Some(r.clone());
+                }
+                g.completed_at = Some(now_secs());
+                true
+            });
+            emit(events_tx, "goal marked complete".into());
+        }
+        SlashCommand::GoalAbandon { reason } => {
+            if crate::goal_state::current().is_none() {
+                emit(events_tx, "no active goal".into());
+                return;
+            }
+            let r = reason.clone();
+            crate::goal_state::apply(|g| {
+                g.status = crate::goal_state::GoalStatus::Abandoned;
+                if let Some(r) = &r {
+                    g.last_message = Some(r.clone());
+                }
+                g.completed_at = Some(now_secs());
+                true
+            });
+            emit(events_tx, "goal abandoned".into());
+        }
 
         // ─── sso (EE Phase 4) ───────────────────────────────────────
         SlashCommand::Sso { sub } => {
@@ -1333,6 +1589,13 @@ pub async fn dispatch(
                 state
                     .tool_registry
                     .register(std::sync::Arc::new(crate::tools::KmsSearchTool));
+                // M6.25 BUG #1: write tools alongside read tools.
+                state
+                    .tool_registry
+                    .register(std::sync::Arc::new(crate::tools::KmsWriteTool));
+                state
+                    .tool_registry
+                    .register(std::sync::Arc::new(crate::tools::KmsAppendTool));
                 state.rebuild_system_prompt();
                 if let Err(e) = state.rebuild_agent(true) {
                     emit(events_tx, format!("rebuild failed: {e}"));
@@ -1362,6 +1625,8 @@ pub async fn dispatch(
                 if state.config.kms_active.is_empty() {
                     state.tool_registry.remove("KmsRead");
                     state.tool_registry.remove("KmsSearch");
+                    state.tool_registry.remove("KmsWrite");
+                    state.tool_registry.remove("KmsAppend");
                 }
                 state.rebuild_system_prompt();
                 if let Err(e) = state.rebuild_agent(true) {
@@ -1413,15 +1678,168 @@ pub async fn dispatch(
             match crate::kms::ingest(&k, &source, alias.as_deref(), force) {
                 Ok(r) => {
                     let verb = if r.overwrote { "replaced" } else { "ingested" };
+                    let cascade = if r.cascaded > 0 {
+                        format!(" (marked {} dependent page(s) stale)", r.cascaded)
+                    } else {
+                        String::new()
+                    };
                     emit(
                         events_tx,
-                        format!("{verb} → {} — {}", r.target.display(), r.summary,),
+                        format!("{verb} → {} — {}{cascade}", r.target.display(), r.summary),
                     );
-                    // No kms_update broadcast — ingest doesn't change
-                    // the list of KMSes or their active state. The
-                    // index.md change is picked up on next /kms show.
                 }
                 Err(e) => emit(events_tx, format!("ingest failed: {e}")),
+            }
+        }
+        SlashCommand::KmsIngestUrl {
+            name,
+            url,
+            alias,
+            force,
+        } => {
+            // M6.25 BUG #8: URL ingest dispatches via async ingest_url.
+            let Some(k) = crate::kms::resolve(&name) else {
+                emit(events_tx, format!("no KMS named '{name}'"));
+                return;
+            };
+            match crate::kms::ingest_url(&k, &url, alias.as_deref(), force).await {
+                Ok(r) => {
+                    let verb = if r.overwrote { "replaced" } else { "ingested" };
+                    let cascade = if r.cascaded > 0 {
+                        format!(" (marked {} dependent page(s) stale)", r.cascaded)
+                    } else {
+                        String::new()
+                    };
+                    emit(
+                        events_tx,
+                        format!(
+                            "{verb} {url} → {} — {}{cascade}",
+                            r.target.display(),
+                            r.summary
+                        ),
+                    );
+                }
+                Err(e) => emit(events_tx, format!("url ingest failed: {e}")),
+            }
+        }
+        SlashCommand::KmsIngestPdf {
+            name,
+            file,
+            alias,
+            force,
+        } => {
+            // M6.25 BUG #8: PDF ingest via pdftotext.
+            let Some(k) = crate::kms::resolve(&name) else {
+                emit(events_tx, format!("no KMS named '{name}'"));
+                return;
+            };
+            let source = std::path::PathBuf::from(&file);
+            let source = if source.is_absolute() {
+                source
+            } else {
+                state.cwd.join(&source)
+            };
+            match crate::kms::ingest_pdf(&k, &source, alias.as_deref(), force).await {
+                Ok(r) => {
+                    let verb = if r.overwrote { "replaced" } else { "ingested" };
+                    let cascade = if r.cascaded > 0 {
+                        format!(" (marked {} dependent page(s) stale)", r.cascaded)
+                    } else {
+                        String::new()
+                    };
+                    emit(
+                        events_tx,
+                        format!(
+                            "{verb} {} → {} — {}{cascade}",
+                            source.display(),
+                            r.target.display(),
+                            r.summary
+                        ),
+                    );
+                }
+                Err(e) => emit(events_tx, format!("pdf ingest failed: {e}")),
+            }
+        }
+        SlashCommand::KmsIngestSession { name, .. } => {
+            // M6.28: handled in shared_session.rs::handle_line as a
+            // turn-rewrite BEFORE this dispatch is called, so this
+            // arm should be unreachable in normal flow. If it fires
+            // (e.g. somebody calls dispatch directly bypassing
+            // handle_line), surface a clear error rather than
+            // silently no-opping.
+            emit(
+                events_tx,
+                format!(
+                    "/kms ingest {name} $ requires the agent loop — invoke from chat / CLI, \
+                     not via shell_dispatch::dispatch directly."
+                ),
+            );
+        }
+        SlashCommand::KmsLint(name) => {
+            // M6.25 BUG #3: pure-read health check.
+            let Some(k) = crate::kms::resolve(&name) else {
+                emit(events_tx, format!("no KMS named '{name}'"));
+                return;
+            };
+            match crate::kms::lint(&k) {
+                Ok(report) => {
+                    emit(events_tx, format_lint_report(&name, &report));
+                }
+                Err(e) => emit(events_tx, format!("lint failed: {e}")),
+            }
+        }
+        SlashCommand::KmsFileAnswer { name, title } => {
+            // M6.25 BUG #4: file the latest assistant message into a KMS
+            // as a new page. Reads from the live session.
+            let Some(k) = crate::kms::resolve(&name) else {
+                emit(events_tx, format!("no KMS named '{name}'"));
+                return;
+            };
+            let answer = state
+                .session
+                .messages
+                .iter()
+                .rev()
+                .find(|m| matches!(m.role, crate::types::Role::Assistant))
+                .and_then(|m| {
+                    Some(
+                        m.content
+                            .iter()
+                            .filter_map(|b| match b {
+                                crate::types::ContentBlock::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n\n"),
+                    )
+                });
+            let Some(answer_text) = answer.filter(|s| !s.trim().is_empty()) else {
+                emit(
+                    events_tx,
+                    "no assistant message in session yet — nothing to file".into(),
+                );
+                return;
+            };
+            let stem = sanitize_alias_for_dispatch(&title);
+            if stem.is_empty() {
+                emit(events_tx, "title sanitises to empty — pick another".into());
+                return;
+            }
+            let body = format!("# {title}\n\n{answer_text}\n");
+            let mut fm = std::collections::BTreeMap::new();
+            fm.insert("category".into(), "answer".into());
+            fm.insert("filed_from".into(), "chat".into());
+            let serialized = crate::kms::write_frontmatter(&fm, &body);
+            match crate::kms::write_page(&k, &stem, &serialized) {
+                Ok(path) => emit(
+                    events_tx,
+                    format!(
+                        "filed answer → {} ({} bytes)",
+                        path.display(),
+                        serialized.len()
+                    ),
+                ),
+                Err(e) => emit(events_tx, format!("file-answer failed: {e}")),
             }
         }
 
@@ -1608,11 +2026,8 @@ pub async fn dispatch(
                     );
                     if let Ok(m) = plugin.manifest() {
                         if !m.mcp_servers.is_empty() {
-                            let mut names: Vec<&str> = m
-                                .mcp_servers
-                                .keys()
-                                .map(String::as_str)
-                                .collect();
+                            let mut names: Vec<&str> =
+                                m.mcp_servers.keys().map(String::as_str).collect();
                             names.sort();
                             note.push_str(&format!(
                                 "\n\n⚠  restart thClaws (/quit then relaunch) to spawn {} new MCP server(s): {}",
@@ -1696,7 +2111,8 @@ pub async fn dispatch(
                 Err(e) => emit(events_tx, format!("disable failed: {e}")),
             }
         }
-        SlashCommand::PluginShow { name } => match crate::plugins::find_installed_with_scope(&name) {
+        SlashCommand::PluginShow { name } => match crate::plugins::find_installed_with_scope(&name)
+        {
             Some((p, is_user)) => {
                 let status = if p.enabled { "enabled" } else { "disabled" };
                 let scope = if is_user { "user" } else { "project" };
@@ -2113,6 +2529,147 @@ fn broadcast_kms_update(events_tx: &broadcast::Sender<ViewEvent>) {
     let _ = events_tx.send(ViewEvent::KmsUpdate(payload.to_string()));
 }
 
+/// M6.25: human-readable lint summary for `/kms lint`.
+/// M6.29: helper for the `/loop` and `/goal` arms.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// M6.29: short status line for `/goal status`.
+fn format_goal_status(g: &crate::goal_state::GoalState) -> String {
+    let elapsed = g.time_used_secs();
+    let token_budget = g
+        .budget_tokens
+        .map(|n| format!("{}/{}", g.tokens_used, n))
+        .unwrap_or_else(|| format!("{} (unlimited)", g.tokens_used));
+    let last = g
+        .last_message
+        .as_deref()
+        .or(g.last_audit.as_deref())
+        .unwrap_or("(none)");
+    format!(
+        "goal status: {}\n  elapsed: {}s, iterations: {}, tokens: {}\n  objective: {}\n  last: {}",
+        g.status.as_str(),
+        elapsed,
+        g.iterations_done,
+        token_budget,
+        truncate_inline(&g.objective, 100),
+        truncate_inline(last, 200),
+    )
+}
+
+/// M6.29: full goal contents for `/goal show`.
+fn format_goal_show(g: &crate::goal_state::GoalState) -> String {
+    let mut out = format!(
+        "goal: {}\nstatus: {}\nstarted_at: {}\niterations_done: {}\ntokens_used: {}\n",
+        g.objective,
+        g.status.as_str(),
+        g.started_at,
+        g.iterations_done,
+        g.tokens_used,
+    );
+    if let Some(b) = g.budget_tokens {
+        out.push_str(&format!("budget_tokens: {b}\n"));
+    }
+    if let Some(b) = g.budget_time_secs {
+        out.push_str(&format!("budget_time_secs: {b}\n"));
+    }
+    if let Some(a) = &g.last_audit {
+        out.push_str(&format!("last_audit: {a}\n"));
+    }
+    if let Some(m) = &g.last_message {
+        out.push_str(&format!("last_message: {m}\n"));
+    }
+    if let Some(c) = g.completed_at {
+        out.push_str(&format!("completed_at: {c}\n"));
+    }
+    out
+}
+
+fn truncate_inline(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.replace('\n', " ")
+    } else {
+        let mut out: String = s.chars().take(max).collect();
+        out.push('…');
+        out.replace('\n', " ")
+    }
+}
+
+fn format_lint_report(name: &str, report: &crate::kms::LintReport) -> String {
+    let total = report.total_issues();
+    if total == 0 {
+        return format!("KMS '{name}': clean — no issues found.");
+    }
+    let mut out = format!("KMS '{name}': {total} issue(s)\n");
+    if !report.broken_links.is_empty() {
+        out.push_str(&format!(
+            "\nbroken links ({}):\n",
+            report.broken_links.len()
+        ));
+        for (page, target) in &report.broken_links {
+            out.push_str(&format!("  - {page} → pages/{target}.md (missing)\n"));
+        }
+    }
+    if !report.index_orphans.is_empty() {
+        out.push_str(&format!(
+            "\nindex entries with no underlying file ({}):\n",
+            report.index_orphans.len()
+        ));
+        for stem in &report.index_orphans {
+            out.push_str(&format!("  - {stem}\n"));
+        }
+    }
+    if !report.missing_in_index.is_empty() {
+        out.push_str(&format!(
+            "\npages missing from index ({}):\n",
+            report.missing_in_index.len()
+        ));
+        for stem in &report.missing_in_index {
+            out.push_str(&format!("  - {stem}\n"));
+        }
+    }
+    if !report.orphan_pages.is_empty() {
+        out.push_str(&format!(
+            "\norphan pages (no inbound links from other pages, {}):\n",
+            report.orphan_pages.len()
+        ));
+        for stem in &report.orphan_pages {
+            out.push_str(&format!("  - {stem}\n"));
+        }
+    }
+    if !report.missing_frontmatter.is_empty() {
+        out.push_str(&format!(
+            "\npages without YAML frontmatter ({}):\n",
+            report.missing_frontmatter.len()
+        ));
+        for stem in &report.missing_frontmatter {
+            out.push_str(&format!("  - {stem}\n"));
+        }
+    }
+    out
+}
+
+/// M6.25 BUG #4: alias-sanitizer used by /kms file-answer. Same rules
+/// as `kms::sanitize_alias` (which is private to that module).
+fn sanitize_alias_for_dispatch(raw: &str) -> String {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    cleaned.trim_matches('_').to_string()
+}
+
 /// Same shape as [`broadcast_kms_update`], for the MCP-server list. Read
 /// fresh from disk by `build_mcp_update_payload` so user-scope removals
 /// (which the live tool registry can't surgically reflect) at least
@@ -2161,4 +2718,3 @@ fn mcp_server_names(name: &str) -> Option<Vec<String>> {
     names.sort();
     Some(names)
 }
-

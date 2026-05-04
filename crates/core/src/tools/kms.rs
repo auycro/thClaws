@@ -1,8 +1,17 @@
-//! KMS read and search tools — pair with [`crate::kms`] to let the
-//! model pull in wiki pages and grep across them without embeddings.
+//! KMS read, search, write, and append tools — pair with [`crate::kms`]
+//! to let the model both consult AND maintain wiki pages without
+//! embeddings.
 //!
-//! Both tools resolve the `kms` argument via `kms::resolve`, which
+//! All tools resolve the `kms` argument via `kms::resolve`, which
 //! prefers a project-scope KMS over a user-scope one on name collision.
+//!
+//! M6.25 BUG #1: `KmsWrite` + `KmsAppend` deliberately bypass
+//! `Sandbox::check_write` to land inside the KMS root (project-scope
+//! `.thclaws/kms/.../pages/...` is otherwise blocked by the sandbox).
+//! Path safety is enforced at a finer grain via `kms::writable_page_path`,
+//! which validates the page name and canonicalizes it inside the
+//! resolved KMS pages dir. Same intentional carve-out pattern as
+//! TodoWrite's `.thclaws/todos.md` write.
 
 use super::{req_str, Tool};
 use crate::error::{Error, Result};
@@ -129,6 +138,116 @@ impl Tool for KmsSearchTool {
     }
 }
 
+/// M6.25 BUG #1: write a KMS page. Create-or-replace; if the content
+/// includes YAML frontmatter (`---\n...\n---\n`), it's preserved and
+/// `updated:` is bumped to today. New pages get `created:` stamped.
+/// Updates the index.md bullet and appends a `## [date] wrote | alias`
+/// log entry. Bypasses `Sandbox::check_write` for the KMS pages dir
+/// (validated by `kms::writable_page_path`).
+pub struct KmsWriteTool;
+
+#[async_trait]
+impl Tool for KmsWriteTool {
+    fn name(&self) -> &'static str {
+        "KmsWrite"
+    }
+
+    fn description(&self) -> &'static str {
+        "Create or replace a page in an attached knowledge base. Content \
+         may begin with YAML frontmatter (---\\n category: ... \\n---\\n) — \
+         it's preserved and `updated:` is bumped to today. Use for \
+         wiki maintenance: filing curated summaries, entity pages, \
+         cross-referenced concept pages."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "kms":     {"type": "string", "description": "KMS name (from the active list)"},
+                "page":    {"type": "string", "description": "Page name (with or without .md). No path separators."},
+                "content": {"type": "string", "description": "Full page content; may include YAML frontmatter."}
+            },
+            "required": ["kms", "page", "content"]
+        })
+    }
+
+    fn requires_approval(&self, _input: &Value) -> bool {
+        true
+    }
+
+    async fn call(&self, input: Value) -> Result<String> {
+        let kms_name = req_str(&input, "kms")?;
+        let page = req_str(&input, "page")?;
+        let content = req_str(&input, "content")?;
+        let Some(kref) = crate::kms::resolve(kms_name) else {
+            return Err(Error::Tool(format!(
+                "no KMS named '{kms_name}' (check /kms list)"
+            )));
+        };
+        let path = crate::kms::write_page(&kref, page, content)?;
+        Ok(format!(
+            "wrote {} ({} bytes)",
+            path.display(),
+            content.len()
+        ))
+    }
+}
+
+/// M6.25 BUG #1: append to a KMS page. If the page exists with
+/// frontmatter, only the body grows and `updated:` bumps. If no
+/// frontmatter, plain append. If the page doesn't exist, creates it
+/// with the given content (no frontmatter — model can rewrite via
+/// KmsWrite to add metadata).
+pub struct KmsAppendTool;
+
+#[async_trait]
+impl Tool for KmsAppendTool {
+    fn name(&self) -> &'static str {
+        "KmsAppend"
+    }
+
+    fn description(&self) -> &'static str {
+        "Append content to a page in an attached knowledge base. \
+         Faster than KmsWrite for incremental updates (logs, journal \
+         entries, accumulating notes). Bumps `updated:` if the page \
+         already has frontmatter."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "kms":     {"type": "string", "description": "KMS name"},
+                "page":    {"type": "string", "description": "Page name (with or without .md)"},
+                "content": {"type": "string", "description": "Text chunk to append"}
+            },
+            "required": ["kms", "page", "content"]
+        })
+    }
+
+    fn requires_approval(&self, _input: &Value) -> bool {
+        true
+    }
+
+    async fn call(&self, input: Value) -> Result<String> {
+        let kms_name = req_str(&input, "kms")?;
+        let page = req_str(&input, "page")?;
+        let content = req_str(&input, "content")?;
+        let Some(kref) = crate::kms::resolve(kms_name) else {
+            return Err(Error::Tool(format!(
+                "no KMS named '{kms_name}' (check /kms list)"
+            )));
+        };
+        let path = crate::kms::append_to_page(&kref, page, content)?;
+        Ok(format!(
+            "appended {} bytes to {}",
+            content.len(),
+            path.display()
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +353,83 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, "");
+    }
+
+    // ─── M6.25 BUG #1: write/append tools ─────────────────────────────────
+
+    #[tokio::test]
+    async fn write_tool_creates_page_with_stamps() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        let result = KmsWriteTool
+            .call(json!({
+                "kms": "nb",
+                "page": "topic",
+                "content": "# Topic\n\nFresh page.\n"
+            }))
+            .await
+            .unwrap();
+        assert!(result.contains("wrote"));
+        let raw = std::fs::read_to_string(k.pages_dir().join("topic.md")).unwrap();
+        let (fm, body) = crate::kms::parse_frontmatter(&raw);
+        assert!(fm.contains_key("created"));
+        assert!(fm.contains_key("updated"));
+        assert!(body.contains("Fresh page."));
+    }
+
+    #[tokio::test]
+    async fn write_tool_unknown_kms_errors() {
+        let _home = scoped_home();
+        let err = KmsWriteTool
+            .call(json!({"kms": "nope", "page": "x", "content": "y"}))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("no KMS"));
+    }
+
+    #[tokio::test]
+    async fn write_tool_rejects_traversal() {
+        let _home = scoped_home();
+        create("nb", KmsScope::Project).unwrap();
+        let err = KmsWriteTool
+            .call(json!({
+                "kms": "nb",
+                "page": "../escape",
+                "content": "evil"
+            }))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("invalid page name") || format!("{err}").contains(".."));
+    }
+
+    #[tokio::test]
+    async fn append_tool_creates_then_extends() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        // First call creates with bare body.
+        KmsAppendTool
+            .call(json!({"kms": "nb", "page": "log", "content": "line one\n"}))
+            .await
+            .unwrap_err(); // "log" is reserved
+        KmsAppendTool
+            .call(json!({"kms": "nb", "page": "journal", "content": "line one\n"}))
+            .await
+            .unwrap();
+        KmsAppendTool
+            .call(json!({"kms": "nb", "page": "journal", "content": "line two\n"}))
+            .await
+            .unwrap();
+        let raw = std::fs::read_to_string(k.pages_dir().join("journal.md")).unwrap();
+        assert!(raw.contains("line one"));
+        assert!(raw.contains("line two"));
+    }
+
+    #[tokio::test]
+    async fn write_and_append_require_approval() {
+        let _home = scoped_home();
+        // Approval defaults are read off the trait; write tools must
+        // require approval (they mutate disk) — same posture as Write.
+        assert!(KmsWriteTool.requires_approval(&json!({})));
+        assert!(KmsAppendTool.requires_approval(&json!({})));
     }
 }

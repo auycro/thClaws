@@ -417,17 +417,21 @@ impl Provider for OpenAIProvider {
         let raw_dump = super::RawDump::new(format!("openai {}", req.model));
 
         let event_stream = try_stream! {
-            let mut buffer = String::new();
+            // M6.21 BUG H1: buffer raw bytes so UTF-8 chars don't get
+            // corrupted at chunk boundaries. See providers::find_bytes
+            // doc comment for full bug description.
+            let mut buffer: Vec<u8> = Vec::new();
             let mut byte_stream = Box::pin(byte_stream);
             let mut state = ParseState::default();
             let mut raw = raw_dump;
 
             while let Some(chunk) = byte_stream.next().await {
                 let chunk = chunk.map_err(|e| Error::Provider(format!("stream: {e}")))?;
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                buffer.extend_from_slice(&chunk);
 
-                while let Some(boundary) = buffer.find("\n\n") {
-                    let event_text: String = buffer.drain(..boundary + 2).collect();
+                while let Some(boundary) = super::find_bytes(&buffer, b"\n\n") {
+                    let event_bytes: Vec<u8> = buffer.drain(..boundary + 2).collect();
+                    let event_text = String::from_utf8_lossy(&event_bytes);
                     let trimmed = event_text.trim_end_matches('\n');
                     for event in parse_chunk(trimmed, &mut state)? {
                         if let ProviderEvent::TextDelta(ref s) = event { raw.push(s); }
@@ -471,14 +475,43 @@ fn parse_openai_usage(v: &Value) -> Option<Usage> {
         .get("completion_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    if input == 0 && output == 0 {
+    // M6.22 BUG G1+G4: surface server-side prompt cache stats. OpenAI's
+    // auto-cache reports the cached portion under
+    // `usage.prompt_tokens_details.cached_tokens` (subset of
+    // `prompt_tokens`). DeepSeek went their own way with
+    // `prompt_cache_hit_tokens` (also subset of `prompt_tokens`).
+    // Defensive dual-check: try the OpenAI shape first, fall back to
+    // DeepSeek's. No provider should expose both with conflicting
+    // meanings, so the precedence is safe.
+    let cached = u
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| u.get("prompt_cache_hit_tokens").and_then(Value::as_u64));
+    // Early-return guards against the trailing-usage-frame where both
+    // counts are 0 — but if a fully-cached prompt arrives (cached > 0
+    // even when uncached input == 0), keep the frame so the cache hit
+    // is surfaced.
+    if input == 0 && output == 0 && cached.unwrap_or(0) == 0 {
         return None;
     }
+    // M6.22: subtract cached portion from input_tokens so the per-turn
+    // pill and daily-totals math match Anthropic's semantics:
+    //   total billable input = input_tokens (uncached new) + cache_read_input_tokens (cached)
+    // OpenAI's wire format reports `prompt_tokens` as the FULL prompt
+    // (cached + uncached), so we subtract `cached_tokens` here to get
+    // the uncached portion. Without this, `usage.rs::record` would
+    // double-count: input += 5000 AND cache_read += 4500 = 9500
+    // contribution from a turn that actually consumed 5000 tokens.
+    let cached_count = cached.unwrap_or(0);
+    let uncached_input = input.saturating_sub(cached_count);
     Some(Usage {
-        input_tokens: input as u32,
+        input_tokens: uncached_input as u32,
         output_tokens: output as u32,
+        // OpenAI doesn't separate writes from reads (auto-managed; the
+        // user pays the write premium silently the first time). Map
+        // cached → cache_read; leave cache_creation as None.
         cache_creation_input_tokens: None,
-        cache_read_input_tokens: None,
+        cache_read_input_tokens: cached.map(|v| v as u32),
     })
 }
 
@@ -614,16 +647,16 @@ pub fn parse_chunk(raw: &str, state: &mut ParseState) -> Result<Vec<ProviderEven
         state.emitted_message_stop = true;
     }
 
-    // With stream_options.include_usage, a final chunk has usage but empty choices.
-    // Emit a MessageStop with usage if we already emitted one without.
-    if state.emitted_message_stop {
-        if let Some(usage) = parse_openai_usage(&v) {
-            out.push(ProviderEvent::MessageStop {
-                stop_reason: Some("stop".into()),
-                usage: Some(usage),
-            });
-        }
-    }
+    // M6.21 BUG M2: the trailing-usage-frame guard at the top of the
+    // function (when `choices` is missing/empty) handles the standard
+    // OpenAI shape where usage arrives in a separate frame. The
+    // duplicate guard that USED to live here also fired when
+    // `finish_reason` and `usage` arrived in the SAME chunk (some
+    // OpenAI-compat aggregators consolidate them) — emitting a second
+    // MessageStop with the same usage values, which the agent loop's
+    // `cumulative_usage.accumulate` then double-counted. Removed.
+    // The trailing-usage-frame case is exclusively the empty-choices
+    // path above.
 
     Ok(out)
 }
@@ -731,6 +764,114 @@ mod tests {
         );
         assert_eq!(usage_stops[0].input_tokens, 11);
         assert_eq!(usage_stops[0].output_tokens, 3);
+    }
+
+    /// M6.22 BUG G1: surface OpenAI's auto-prompt-cache stats. Pre-fix
+    /// `parse_openai_usage` hardcoded `cache_read_input_tokens: None`,
+    /// hiding the cached-portion of `prompt_tokens` from the per-turn
+    /// pill and daily totals even though OpenAI was applying the 50%
+    /// discount server-side. Verify `usage.prompt_tokens_details.cached_tokens`
+    /// is parsed.
+    #[test]
+    fn parse_openai_usage_reads_cached_tokens_from_prompt_tokens_details() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"usage": {
+                "prompt_tokens": 5000,
+                "completion_tokens": 200,
+                "prompt_tokens_details": {"cached_tokens": 4500}
+            }}"#,
+        )
+        .unwrap();
+        let u = parse_openai_usage(&v).expect("usage parsed");
+        assert_eq!(u.input_tokens, 500, "uncached portion (5000 - 4500)");
+        assert_eq!(u.output_tokens, 200);
+        assert_eq!(u.cache_read_input_tokens, Some(4500));
+        assert_eq!(u.cache_creation_input_tokens, None);
+    }
+
+    /// M6.22 BUG G4: DeepSeek uses `prompt_cache_hit_tokens` instead of
+    /// OpenAI's `prompt_tokens_details.cached_tokens`. Defensive
+    /// dual-check in `parse_openai_usage` should catch both since
+    /// DeepSeek routes through `OpenAIProvider`.
+    #[test]
+    fn parse_openai_usage_reads_deepseek_prompt_cache_hit_tokens() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"usage": {
+                "prompt_tokens": 5000,
+                "prompt_cache_hit_tokens": 4500,
+                "prompt_cache_miss_tokens": 500,
+                "completion_tokens": 200
+            }}"#,
+        )
+        .unwrap();
+        let u = parse_openai_usage(&v).expect("usage parsed");
+        assert_eq!(u.input_tokens, 500);
+        assert_eq!(u.output_tokens, 200);
+        assert_eq!(u.cache_read_input_tokens, Some(4500));
+    }
+
+    /// Edge case from M6.22 audit: a fully-cached prompt where uncached
+    /// input is 0 but cached is non-zero must still surface (don't
+    /// trigger the trailing-usage-frame None guard).
+    #[test]
+    fn parse_openai_usage_surfaces_fully_cached_prompts() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"usage": {
+                "prompt_tokens": 4500,
+                "completion_tokens": 0,
+                "prompt_tokens_details": {"cached_tokens": 4500}
+            }}"#,
+        )
+        .unwrap();
+        let u = parse_openai_usage(&v).expect("usage with all-cached input must surface");
+        assert_eq!(u.cache_read_input_tokens, Some(4500));
+    }
+
+    /// Old behavior preserved: a usage frame with no token counts at
+    /// all returns None (the trailing-empty-frame case stays guarded).
+    #[test]
+    fn parse_openai_usage_returns_none_on_truly_empty_frame() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"usage": {"prompt_tokens": 0, "completion_tokens": 0}}"#)
+                .unwrap();
+        assert!(parse_openai_usage(&v).is_none());
+    }
+
+    /// M6.21 BUG M2: when a chunk contains BOTH `finish_reason` (on a
+    /// non-empty `choices` entry) AND a top-level `usage` object — as
+    /// some OpenAI-compat aggregators (LiteLLM, OpenRouter forks) emit
+    /// — pre-fix the parser fired TWO `MessageStop` events with the
+    /// same usage values, which the agent's `cumulative_usage.accumulate`
+    /// then double-counted. Verify only ONE MessageStop comes out.
+    #[test]
+    fn finish_reason_with_inline_usage_does_not_double_emit_message_stop() {
+        let events = parse_all(&[
+            "data: {\"id\":\"1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}",
+            // Single chunk consolidating finish_reason AND usage:
+            "data: {\"id\":\"1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}",
+            "data: [DONE]",
+        ]);
+
+        let stops: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, ProviderEvent::MessageStop { .. }))
+            .collect();
+        assert_eq!(
+            stops.len(),
+            1,
+            "expected exactly one MessageStop, got {}: {:?}",
+            stops.len(),
+            stops
+        );
+        match stops[0] {
+            ProviderEvent::MessageStop { stop_reason, usage } => {
+                assert_eq!(stop_reason.as_deref(), Some("stop"));
+                let u = usage.as_ref().expect("usage should be present");
+                assert_eq!(u.input_tokens, 10);
+                assert_eq!(u.output_tokens, 5);
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]

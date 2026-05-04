@@ -17,11 +17,40 @@
 
 use crate::error::{Error, Result};
 use crate::types::Message;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// M6.24 BUG M4: serialize concurrent JSONL writes via OS-level
+/// advisory file lock. Pre-fix two thClaws processes against the
+/// same project session dir could interleave bytes mid-line because
+/// POSIX `O_APPEND` is per-write atomic only ≤ PIPE_BUF (~4 KB);
+/// tool_use lines with large content easily exceed that. With M6.19
+/// H1's per-line skip-with-warning fix in place, the practical
+/// impact dropped from "session disappears" to "occasional warning
+/// + dropped corrupt line" — but corrupt lines are still corrupt
+/// data. Locking eliminates the interleave entirely. Acquire
+/// exclusive lock before each write; release at scope end via Drop.
+fn append_locked<F>(path: &Path, write: F) -> Result<()>
+where
+    F: FnOnce(&mut File) -> std::io::Result<()>,
+{
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    // `lock_exclusive` blocks until acquired. Cheap on uncontested
+    // path (single process). On contention, waits for the other
+    // process's append to complete.
+    file.lock_exclusive()
+        .map_err(|e| Error::Config(format!("session lock: {e}")))?;
+    let result = write(&mut file);
+    // Best-effort unlock — file's Drop closes the fd which also
+    // releases the lock per POSIX flock semantics, so if unlock
+    // fails we still don't deadlock the next writer.
+    let _ = file.unlock();
+    result.map_err(Error::from)
+}
 
 /// JSONL header line written once when a session is first created.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,11 +203,17 @@ impl Session {
             std::fs::create_dir_all(parent)?;
         }
         let needs_header = !path.exists()
-            || std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true);
+            || std::fs::metadata(path)
+                .map(|m| m.len() == 0)
+                .unwrap_or(true);
         if !needs_header {
             return Ok(());
         }
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        // M6.24 BUG M4: lock the file across the empty-check + write
+        // window. Without the lock, two processes could both observe
+        // empty and both write the header line — double header. With
+        // the lock, the second writer sees the file non-empty after
+        // the first releases.
         let header = SessionHeader {
             kind: "header".into(),
             id: self.id.clone(),
@@ -187,8 +222,16 @@ impl Session {
             created_at: self.created_at,
         };
         let line = serde_json::to_string(&header)?;
-        writeln!(file, "{}", line)?;
-        Ok(())
+        append_locked(path, |file| {
+            // Re-check under lock — could have been written by another
+            // process between our metadata check and the lock acquisition.
+            let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            if len > 0 {
+                return Ok(());
+            }
+            writeln!(file, "{}", line)?;
+            Ok(())
+        })
     }
 
     /// Append only the new messages (since `last_saved_count`) to the JSONL file.
@@ -198,11 +241,10 @@ impl Session {
             std::fs::create_dir_all(parent)?;
         }
 
-        let file_exists = path.exists();
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-
-        // Write header if this is a new file.
-        if !file_exists {
+        // Pre-build event payloads outside the lock so the critical
+        // section is just I/O. M6.24 BUG M4: serialize concurrent
+        // appenders (CLI + GUI in same project, two GUIs, etc.).
+        let header_line = if !path.exists() {
             let header = SessionHeader {
                 kind: "header".into(),
                 id: self.id.clone(),
@@ -210,13 +252,14 @@ impl Session {
                 cwd: self.cwd.clone(),
                 created_at: self.created_at,
             };
-            let line = serde_json::to_string(&header)?;
-            writeln!(file, "{}", line)?;
-        }
+            Some(serde_json::to_string(&header)?)
+        } else {
+            None
+        };
 
-        // Append only unsaved messages.
         let new_messages = &self.messages[self.last_saved_count..];
         let now = now_secs();
+        let mut event_lines: Vec<String> = Vec::with_capacity(new_messages.len());
         for msg in new_messages {
             let role_str = match msg.role {
                 crate::types::Role::User => "user",
@@ -228,9 +271,26 @@ impl Session {
                 content: msg.content.clone(),
                 timestamp: now,
             };
-            let line = serde_json::to_string(&event)?;
-            writeln!(file, "{}", line)?;
+            event_lines.push(serde_json::to_string(&event)?);
         }
+
+        append_locked(path, |file| {
+            // Re-check under lock for header write — another process may
+            // have created + headered the file between our `path.exists()`
+            // check and the lock acquisition.
+            if header_line.is_some() {
+                let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+                if len == 0 {
+                    if let Some(ref h) = header_line {
+                        writeln!(file, "{}", h)?;
+                    }
+                }
+            }
+            for line in &event_lines {
+                writeln!(file, "{}", line)?;
+            }
+            Ok(())
+        })?;
 
         self.last_saved_count = self.messages.len();
         Ok(())
@@ -255,7 +315,170 @@ impl Session {
         Ok(())
     }
 
+    /// Load only the metadata (id, model, title, message count, last
+    /// activity timestamp) from a JSONL file. Streams the file
+    /// line-by-line WITHOUT keeping message bodies in memory — used by
+    /// `SessionStore::list()` to render the sidebar without paying for
+    /// full deserialization of every session's history.
+    ///
+    /// M6.24 BUG M3: pre-fix `SessionStore::list()` called `load_from`
+    /// for every session, which deserialized every message body into
+    /// `Vec<Message>` just to count them and grab the last timestamp.
+    /// For a project with hundreds of sessions of multi-MB JSONL each,
+    /// the sidebar refresh read + parsed hundreds of MB on every
+    /// `SessionListRefresh`. Streaming meta-only avoids the body
+    /// deserialization entirely; we just keep a running count + the
+    /// most recent message timestamp.
+    ///
+    /// Same per-line skip-with-warning behavior as `load_from` (corrupt
+    /// lines logged + skipped). Same headerless-file salvage path.
+    pub fn load_meta_from(path: &Path) -> Result<SessionMeta> {
+        let file = std::fs::File::open(path)?;
+        let reader = BufReader::new(file);
+
+        let mut header: Option<SessionHeader> = None;
+        let mut last_timestamp = 0u64;
+        let mut title: Option<String> = None;
+        let mut message_count = 0usize;
+        let mut skipped = 0usize;
+
+        for line_result in reader.lines() {
+            let line = match line_result {
+                Ok(l) => l,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            // Parse only the discriminator + the few fields we care
+            // about. Avoid `from_value::<MessageEvent>` because that
+            // would deserialize the full content vec.
+            let val: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let kind = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+            match kind {
+                "header" => {
+                    if let Ok(h) = serde_json::from_value::<SessionHeader>(val) {
+                        header = Some(h);
+                    } else {
+                        skipped += 1;
+                    }
+                }
+                "rename" => {
+                    if let Some(ts) = val.get("timestamp").and_then(|v| v.as_u64()) {
+                        if ts > last_timestamp {
+                            last_timestamp = ts;
+                        }
+                    }
+                    let t = val
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    title = if t.is_empty() {
+                        None
+                    } else {
+                        Some(t.to_string())
+                    };
+                }
+                "compaction" => {
+                    if let Some(ts) = val.get("timestamp").and_then(|v| v.as_u64()) {
+                        if ts > last_timestamp {
+                            last_timestamp = ts;
+                        }
+                    }
+                    // Reset count to whatever the checkpoint contains —
+                    // matches load_from's behavior.
+                    message_count = val
+                        .get("messages")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                }
+                "plan_snapshot" => {
+                    // Per M6.16.1: do NOT bump last_timestamp from
+                    // plan_snapshot events (restore-on-load fires the
+                    // broadcaster which writes a fresh snapshot —
+                    // not user activity).
+                }
+                "user" | "assistant" | "system" => {
+                    if let Some(ts) = val.get("timestamp").and_then(|v| v.as_u64()) {
+                        if ts > last_timestamp {
+                            last_timestamp = ts;
+                        }
+                    }
+                    message_count += 1;
+                }
+                _ => {
+                    skipped += 1;
+                }
+            }
+        }
+
+        if skipped > 0 {
+            eprintln!(
+                "\x1b[33m[session] {}: meta scan skipped {skipped} corrupt line(s)\x1b[0m",
+                path.display()
+            );
+        }
+
+        // Headerless-file salvage path — mirrors load_from.
+        let h = header.unwrap_or_else(|| {
+            let id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let created_at = std::fs::metadata(path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            SessionHeader {
+                kind: "header".into(),
+                id,
+                model: "unknown".into(),
+                cwd: String::new(),
+                created_at,
+            }
+        });
+
+        Ok(SessionMeta {
+            id: h.id,
+            updated_at: if last_timestamp > 0 {
+                last_timestamp
+            } else {
+                h.created_at
+            },
+            model: h.model,
+            message_count,
+            title,
+        })
+    }
+
     /// Load a session from a JSONL file. Reads the header + all message events.
+    ///
+    /// M6.19 BUG H1: per-line errors (malformed JSON, invalid UTF-8,
+    /// unknown role, mid-write fragments from disk-full / kill -9 /
+    /// cross-process race) are now logged + skipped instead of failing
+    /// the entire load. Pre-fix a single corrupt line silently dropped
+    /// the whole session from `SessionStore::list()` (which catches the
+    /// load Err and skips), making sessions invisible in the sidebar
+    /// with no surface to the user. Skip-with-warning preserves every
+    /// recoverable message; the warning goes to stderr so it's
+    /// debuggable but doesn't block the user.
     pub fn load_from(path: &Path) -> Result<Self> {
         let file = std::fs::File::open(path)?;
         let reader = BufReader::new(file);
@@ -265,38 +488,69 @@ impl Session {
         let mut last_timestamp = 0u64;
         let mut title: Option<String> = None;
         let mut plan: Option<crate::tools::plan_state::Plan> = None;
+        let mut skipped: usize = 0;
 
         for (line_num, line_result) in reader.lines().enumerate() {
-            let line = line_result?;
+            let line = match line_result {
+                Ok(l) => l,
+                Err(e) => {
+                    // Invalid UTF-8 or other I/O error mid-stream.
+                    // Skip the line and keep going.
+                    eprintln!(
+                        "\x1b[33m[session] {}:{}: skipping corrupt line ({e})\x1b[0m",
+                        path.display(),
+                        line_num + 1
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            };
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
 
-            let val: serde_json::Value = serde_json::from_str(line).map_err(|e| {
-                Error::Config(format!(
-                    "session parse ({}:{}): {e}",
-                    path.display(),
-                    line_num + 1
-                ))
-            })?;
+            let val: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "\x1b[33m[session] {}:{}: skipping malformed JSON ({e})\x1b[0m",
+                        path.display(),
+                        line_num + 1
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            };
 
             let kind = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
             if kind == "header" {
-                let h: SessionHeader = serde_json::from_value(val).map_err(|e| {
-                    Error::Config(format!("session header parse ({}): {e}", path.display()))
-                })?;
-                header = Some(h);
+                match serde_json::from_value::<SessionHeader>(val) {
+                    Ok(h) => header = Some(h),
+                    Err(e) => {
+                        eprintln!(
+                            "\x1b[33m[session] {}:{}: skipping malformed header ({e})\x1b[0m",
+                            path.display(),
+                            line_num + 1
+                        );
+                        skipped += 1;
+                    }
+                }
             } else if kind == "rename" {
                 // Latest rename wins.
-                let ev: RenameEvent = serde_json::from_value(val).map_err(|e| {
-                    Error::Config(format!(
-                        "session rename parse ({}:{}): {e}",
-                        path.display(),
-                        line_num + 1
-                    ))
-                })?;
+                let ev: RenameEvent = match serde_json::from_value(val) {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        eprintln!(
+                            "\x1b[33m[session] {}:{}: skipping malformed rename ({e})\x1b[0m",
+                            path.display(),
+                            line_num + 1
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                };
                 if ev.timestamp > last_timestamp {
                     last_timestamp = ev.timestamp;
                 }
@@ -320,26 +574,36 @@ impl Session {
                 // just-clicked session to the top, masking the actual
                 // recency ordering. Sort recency now tracks real
                 // message / rename / compaction events only.
-                let ev: PlanSnapshotEvent = serde_json::from_value(val).map_err(|e| {
-                    Error::Config(format!(
-                        "session plan_snapshot parse ({}:{}): {e}",
-                        path.display(),
-                        line_num + 1
-                    ))
-                })?;
+                let ev: PlanSnapshotEvent = match serde_json::from_value(val) {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        eprintln!(
+                            "\x1b[33m[session] {}:{}: skipping malformed plan_snapshot ({e})\x1b[0m",
+                            path.display(),
+                            line_num + 1
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                };
                 plan = ev.plan;
             } else if kind == "compaction" {
                 // Replay checkpoint: everything accumulated so far is
                 // archived-on-disk but gets replaced in memory by the
                 // checkpoint's messages. Later `message` events in
                 // the same file still append after this point.
-                let ev: CompactionEvent = serde_json::from_value(val).map_err(|e| {
-                    Error::Config(format!(
-                        "session compaction parse ({}:{}): {e}",
-                        path.display(),
-                        line_num + 1
-                    ))
-                })?;
+                let ev: CompactionEvent = match serde_json::from_value(val) {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        eprintln!(
+                            "\x1b[33m[session] {}:{}: skipping malformed compaction ({e})\x1b[0m",
+                            path.display(),
+                            line_num + 1
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                };
                 if ev.timestamp > last_timestamp {
                     last_timestamp = ev.timestamp;
                 }
@@ -350,11 +614,13 @@ impl Session {
                         "assistant" => crate::types::Role::Assistant,
                         "system" => crate::types::Role::System,
                         other => {
-                            return Err(Error::Config(format!(
-                                "session compaction ({}:{}): unknown role '{other}'",
+                            eprintln!(
+                                "\x1b[33m[session] {}:{}: dropping compaction message with unknown role '{other}'\x1b[0m",
                                 path.display(),
                                 line_num + 1
-                            )))
+                            );
+                            skipped += 1;
+                            continue;
                         }
                     };
                     messages.push(Message {
@@ -364,24 +630,31 @@ impl Session {
                 }
             } else {
                 // Message event line
-                let event: MessageEvent = serde_json::from_value(val).map_err(|e| {
-                    Error::Config(format!(
-                        "session event parse ({}:{}): {e}",
-                        path.display(),
-                        line_num + 1
-                    ))
-                })?;
+                let event: MessageEvent = match serde_json::from_value(val) {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        eprintln!(
+                            "\x1b[33m[session] {}:{}: skipping malformed message event ({e})\x1b[0m",
+                            path.display(),
+                            line_num + 1
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                };
 
                 let role = match event.kind.as_str() {
                     "user" => crate::types::Role::User,
                     "assistant" => crate::types::Role::Assistant,
                     "system" => crate::types::Role::System,
                     other => {
-                        return Err(Error::Config(format!(
-                            "session parse ({}:{}): unknown message type '{other}'",
+                        eprintln!(
+                            "\x1b[33m[session] {}:{}: skipping message with unknown role '{other}'\x1b[0m",
                             path.display(),
                             line_num + 1
-                        )))
+                        );
+                        skipped += 1;
+                        continue;
                     }
                 };
 
@@ -394,6 +667,13 @@ impl Session {
                     content: event.content,
                 });
             }
+        }
+
+        if skipped > 0 {
+            eprintln!(
+                "\x1b[33m[session] {}: loaded with {skipped} corrupt line(s) skipped\x1b[0m",
+                path.display()
+            );
         }
 
         // Salvage headerless files (legacy / pre-fix sessions where
@@ -454,7 +734,6 @@ impl Session {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         let compacted_payload: Vec<CompactedMessage> = compacted
             .iter()
             .map(|m| CompactedMessage {
@@ -473,7 +752,9 @@ impl Session {
             timestamp: now_secs(),
         };
         let line = serde_json::to_string(&event)?;
-        writeln!(file, "{}", line)?;
+        // M6.24 BUG M4: lock the write so a concurrent appender from
+        // another process can't interleave bytes mid-line.
+        append_locked(path, |file| writeln!(file, "{}", line))?;
         // Drop the in-memory history down to the compacted view so
         // subsequent `append_to` calls start fresh at index 0 and only
         // append new turns produced *after* the checkpoint.
@@ -489,15 +770,33 @@ impl Session {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        let trimmed = title.trim();
+        // M6.19 BUG L1+L5: strip control characters (newlines, tabs,
+        // CR, NUL, etc.) from titles. JSON escapes them on write so
+        // persistence is fine, but a UI rendering the title raw could
+        // break layout (a `\n` in a title would split the sidebar
+        // entry across two lines). Convert tabs / newlines to spaces
+        // to keep the user's intended segmentation, then drop other
+        // control chars entirely. Trim leading/trailing whitespace
+        // afterward in case the substitution produced new outer
+        // whitespace.
+        let sanitized: String = title
+            .chars()
+            .map(|c| match c {
+                '\n' | '\r' | '\t' => ' ',
+                c if c.is_control() => '\0',
+                c => c,
+            })
+            .filter(|&c| c != '\0')
+            .collect();
+        let trimmed = sanitized.trim();
         let event = RenameEvent {
             kind: "rename".into(),
             title: trimmed.to_string(),
             timestamp: now_secs(),
         };
         let line = serde_json::to_string(&event)?;
-        writeln!(file, "{}", line)?;
+        // M6.24 BUG M4: lock the write.
+        append_locked(path, |file| writeln!(file, "{}", line))?;
         self.title = if trimmed.is_empty() {
             None
         } else {
@@ -520,15 +819,14 @@ pub fn append_plan_snapshot(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     let event = PlanSnapshotEvent {
         kind: "plan_snapshot".into(),
         plan: plan.cloned(),
         timestamp: now_secs(),
     };
     let line = serde_json::to_string(&event)?;
-    writeln!(file, "{}", line)?;
-    Ok(())
+    // M6.24 BUG M4: lock the write.
+    append_locked(path, |file| writeln!(file, "{}", line))
 }
 
 /// Directory-backed store for sessions.
@@ -684,6 +982,13 @@ impl SessionStore {
 
     /// List saved sessions, newest first. Returns an empty vec when the
     /// store directory doesn't exist yet.
+    ///
+    /// M6.24 BUG M3: uses `Session::load_meta_from` (streaming, no
+    /// message-body deserialization) instead of `load_from`. For a
+    /// project with hundreds of sessions of multi-MB each, this drops
+    /// `SessionListRefresh` from "read + parse all message bodies"
+    /// (potentially hundreds of MB) to "stream + count" (a few KB of
+    /// headers + timestamps).
     pub fn list(&self) -> Result<Vec<SessionMeta>> {
         if !self.root.exists() {
             return Ok(Vec::new());
@@ -694,14 +999,8 @@ impl SessionStore {
             if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
                 continue;
             }
-            if let Ok(s) = Session::load_from(&path) {
-                out.push(SessionMeta {
-                    id: s.id,
-                    updated_at: s.updated_at,
-                    model: s.model,
-                    message_count: s.messages.len(),
-                    title: s.title,
-                });
+            if let Ok(meta) = Session::load_meta_from(&path) {
+                out.push(meta);
             }
         }
         out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -915,6 +1214,155 @@ mod tests {
         assert_eq!(metas[0].model, "gpt-4o");
     }
 
+    /// M6.24 BUG M3: `load_meta_from` must produce the same metadata
+    /// as `load_from` -> SessionMeta but WITHOUT keeping message
+    /// bodies in memory. Verify equivalence on a representative
+    /// session with multiple message events, a rename, and a
+    /// compaction.
+    #[test]
+    fn load_meta_from_matches_load_from_metadata() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sess-meta.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"header","id":"sess-meta","model":"claude-sonnet-4-5","cwd":"/tmp","created_at":1000}"#,
+                "\n",
+                r#"{"type":"user","content":[{"type":"text","text":"q1"}],"timestamp":1100}"#,
+                "\n",
+                r#"{"type":"assistant","content":[{"type":"text","text":"a1"}],"timestamp":1200}"#,
+                "\n",
+                r#"{"type":"rename","title":"my session","timestamp":1250}"#,
+                "\n",
+                r#"{"type":"user","content":[{"type":"text","text":"q2"}],"timestamp":1300}"#,
+                "\n",
+                r#"{"type":"plan_snapshot","plan":null,"timestamp":99999}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let full = Session::load_from(&path).unwrap();
+        let full_meta = SessionMeta {
+            id: full.id.clone(),
+            updated_at: full.updated_at,
+            model: full.model.clone(),
+            message_count: full.messages.len(),
+            title: full.title.clone(),
+        };
+
+        let streamed = Session::load_meta_from(&path).unwrap();
+
+        assert_eq!(streamed, full_meta, "streamed meta must match full load");
+        assert_eq!(streamed.id, "sess-meta");
+        assert_eq!(streamed.model, "claude-sonnet-4-5");
+        assert_eq!(streamed.message_count, 3);
+        assert_eq!(streamed.title.as_deref(), Some("my session"));
+        // plan_snapshot's 99999 timestamp must NOT bump updated_at —
+        // M6.16.1 fix preserved.
+        assert_eq!(streamed.updated_at, 1300);
+    }
+
+    /// M6.24 BUG M3: load_meta_from of a compacted session reports
+    /// the post-compaction message count, not pre.
+    #[test]
+    fn load_meta_from_respects_compaction_checkpoint_count() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sess-comp.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"header","id":"sess-comp","model":"m","cwd":"/tmp","created_at":1000}"#,
+                "\n",
+                r#"{"type":"user","content":[{"type":"text","text":"q1"}],"timestamp":1100}"#,
+                "\n",
+                r#"{"type":"user","content":[{"type":"text","text":"q2"}],"timestamp":1200}"#,
+                "\n",
+                r#"{"type":"user","content":[{"type":"text","text":"q3"}],"timestamp":1300}"#,
+                "\n",
+                r#"{"type":"compaction","messages":[{"role":"user","content":[{"type":"text","text":"summary"}]}],"replaces_count":3,"timestamp":1400}"#,
+                "\n",
+                r#"{"type":"user","content":[{"type":"text","text":"q4"}],"timestamp":1500}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let meta = Session::load_meta_from(&path).unwrap();
+        // 1 from compaction + 1 added after = 2
+        assert_eq!(meta.message_count, 2);
+        assert_eq!(meta.updated_at, 1500);
+    }
+
+    /// M6.24 BUG M4: append_locked must serialize concurrent writers
+    /// — the resulting file should be valid JSONL with no interleaved
+    /// bytes mid-line. Test by spawning two threads that append
+    /// distinct large messages concurrently and verifying every line
+    /// parses as valid JSON.
+    #[test]
+    fn concurrent_appends_dont_corrupt_jsonl() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sess-concurrent.jsonl");
+
+        // Pre-write the header so both threads only append message events.
+        std::fs::write(
+            &path,
+            r#"{"type":"header","id":"sess-concurrent","model":"m","cwd":"/tmp","created_at":1}"#
+                .to_string()
+                + "\n",
+        )
+        .unwrap();
+
+        // Build two large messages — large enough that a single
+        // writeln! exceeds typical PIPE_BUF and would interleave
+        // without locking.
+        let big_a = "A".repeat(8192);
+        let big_b = "B".repeat(8192);
+
+        // Each thread writes 50 messages of its filler text.
+        let path_a = path.clone();
+        let path_b = path.clone();
+        let h_a = std::thread::spawn(move || {
+            for i in 0..50 {
+                let event = format!(
+                    r#"{{"type":"user","content":[{{"type":"text","text":"{big_a}-{i}"}}],"timestamp":2}}"#,
+                );
+                append_locked(&path_a, |f| writeln!(f, "{}", event)).unwrap();
+            }
+        });
+        let h_b = std::thread::spawn(move || {
+            for i in 0..50 {
+                let event = format!(
+                    r#"{{"type":"assistant","content":[{{"type":"text","text":"{big_b}-{i}"}}],"timestamp":3}}"#,
+                );
+                append_locked(&path_b, |f| writeln!(f, "{}", event)).unwrap();
+            }
+        });
+        h_a.join().unwrap();
+        h_b.join().unwrap();
+
+        // Verify every line is valid JSON. Pre-fix this would fail
+        // for some lines because two threads' bytes would interleave.
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        // 1 header + 50 from each thread = 101 lines
+        assert_eq!(
+            lines.len(),
+            101,
+            "expected 101 lines (1 header + 100 messages), got {}",
+            lines.len()
+        );
+        for (i, line) in lines.iter().enumerate() {
+            let parsed: std::result::Result<serde_json::Value, _> = serde_json::from_str(line);
+            assert!(
+                parsed.is_ok(),
+                "line {} failed to parse as JSON: {:?}",
+                i + 1,
+                line.chars().take(80).collect::<String>()
+            );
+        }
+    }
+
     #[test]
     fn latest_returns_most_recent_session() {
         let dir = tempdir().unwrap();
@@ -968,13 +1416,51 @@ mod tests {
     }
 
     #[test]
-    fn load_errors_cleanly_on_malformed_json() {
+    fn load_skips_malformed_lines_and_keeps_recoverable_session() {
+        // M6.19 BUG H1: pre-fix, a single malformed line failed the
+        // entire load and the session disappeared from `list()`'s
+        // silent-skip catcher. Now the malformed line is skipped
+        // with a stderr warning and the rest of the session is
+        // preserved. With NO valid lines, the salvage path
+        // (file_stem → id, mtime → created_at) returns a usable
+        // "unknown-model" placeholder rather than an error.
+        let dir = tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let path = store.path_for("sess-mixed");
+        // Mix of valid header + valid message + malformed line + another
+        // valid message. The malformed line should be dropped; the rest
+        // should round-trip.
+        let body = concat!(
+            r#"{"type":"header","id":"sess-mixed","model":"m","cwd":"/tmp","created_at":100}"#,
+            "\n",
+            r#"{"type":"user","content":[{"type":"text","text":"first"}],"timestamp":200}"#,
+            "\n",
+            "{not-valid-json",
+            "\n",
+            r#"{"type":"assistant","content":[{"type":"text","text":"second"}],"timestamp":201}"#,
+            "\n",
+        );
+        std::fs::write(&path, body).unwrap();
+        let s = store
+            .load("sess-mixed")
+            .expect("partial load should succeed");
+        assert_eq!(s.id, "sess-mixed");
+        assert_eq!(s.messages.len(), 2, "valid messages preserved");
+    }
+
+    #[test]
+    fn load_salvages_pure_garbage_via_filename() {
+        // Pure-garbage JSONL with no recoverable lines — salvage path
+        // gives a placeholder session so the file at least appears in
+        // the sidebar (where the user can decide to delete it).
         let dir = tempdir().unwrap();
         let store = SessionStore::new(dir.path().to_path_buf());
         let path = store.path_for("sess-bad");
-        std::fs::write(&path, "{not-valid").unwrap();
-        let err = store.load("sess-bad").unwrap_err();
-        assert!(format!("{err}").contains("session parse"));
+        std::fs::write(&path, "{not-valid\nmore garbage\n").unwrap();
+        let s = store.load("sess-bad").expect("salvage path should succeed");
+        assert_eq!(s.id, "sess-bad");
+        assert_eq!(s.model, "unknown");
+        assert!(s.messages.is_empty());
     }
 
     #[test]
@@ -982,6 +1468,41 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = SessionStore::new(dir.path().to_path_buf());
         assert!(store.load("nope").is_err());
+    }
+
+    #[test]
+    fn rename_strips_control_characters_from_title() {
+        // M6.19 BUG L1+L5: titles with embedded newlines / tabs / CR
+        // / NUL would JSON-escape on persistence (so the file stays
+        // valid), but a UI rendering the title raw would break
+        // layout. Sanitize at write time: convert tabs / newlines
+        // to spaces (preserve segmentation), strip other control
+        // chars entirely, then trim outer whitespace.
+        let dir = tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let mut session = Session::new("m", "/tmp");
+        session.sync(vec![Message::user("hello")]);
+        store.save(&mut session).unwrap();
+
+        let path = store.path_for(&session.id);
+        session
+            .append_rename_to(&path, "  before\nafter\twith\rcontrol\x01here  ")
+            .unwrap();
+
+        // Newlines / tabs / CR collapse to spaces; \x01 (control) is
+        // stripped entirely (no replacement char); outer whitespace
+        // trimmed.
+        assert_eq!(
+            session.title.as_deref(),
+            Some("before after with controlhere")
+        );
+
+        // Roundtrip through load_from to confirm persistence.
+        let reloaded = store.load(&session.id).unwrap();
+        assert_eq!(
+            reloaded.title.as_deref(),
+            Some("before after with controlhere")
+        );
     }
 
     #[test]

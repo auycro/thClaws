@@ -81,6 +81,27 @@ struct Cli {
     #[arg(long)]
     team_dir: Option<String>,
 
+    /// M6.36: serve the React frontend over HTTP + WebSocket so the
+    /// project is reachable from a browser. Single-user; binds to
+    /// 127.0.0.1 by default — use an SSH tunnel for remote access.
+    /// `--bind 0.0.0.0` exposes the server publicly (only with auth
+    /// in front: e.g. Tailscale, Cloudflare Access, reverse proxy
+    /// with basic auth). One project per process; cd into the project
+    /// dir before running. Mutually exclusive with --cli / --print /
+    /// the GUI default.
+    #[arg(long)]
+    serve: bool,
+
+    /// Port for `--serve` mode. Default 8443.
+    #[arg(long, default_value_t = 8443)]
+    port: u16,
+
+    /// Bind address for `--serve` mode. Default 127.0.0.1 (localhost).
+    /// Set to `0.0.0.0` to bind all interfaces — only safe behind
+    /// auth (Tailscale, reverse proxy, etc.).
+    #[arg(long, default_value = "127.0.0.1")]
+    bind: String,
+
     /// Prompt (positional args joined with spaces)
     prompt: Vec<String>,
 }
@@ -121,6 +142,27 @@ async fn main() {
 
     let cli = Cli::parse();
     let use_cli = cli.cli || cli.print;
+
+    // M6.36 SERVE5: --serve mode short-circuits the CLI/GUI dispatch.
+    // Single-purpose deployment shape — operator runs one process per
+    // project on a server.
+    if cli.serve {
+        let bind_ip: std::net::IpAddr = match cli.bind.parse() {
+            Ok(ip) => ip,
+            Err(e) => {
+                eprintln!("\x1b[31m--bind: invalid IP '{}': {e}\x1b[0m", cli.bind);
+                std::process::exit(1);
+            }
+        };
+        let config = thclaws_core::server::ServeConfig {
+            bind: std::net::SocketAddr::new(bind_ip, cli.port),
+        };
+        if let Err(e) = thclaws_core::server::run(config).await {
+            eprintln!("\n\x1b[31mserve error: {e}\x1b[0m");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     if !use_cli {
         #[cfg(feature = "gui")]

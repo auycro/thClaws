@@ -236,18 +236,21 @@ impl Provider for OllamaCloudProvider {
         let raw_dump = super::RawDump::new(format!("ollama-cloud {}", req.model));
 
         let event_stream = try_stream! {
-            let mut buffer = String::new();
+            // M6.21 BUG H1: byte buffer to avoid UTF-8 corruption at
+            // chunk boundaries.
+            let mut buffer: Vec<u8> = Vec::new();
             let mut byte_stream = Box::pin(byte_stream);
             let mut state = super::ollama::ParseState::default();
             let mut raw = raw_dump;
 
             while let Some(chunk) = byte_stream.next().await {
                 let chunk = chunk.map_err(|e| Error::Provider(format!("stream: {e}")))?;
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                buffer.extend_from_slice(&chunk);
 
-                while let Some(newline) = buffer.find('\n') {
-                    let line: String = buffer.drain(..newline + 1).collect();
-                    let line = line.trim();
+                while let Some(newline) = super::find_bytes(&buffer, b"\n") {
+                    let line_bytes: Vec<u8> = buffer.drain(..newline + 1).collect();
+                    let line_text = String::from_utf8_lossy(&line_bytes);
+                    let line = line_text.trim();
                     if line.is_empty() {
                         continue;
                     }
@@ -258,10 +261,14 @@ impl Provider for OllamaCloudProvider {
                 }
             }
 
-            if !buffer.trim().is_empty() {
-                for event in super::ollama::parse_line(buffer.trim(), &mut state)? {
-                    if let ProviderEvent::TextDelta(ref s) = event { raw.push(s); }
-                    yield event;
+            if !buffer.is_empty() {
+                let line_text = String::from_utf8_lossy(&buffer);
+                let trimmed = line_text.trim();
+                if !trimmed.is_empty() {
+                    for event in super::ollama::parse_line(trimmed, &mut state)? {
+                        if let ProviderEvent::TextDelta(ref s) = event { raw.push(s); }
+                        yield event;
+                    }
                 }
             }
             raw.flush();

@@ -394,9 +394,9 @@ pub async fn install(url: &str, user: bool) -> Result<Plugin> {
         // recovery action.
         let rollback_failed = std::fs::remove_dir_all(&final_dir).err();
         return Err(Error::Config(match rollback_failed {
-            None => format!(
-                "registry save failed ({e}); rolled back install (no files left on disk)"
-            ),
+            None => {
+                format!("registry save failed ({e}); rolled back install (no files left on disk)")
+            }
             Some(rb) => format!(
                 "registry save failed ({e}); rollback ALSO failed ({rb}). \
                  Plugin files orphaned at {} — run `rm -rf` to clean up before retrying",
@@ -733,12 +733,7 @@ async fn git_clone(url: &str, dest: &Path) -> Result<()> {
     // plugin repos take ~20–30 s on a fresh ARM macOS at depth 1).
     let mut cmd = tokio::process::Command::new("git");
     cmd.args(&args).kill_on_drop(true);
-    let out = match tokio::time::timeout(
-        std::time::Duration::from_secs(60),
-        cmd.output(),
-    )
-    .await
-    {
+    let out = match tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output()).await {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
             let _ = std::fs::remove_dir_all(&stage_dir);
@@ -748,9 +743,7 @@ async fn git_clone(url: &str, dest: &Path) -> Result<()> {
             // Tokio aborted the future; kill_on_drop on the Command
             // takes care of the child when `cmd` drops.
             let _ = std::fs::remove_dir_all(&stage_dir);
-            return Err(Error::Config(
-                "git clone timed out after 60s".into(),
-            ));
+            return Err(Error::Config("git clone timed out after 60s".into()));
         }
     };
     if !out.status.success() {

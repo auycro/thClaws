@@ -127,10 +127,16 @@ where
 }
 
 fn fire(plan: Option<Plan>) {
-    if let Ok(g) = broadcaster().lock() {
-        if let Some(f) = g.as_ref() {
-            f(plan);
-        }
+    // M6.31 PM4: recover from mutex poisoning. Pre-fix a panic in
+    // another thread holding the broadcaster mutex would silently
+    // disable all subsequent broadcasts — sidebar would stop
+    // updating, plan_snapshots would stop persisting to JSONL, user
+    // would think plan tools were silently broken. Recovery via
+    // `into_inner()` matches the existing pattern in `slot()` /
+    // `update_step()` / `force_step_done()`.
+    let g = broadcaster().lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(f) = g.as_ref() {
+        f(plan);
     }
 }
 
@@ -179,19 +185,22 @@ fn step_attempts() -> &'static Mutex<Option<(String, usize)>> {
 /// If this is the first nudge for this step, returns 1. Subsequent
 /// nudges for the same step return 2, 3, … The counter resets when
 /// the driver moves on to a different step.
+///
+/// M6.31 PM3: recover from mutex poisoning instead of returning
+/// `usize::MAX` (which would force-Fail the next plan step on the
+/// driver's `> MAX_RETRIES_PER_STEP` check). Poisoning means a
+/// concurrent thread panicked while holding the lock — the data
+/// inside is still valid; the panic flag just signals "be careful."
+/// Recovery via `into_inner()` matches what `slot()` and other
+/// plan_state internals already do for the slot mutex.
 pub fn note_step_attempt(step_id: &str) -> usize {
-    if let Ok(mut g) = step_attempts().lock() {
-        let next = match g.as_ref() {
-            Some((prev, n)) if prev == step_id => n + 1,
-            _ => 1,
-        };
-        *g = Some((step_id.to_string(), next));
-        next
-    } else {
-        // Lock poisoned — be conservative and return a high number so
-        // the driver bails rather than spinning.
-        usize::MAX
-    }
+    let mut g = step_attempts().lock().unwrap_or_else(|p| p.into_inner());
+    let next = match g.as_ref() {
+        Some((prev, n)) if prev == step_id => n + 1,
+        _ => 1,
+    };
+    *g = Some((step_id.to_string(), next));
+    next
 }
 
 fn reset_step_attempts() {
@@ -881,6 +890,47 @@ mod tests {
         let err = set_step_output("nope", Some("hi".into())).unwrap_err();
         assert!(err.contains("unknown step id"), "got: {err}");
     }
+
+    /// M6.31 PM2: rising-edge stall counter. The detector is meant to
+    /// fire once when the counter first hits the threshold; subsequent
+    /// turns past the threshold should NOT re-fire (without this, the
+    /// sidebar saw repeated PlanStalled banners until the user
+    /// clicked Continue or the plan mutated).
+    ///
+    /// The driver-side check now uses `==` instead of `>=`. This test
+    /// pins the increment behavior + documents the boundary so a
+    /// future refactor doesn't regress the pattern silently.
+    #[test]
+    fn note_turn_completed_without_progress_increments_monotonically() {
+        let _g = test_lock();
+        reset_stall_counter();
+        assert_eq!(note_turn_completed_without_progress(), 1);
+        assert_eq!(note_turn_completed_without_progress(), 2);
+        assert_eq!(note_turn_completed_without_progress(), 3);
+        // The driver fires PlanStalled when this returns
+        // STALL_TURN_THRESHOLD (3). Subsequent turns continue to
+        // increment but the driver's `==` check skips re-firing.
+        assert_eq!(note_turn_completed_without_progress(), 4);
+        assert_eq!(note_turn_completed_without_progress(), 5);
+        // Reset (any plan mutation, or sidebar Continue) brings the
+        // counter back to 0; next call returns 1 — re-arming the
+        // detector.
+        reset_stall_counter();
+        assert_eq!(note_turn_completed_without_progress(), 1);
+    }
+
+    // M6.31 PM3 + PM4 (poison recovery for `note_step_attempt` and
+    // `fire`): no unit test. A test that deliberately poisons the
+    // process-global `step_attempts` / `broadcaster` mutexes leaves
+    // those mutexes poisoned for the entire `cargo test` process —
+    // subsequent tests that depend on a clean slate (e.g. the
+    // `reset_step_attempts` helper, which silently no-ops on poison)
+    // see leaked state and fail. The fix is mechanically verifiable
+    // by code inspection: `unwrap_or_else(|p| p.into_inner())`
+    // matches the existing pattern in `slot()` / `update_step()` /
+    // `force_step_done()`. Re-poisoning safely would require making
+    // every other consumer of these mutexes also recover from poison
+    // — a larger refactor than the bug warrants.
 
     #[test]
     fn submit_replaces_prior_plan() {

@@ -3,6 +3,14 @@ use crate::error::{Error, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+/// M6.23 BUG LT1: hard cap on directory entries returned. Pre-fix `Ls`
+/// built an unbounded `Vec<String>` from `std::fs::read_dir`. A
+/// directory with hundreds of thousands of entries (large `node_modules`
+/// trees flattened, build caches, mailbox dirs) would OOM the worker.
+/// 1000 is generous enough for any human-navigable directory; users
+/// who need to find a needle should use `Glob` with a pattern.
+const MAX_LS_ENTRIES: usize = 1000;
+
 pub struct LsTool;
 
 #[async_trait]
@@ -36,14 +44,31 @@ impl Tool for LsTool {
         let entries = std::fs::read_dir(&path)
             .map_err(|e| Error::Tool(format!("ls {}: {e}", path.display())))?;
 
-        let mut items: Vec<String> = Vec::new();
+        // M6.23 BUG LT1: bound the in-memory entry collection so a
+        // huge directory can't OOM the worker. Walk lazily and bail
+        // when we hit the cap; surface the truncation so the user
+        // knows to use Glob with a pattern instead.
+        let mut items: Vec<String> = Vec::with_capacity(MAX_LS_ENTRIES);
+        let mut total_seen = 0usize;
         for entry in entries.flatten() {
+            total_seen += 1;
+            if items.len() >= MAX_LS_ENTRIES {
+                continue;
+            }
             let name = entry.file_name().to_string_lossy().into_owned();
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
             items.push(if is_dir { format!("{name}/") } else { name });
         }
         items.sort();
-        Ok(items.join("\n"))
+        let mut out = items.join("\n");
+        if total_seen > MAX_LS_ENTRIES {
+            out.push_str(&format!(
+                "\n... ({} more entries, showing first {}; use Glob with a pattern for filtering)",
+                total_seen - MAX_LS_ENTRIES,
+                MAX_LS_ENTRIES,
+            ));
+        }
+        Ok(out)
     }
 }
 
@@ -99,5 +124,32 @@ mod tests {
         assert!(out.contains("subdir/"));
         assert!(out.contains("file"));
         assert!(!out.contains("file/"));
+    }
+
+    /// M6.23 BUG LT1: huge directories must cap at MAX_LS_ENTRIES and
+    /// surface a truncation notice with a hint to use Glob.
+    #[tokio::test]
+    async fn truncates_at_max_entries_with_notice() {
+        let dir = tempdir().unwrap();
+        // Create more entries than the cap so we exercise the truncation path.
+        let n = MAX_LS_ENTRIES + 50;
+        for i in 0..n {
+            std::fs::write(dir.path().join(format!("f{i:05}.txt")), "").unwrap();
+        }
+        let out = LsTool
+            .call(json!({"path": dir.path().to_string_lossy()}))
+            .await
+            .unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        // First MAX_LS_ENTRIES lines + one trailing notice line
+        assert_eq!(lines.len(), MAX_LS_ENTRIES + 1, "expected cap + 1 notice");
+        assert!(
+            lines[MAX_LS_ENTRIES].contains("more entries"),
+            "last line should announce truncation"
+        );
+        assert!(
+            lines[MAX_LS_ENTRIES].contains("Glob"),
+            "should suggest Glob for filtering"
+        );
     }
 }

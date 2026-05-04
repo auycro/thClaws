@@ -134,11 +134,15 @@ pub fn find_claude_md(start: &Path) -> Option<String> {
     // locations so a repo-shared AGENTS.md can extend (not replace) the user
     // baseline.
     if let Some(home) = crate::util::home_dir() {
+        // M6.18 BUG M4: load CLAUDE before AGENTS at every scope. The
+        // user-level thclaws-native pair was inverted (AGENTS first),
+        // contradicting the "per-vendor instructions refine a shared
+        // baseline" rationale used everywhere else.
         for candidate in [
             home.join(".claude/CLAUDE.md"),
             home.join(".claude/AGENTS.md"),
-            home.join(".config/thclaws/AGENTS.md"),
             home.join(".config/thclaws/CLAUDE.md"),
+            home.join(".config/thclaws/AGENTS.md"),
         ] {
             if let Ok(contents) = std::fs::read_to_string(&candidate) {
                 parts.push(contents);
@@ -261,11 +265,13 @@ pub fn scan_claude_md_sizes(start: &Path) -> Vec<(PathBuf, u64)> {
         }
     };
     if let Some(home) = crate::util::home_dir() {
+        // M6.18 BUG M4: CLAUDE before AGENTS at every scope so the
+        // size scan matches find_claude_md's load order.
         for candidate in [
             home.join(".claude/CLAUDE.md"),
             home.join(".claude/AGENTS.md"),
-            home.join(".config/thclaws/AGENTS.md"),
             home.join(".config/thclaws/CLAUDE.md"),
+            home.join(".config/thclaws/AGENTS.md"),
         ] {
             check(candidate);
         }
@@ -294,7 +300,12 @@ pub fn scan_claude_md_sizes(start: &Path) -> Vec<(PathBuf, u64)> {
             }
         }
     }
+    // M6.18 BUG M3: also check AGENTS.local.md so the scan matches
+    // find_claude_md (which loads BOTH local override files).
+    // Pre-fix /context underreported memory contribution for
+    // projects using AGENTS.local.md.
     check(start.join("CLAUDE.local.md"));
+    check(start.join("AGENTS.local.md"));
     out
 }
 
@@ -315,11 +326,13 @@ pub fn scan_claude_md_oversize(start: &Path) -> Vec<ClaudeMdOversize> {
     };
 
     if let Some(home) = crate::util::home_dir() {
+        // M6.18 BUG M4: CLAUDE before AGENTS at every scope so the
+        // size scan matches find_claude_md's load order.
         for candidate in [
             home.join(".claude/CLAUDE.md"),
             home.join(".claude/AGENTS.md"),
-            home.join(".config/thclaws/AGENTS.md"),
             home.join(".config/thclaws/CLAUDE.md"),
+            home.join(".config/thclaws/AGENTS.md"),
         ] {
             check(candidate);
         }
@@ -352,7 +365,12 @@ pub fn scan_claude_md_oversize(start: &Path) -> Vec<ClaudeMdOversize> {
         }
     }
 
+    // M6.18 BUG M3: also check AGENTS.local.md so the scan matches
+    // find_claude_md (which loads BOTH local override files).
+    // Pre-fix /context underreported memory contribution for
+    // projects using AGENTS.local.md.
     check(start.join("CLAUDE.local.md"));
+    check(start.join("AGENTS.local.md"));
     out
 }
 

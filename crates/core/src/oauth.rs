@@ -680,13 +680,10 @@ async fn wait_for_callback(
     let mut accumulated: Vec<u8> = Vec::with_capacity(2048);
     let mut chunk = vec![0u8; 2048];
     loop {
-        let n = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            stream.read(&mut chunk),
-        )
-        .await
-        .map_err(|_| Error::Provider("oauth: timed out reading callback request".into()))?
-        .map_err(|e| Error::Provider(format!("oauth read: {e}")))?;
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut chunk))
+            .await
+            .map_err(|_| Error::Provider("oauth: timed out reading callback request".into()))?
+            .map_err(|e| Error::Provider(format!("oauth read: {e}")))?;
         if n == 0 {
             break;
         }

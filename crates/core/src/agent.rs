@@ -596,6 +596,11 @@ pub fn build_todos_reminder() -> Option<String> {
     if !has_incomplete {
         return None;
     }
+    // M6.18 BUG M6: cap todos.md so an unmaintained list doesn't burn
+    // unbounded tokens every turn. 80 lines / 6 KB is generous for a
+    // typical scratchpad — headers + bullets average ~50 bytes/line.
+    let bounded =
+        crate::memory::truncate_for_prompt(raw.trim_end(), 80, 6_000, ".thclaws/todos.md");
     Some(format!(
         "## Existing todos (.thclaws/todos.md)\n\n\
          A scratchpad todo list from a prior session is present in this \
@@ -605,13 +610,12 @@ pub fn build_todos_reminder() -> Option<String> {
          should we do?\" while these answers are sitting in front of \
          you.\n\n\
          Current contents:\n\n\
-         ```markdown\n{raw}```\n\n\
+         ```markdown\n{bounded}```\n\n\
          If the user wants to resume, mark the next pending item as \
          `in_progress` via TodoWrite (passing the full list with that \
          one item flipped) and start work on it. If they want a fresh \
          start, write an updated list via TodoWrite that reflects the \
-         new direction.",
-        raw = raw.trim_end()
+         new direction."
     ))
 }
 
@@ -656,7 +660,7 @@ pub const ESCALATED_MAX_TOKENS: u32 = 64000;
 
 pub struct Agent {
     provider: Arc<dyn Provider>,
-    tools: ToolRegistry,
+    pub(crate) tools: ToolRegistry,
     model: String,
     system: String,
     pub budget_tokens: usize,
@@ -675,7 +679,15 @@ pub struct Agent {
     /// `cancelled().await` and exits with a synthetic error mid-wait.
     /// `None` for tests / non-interactive consumers that don't want
     /// cancellation plumbing.
-    cancel: Option<crate::cancel::CancelToken>,
+    pub(crate) cancel: Option<crate::cancel::CancelToken>,
+    /// M6.35 HOOK1+HOOK3: lifecycle hooks. Pre-fix the `crate::hooks`
+    /// module existed and had a documented user-manual chapter
+    /// (`ch13-hooks.md`) but was completely orphaned — no production
+    /// code path called `fire_*`. Now the dispatch site (around
+    /// `tool.call_multimodal`) and the explicit-deny site fire the
+    /// configured hooks. `None` keeps tests and standalone consumers
+    /// hook-free.
+    pub(crate) hooks: Option<std::sync::Arc<crate::hooks::HooksConfig>>,
 }
 
 impl Agent {
@@ -706,6 +718,7 @@ impl Agent {
             approver: Arc::new(AutoApprover),
             history: Arc::new(Mutex::new(Vec::new())),
             cancel: None,
+            hooks: None,
         }
     }
 
@@ -714,6 +727,13 @@ impl Agent {
     /// for `cancel.reset()`-ing between turns. M6.17 BUG H1 + M3.
     pub fn with_cancel(mut self, token: crate::cancel::CancelToken) -> Self {
         self.cancel = Some(token);
+        self
+    }
+
+    /// Wire in a HooksConfig so the agent fires user-configured shell
+    /// hooks at tool dispatch / permission denial. M6.35 HOOK1.
+    pub fn with_hooks(mut self, hooks: std::sync::Arc<crate::hooks::HooksConfig>) -> Self {
+        self.hooks = Some(hooks);
         self
     }
 
@@ -816,6 +836,7 @@ impl Agent {
         let approver = self.approver.clone();
         let history = self.history.clone();
         let cancel = self.cancel.clone();
+        let hooks = self.hooks.clone();
 
         try_stream! {
             {
@@ -836,7 +857,58 @@ impl Agent {
 
                 let messages = {
                     let h = history.lock().expect("history lock");
-                    compact(&h, budget_tokens)
+                    // M6.18 BUG H1: subtract the system-prompt size + a
+                    // safety margin for tool definitions from the
+                    // budget BEFORE compacting messages. Pre-fix, a
+                    // large system prompt (CLAUDE.md cascade + memory
+                    // bodies + KMS indices + skills) plus a budget-
+                    // filling history could push the total request past
+                    // the model's context window even though `compact`
+                    // had "fitted" the messages. The provider then
+                    // 400'd with "context length exceeded."
+                    //
+                    // We reserve 4 KiB for tool definitions (typical
+                    // catalog of ~30-40 builtins + MCP tools) on top
+                    // of the system-prompt deduction — rough but keeps
+                    // the request comfortably inside the window.
+                    let system_tokens = crate::tokens::estimate_tokens(&system);
+                    let tools_reserve_tokens = 1024;
+                    let messages_budget = budget_tokens
+                        .saturating_sub(system_tokens)
+                        .saturating_sub(tools_reserve_tokens);
+
+                    // M6.35 HOOK4: pre_compact / post_compact fire only
+                    // when compaction actually trims (history is over
+                    // budget). compact() is called every turn but
+                    // no-ops when within budget — firing on every turn
+                    // would spam audit hooks with empty events.
+                    let pre_tokens = crate::compaction::estimate_messages_tokens(&h);
+                    let pre_count = h.len();
+                    let will_compact = pre_tokens > messages_budget;
+                    if will_compact {
+                        if let Some(hk) = &hooks {
+                            crate::hooks::fire_compact(
+                                hk,
+                                crate::hooks::HookEvent::PreCompact,
+                                pre_count,
+                                pre_tokens,
+                            );
+                        }
+                    }
+                    let compacted = compact(&h, messages_budget);
+                    if will_compact {
+                        if let Some(hk) = &hooks {
+                            let post_tokens =
+                                crate::compaction::estimate_messages_tokens(&compacted);
+                            crate::hooks::fire_compact(
+                                hk,
+                                crate::hooks::HookEvent::PostCompact,
+                                compacted.len(),
+                                post_tokens,
+                            );
+                        }
+                    }
+                    compacted
                 };
                 let tool_defs = tools.tool_defs();
 
@@ -1097,6 +1169,36 @@ impl Agent {
                         }
                     };
 
+                    // M6.20 BUG M1: TodoWrite block fires BEFORE the
+                    // generic mutating-tool block below. Pre-fix the
+                    // generic block ran first (because TodoWrite has
+                    // requires_approval=true), so the model always saw
+                    // the generic "Use Read/Grep/Glob/Ls" message
+                    // instead of this specific "Use SubmitPlan" one.
+                    // TodoWrite is the casual scratchpad outside plan
+                    // mode — letting it coexist with SubmitPlan
+                    // confused the model in tests (it would TodoWrite
+                    // a draft list AND SubmitPlan the same content).
+                    if matches!(permission_mode, PermissionMode::Plan)
+                        && name == "TodoWrite"
+                    {
+                        let blocked = "Blocked: TodoWrite is the casual scratchpad outside plan mode. \
+                                       In plan mode, call SubmitPlan to publish your plan to the \
+                                       sidebar — UpdatePlanStep tracks progress per step.";
+                        result_blocks.push(ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: blocked.to_string().into(),
+                            is_error: true,
+                        });
+                        yield AgentEvent::ToolCallResult {
+                            id: id.clone(),
+                            name: name.clone(),
+                            output: Err(blocked.to_string()),
+                            ui_resource: None,
+                        };
+                        continue;
+                    }
+
                     // Plan-mode block (M2): mutating tools are off-limits
                     // during plan-mode exploration. Return a structured
                     // tool_result the model reads on the next turn and
@@ -1126,32 +1228,6 @@ impl Agent {
                             id: id.clone(),
                             name: name.clone(),
                             output: Err(blocked),
-                            ui_resource: None,
-                        };
-                        continue;
-                    }
-
-                    // TodoWrite is hidden in plan mode — SubmitPlan /
-                    // UpdatePlanStep are the structured replacement and
-                    // letting both coexist confused the model in tests
-                    // (it would TodoWrite a draft list AND SubmitPlan
-                    // the same content). Match by tool name rather than
-                    // a flag to keep it data-free.
-                    if matches!(permission_mode, PermissionMode::Plan)
-                        && name == "TodoWrite"
-                    {
-                        let blocked = "Blocked: TodoWrite is the casual scratchpad outside plan mode. \
-                                       In plan mode, call SubmitPlan to publish your plan to the \
-                                       sidebar — UpdatePlanStep tracks progress per step.";
-                        result_blocks.push(ContentBlock::ToolResult {
-                            tool_use_id: id.clone(),
-                            content: blocked.to_string().into(),
-                            is_error: true,
-                        });
-                        yield AgentEvent::ToolCallResult {
-                            id: id.clone(),
-                            name: name.clone(),
-                            output: Err(blocked.to_string()),
                             ui_resource: None,
                         };
                         continue;
@@ -1212,6 +1288,15 @@ impl Agent {
                         };
                         let decision = approver.approve(&req).await;
                         if matches!(decision, ApprovalDecision::Deny) {
+                            // M6.35 HOOK3: surface explicit user denial
+                            // to the configured permission_denied hook.
+                            // BashTool / sandbox / plan-mode hard-blocks
+                            // are NOT denials per this gate (they're
+                            // tool-level rejections); only the explicit
+                            // approver Deny lands here.
+                            if let Some(h) = &hooks {
+                                crate::hooks::fire_permission_denied(h, &name);
+                            }
                             let denied = format!("denied by user: {name}");
                             result_blocks.push(ContentBlock::ToolResult {
                                 tool_use_id: id.clone(),
@@ -1224,6 +1309,17 @@ impl Agent {
                             };
                             continue;
                         }
+                    }
+
+                    // M6.35 HOOK1: pre_tool_use fires after the approval
+                    // gate but before the tool runs. Fire-and-forget so
+                    // the hook doesn't block dispatch — pre/post strict
+                    // ordering is documented as best-effort, not a
+                    // guarantee, in the user manual.
+                    if let Some(h) = &hooks {
+                        let input_str = serde_json::to_string(input)
+                            .unwrap_or_else(|_| "<unserializable>".to_string());
+                        crate::hooks::fire_pre_tool_use(h, &name, &input_str);
                     }
 
                     // ToolCallStart was yielded at parse time (see the
@@ -1261,6 +1357,20 @@ impl Agent {
                     } else {
                         content
                     };
+
+                    // M6.35 HOOK1: post_tool_use (or _failure) fires
+                    // after we've materialized the result content but
+                    // before pushing it into history. The output the
+                    // hook sees is the truncated-to-disk variant — same
+                    // text the next provider call will see, so audit
+                    // hooks log what the model actually consumed.
+                    if let Some(h) = &hooks {
+                        let preview = match &content {
+                            crate::types::ToolResultContent::Text(s) => s.clone(),
+                            crate::types::ToolResultContent::Blocks(_) => "<multimodal>".to_string(),
+                        };
+                        crate::hooks::fire_post_tool_use(h, &name, &preview, is_error);
+                    }
                     result_blocks.push(ContentBlock::ToolResult {
                         tool_use_id: id.clone(),
                         content: content.clone(),
@@ -1358,9 +1468,40 @@ pub async fn collect_agent_turn<S>(stream: S) -> Result<AgentTurnOutcome>
 where
     S: Stream<Item = Result<AgentEvent>> + Send,
 {
+    collect_agent_turn_with_cancel(stream, None).await
+}
+
+/// M6.33 SUB4: cancel-aware variant of `collect_agent_turn`. When a
+/// `CancelToken` is wired in, the loop `tokio::select!`s the next
+/// stream event against `cancel.cancelled().await` so a parent ctrl-C
+/// short-circuits the subagent's run instead of waiting for the
+/// subagent to exhaust its iteration budget.
+///
+/// Pre-fix subagents had no cancel observation: a runaway 200-iteration
+/// subagent could burn 10+ minutes uninterruptibly because the parent's
+/// cancel only reached its own retry-backoff sleeps, never propagated
+/// down to the child Agent.
+pub async fn collect_agent_turn_with_cancel<S>(
+    stream: S,
+    cancel: Option<crate::cancel::CancelToken>,
+) -> Result<AgentTurnOutcome>
+where
+    S: Stream<Item = Result<AgentEvent>> + Send,
+{
     let mut out = AgentTurnOutcome::default();
     let mut stream = Box::pin(stream);
-    while let Some(ev) = stream.next().await {
+    loop {
+        let next = if let Some(c) = &cancel {
+            tokio::select! {
+                ev = stream.next() => ev,
+                _ = c.cancelled() => {
+                    return Err(Error::Agent("cancelled by user".into()));
+                }
+            }
+        } else {
+            stream.next().await
+        };
+        let Some(ev) = next else { break };
         match ev? {
             AgentEvent::IterationStart { iteration } => out.iterations = iteration + 1,
             AgentEvent::Text(s) => out.text.push_str(&s),
@@ -2363,6 +2504,17 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "ok");
     }
 
+    // M6.20 BUG M1 regression note: the TodoWrite plan-mode block
+    // (agent.rs:1133 area) now fires BEFORE the generic mutating-tool
+    // block, so the model gets the SubmitPlan-specific message instead
+    // of the generic "Use Read/Grep/Glob/Ls" one. A behavioral test
+    // would need to set `permissions::current_mode()` to Plan, which
+    // races other tests reading the same global slot — so this fix is
+    // verified by source inspection + manual repro rather than a
+    // dedicated unit test. The cross-test pollution would cause flakes
+    // in `permission_denied_in_ask_mode_emits_denial_event` and
+    // similar tests that depend on `current_mode() == Ask`.
+
     #[tokio::test]
     async fn max_iterations_short_circuits_runaway_loops() {
         // Infinite tool loop: every script turn returns a tool_use.
@@ -2384,6 +2536,87 @@ mod tests {
         assert_eq!(outcome.stop_reason.as_deref(), Some("max_iterations"));
     }
 
+    /// M6.18 BUG H1: compaction now subtracts the system-prompt size
+    /// from the budget before trimming messages, so a large system
+    /// prompt + budget-filling history can't push the total request
+    /// past the model's context window. Pre-fix `compact()` was
+    /// called with the full budget, so a 50K system prompt + 128K
+    /// "fitted" messages = 178K request that 400'd on a 128K-context
+    /// model.
+    ///
+    /// We probe the deduction via a fake provider that captures the
+    /// inbound StreamRequest's message-token total. The system prompt
+    /// is sized to consume most of the budget; messages should be
+    /// trimmed accordingly.
+    #[tokio::test]
+    async fn compact_subtracts_system_prompt_tokens_from_budget() {
+        use std::sync::Mutex;
+
+        // Capture the messages count of every StreamRequest the
+        // provider receives.
+        struct CapturingProvider {
+            captured_messages: Arc<Mutex<Vec<usize>>>,
+        }
+        #[async_trait]
+        impl Provider for CapturingProvider {
+            async fn stream(&self, req: crate::providers::StreamRequest) -> Result<EventStream> {
+                self.captured_messages
+                    .lock()
+                    .unwrap()
+                    .push(req.messages.len());
+                // Single-text response, no tool use → end of turn.
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(ProviderEvent::TextDelta("ok".into())),
+                    Ok(ProviderEvent::ContentBlockStop),
+                    Ok(ProviderEvent::MessageStop {
+                        stop_reason: Some("end_turn".into()),
+                        usage: None,
+                    }),
+                ])))
+            }
+        }
+
+        let captured: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(CapturingProvider {
+            captured_messages: captured.clone(),
+        });
+
+        // Build an Agent with a big system prompt and small budget.
+        // budget=1000 tokens, system≈800 tokens → messages_budget ≈ 200.
+        let big_system = "x".repeat(3200); // ~800 tokens at 4 chars/token
+        let mut agent = Agent::new(provider, ToolRegistry::default(), "test-model", big_system);
+        agent.budget_tokens = 1000;
+
+        // Pre-load history with a multi-turn conversation that, naively
+        // counted, would fit in 1000 tokens but won't fit once we
+        // subtract 800 + 1024 reserve. Expect compact to drop most.
+        let pre = vec![
+            Message::user("a".repeat(200)),
+            Message::assistant("b".repeat(200)),
+            Message::user("c".repeat(200)),
+            Message::assistant("d".repeat(200)),
+            Message::user("trigger"),
+        ];
+        agent.set_history(pre);
+
+        let _ = collect_agent_turn(agent.run_turn("noop".into())).await;
+
+        let counts = captured.lock().unwrap().clone();
+        assert!(
+            !counts.is_empty(),
+            "provider should have received a request"
+        );
+        // Pre-fix this would be 6 (5 history + 1 new user msg = full
+        // history sent unchanged because compact got the full 1000-
+        // token budget). Post-fix: messages_budget is negative-clamped
+        // to 0, so compact aggressively drops to the minimum (1 msg).
+        assert!(
+            counts[0] <= 2,
+            "expected aggressive compaction (≤2 messages); got {} — system prompt deduction not applied",
+            counts[0]
+        );
+    }
+
     /// M6.17 BUG H1 + M3: when a cancel token is wired in and gets
     /// fired during the retry-backoff sleep, the agent stream errors
     /// out with a "cancelled by user" message instead of waiting the
@@ -2396,10 +2629,7 @@ mod tests {
         struct AlwaysErrProvider;
         #[async_trait]
         impl Provider for AlwaysErrProvider {
-            async fn stream(
-                &self,
-                _req: crate::providers::StreamRequest,
-            ) -> Result<EventStream> {
+            async fn stream(&self, _req: crate::providers::StreamRequest) -> Result<EventStream> {
                 Err(Error::Provider("transient".into()))
             }
         }

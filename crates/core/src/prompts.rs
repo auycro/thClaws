@@ -24,6 +24,11 @@ pub mod defaults {
     pub const WORKTREE: &str = include_str!("default_prompts/worktree.md");
     pub const COMPACTION: &str = include_str!("default_prompts/compaction.md");
     pub const COMPACTION_SYSTEM: &str = include_str!("default_prompts/compaction_system.md");
+    /// M6.29: audit-driven goal-continue prompt fired by `/goal continue`.
+    /// Variables: {{ objective }}, {{ time_used_seconds }},
+    /// {{ tokens_used }}, {{ token_budget }}, {{ remaining_tokens }},
+    /// {{ iterations_done }}, {{ prior_audit }}.
+    pub const GOAL_CONTINUE: &str = include_str!("default_prompts/goal_continue.md");
 }
 
 fn project_path(name: &str) -> PathBuf {

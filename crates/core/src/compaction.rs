@@ -105,9 +105,7 @@ pub fn compact(messages: &[Message], budget_tokens: usize) -> Vec<Message> {
     }
     let mut result = messages[start..].to_vec();
     // M6.17 BUG M1: only-one-message-and-still-too-big rescue.
-    if result.len() == 1
-        && estimate_message_tokens(&result[0]) > budget_tokens
-    {
+    if result.len() == 1 && estimate_message_tokens(&result[0]) > budget_tokens {
         truncate_oversized_message(&mut result[0], budget_tokens);
     }
     result

@@ -112,10 +112,20 @@ pub fn resolve_auth_header() -> Option<String> {
 
 /// Apply the documented substitutions. Public for testing — most
 /// callers should use `resolve_auth_header()`.
+///
+/// M6.21 BUG M3: substitution is depth-capped at `MAX_DEPTH` to prevent
+/// an infinite loop if env values themselves contain `{{env:...}}`
+/// references that form a cycle (e.g. `A=`{{env:B}}`, `B=`{{env:A}}`).
+/// 16 substitutions is generous — real templates have 1-2 — and a
+/// hung worker startup would otherwise wedge the GUI.
 pub fn render_template(template: &str) -> String {
+    const MAX_DEPTH: usize = 16;
     let mut out = template.to_string();
     // {{env:NAME}} → process env value (or empty).
-    while let Some(start) = out.find("{{env:") {
+    for _ in 0..MAX_DEPTH {
+        let Some(start) = out.find("{{env:") else {
+            break;
+        };
         let after = &out[start + 6..];
         let Some(end_offset) = after.find("}}") else {
             break;
@@ -185,6 +195,28 @@ mod tests {
     fn render_template_literal_passthrough() {
         let rendered = render_template("Bearer static-token-12345");
         assert_eq!(rendered, "Bearer static-token-12345");
+    }
+
+    /// M6.21 BUG M3: cyclic env-var values (A → `{{env:B}}`, B → `{{env:A}}`)
+    /// would loop forever pre-fix. Verify the depth cap (16 substitutions)
+    /// terminates instead of hanging worker startup. We can't easily set
+    /// up a true cycle (env vars referencing each other on the same name
+    /// is the simplest provable cycle), but a self-referential env IS
+    /// cyclic and must terminate.
+    #[test]
+    fn render_template_terminates_on_cyclic_env_substitution() {
+        // Set env A's value to a fresh `{{env:NAME}}` reference.
+        // Loop must terminate in ≤16 substitutions even if both var
+        // values keep producing the same `{{env:...}}` token.
+        std::env::set_var("THCLAWS_TEST_CYCLE_A", "{{env:THCLAWS_TEST_CYCLE_A}}");
+        let rendered = render_template("{{env:THCLAWS_TEST_CYCLE_A}}");
+        // After MAX_DEPTH=16 substitutions, the unresolved tail remains.
+        // The exact tail doesn't matter — what matters is the call returns.
+        assert!(
+            rendered.contains("{{env:THCLAWS_TEST_CYCLE_A}}") || rendered.is_empty(),
+            "expected the loop to terminate with a tail or empty string, got: {rendered:?}",
+        );
+        std::env::remove_var("THCLAWS_TEST_CYCLE_A");
     }
 
     #[test]

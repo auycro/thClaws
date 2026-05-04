@@ -4,7 +4,16 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
+
+/// M6.23 BUG AT1: hard timeout on the user-response await. Pre-fix the
+/// agent stalled indefinitely if the user closed the GUI modal without
+/// responding (or closed the terminal during a CLI prompt). 30 minutes
+/// is generous for "let me think about this" while preventing the
+/// forgotten-modal-stalls-forever case. The user can still /cancel
+/// sooner if the cancel token is wired upstream.
+const ASK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 pub struct AskUserTool;
 
@@ -82,11 +91,34 @@ impl Tool for AskUserTool {
                 })
                 .is_ok()
             {
-                return Ok(normalize_answer(answer_rx.await.unwrap_or_default()));
+                // M6.23 BUG AT1: bound the await on the user's
+                // response. If they close the modal without
+                // responding, the await would otherwise block
+                // forever — `oneshot::Receiver` only resolves on
+                // either send or sender-drop, and the modal closing
+                // doesn't necessarily drop the responder.
+                return Ok(normalize_answer(
+                    match tokio::time::timeout(ASK_TIMEOUT, answer_rx).await {
+                        Ok(Ok(answer)) => answer,
+                        Ok(Err(_)) => String::new(), // sender dropped
+                        Err(_) => {
+                            return Ok(format!(
+                                "(no response — user did not reply within {} minutes)",
+                                ASK_TIMEOUT.as_secs() / 60,
+                            ))
+                        }
+                    },
+                ));
             }
         }
 
-        let answer = tokio::task::spawn_blocking(move || {
+        // M6.23 BUG AT1: same timeout for the CLI fallback. The
+        // blocking task itself can't be cancelled (read_line is
+        // synchronous and blocking), but bounding the await prevents
+        // the agent from waiting forever on a terminal that's been
+        // closed or detached. The orphan blocking thread will be
+        // reaped when the process exits.
+        let blocking = tokio::task::spawn_blocking(move || {
             use std::io::{BufRead, Write};
             println!("\n\x1b[36m[agent asks]: {question}\x1b[0m");
             print!("\x1b[36m> \x1b[0m");
@@ -94,11 +126,16 @@ impl Tool for AskUserTool {
             let mut line = String::new();
             std::io::stdin().lock().read_line(&mut line).ok();
             line.trim().to_string()
-        })
-        .await
-        .unwrap_or_default();
+        });
 
-        Ok(normalize_answer(answer))
+        match tokio::time::timeout(ASK_TIMEOUT, blocking).await {
+            Ok(Ok(answer)) => Ok(normalize_answer(answer)),
+            Ok(Err(_)) => Ok(normalize_answer(String::new())),
+            Err(_) => Ok(format!(
+                "(no response — user did not reply within {} minutes)",
+                ASK_TIMEOUT.as_secs() / 60,
+            )),
+        }
     }
 }
 

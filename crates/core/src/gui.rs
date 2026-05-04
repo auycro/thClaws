@@ -16,6 +16,10 @@
 #![cfg(feature = "gui")]
 
 use crate::config::AppConfig;
+use crate::event_render::{
+    render_chat_dispatches, render_terminal_ansi, terminal_data_envelope,
+    terminal_history_replaced_envelope, TerminalRenderState,
+};
 use crate::session::SessionStore;
 use crate::shared_session::{SharedSessionHandle, ShellInput, ViewEvent};
 use base64::Engine;
@@ -140,254 +144,6 @@ fn spawn_event_translator(handle: &SharedSessionHandle, proxy: EventLoopProxy<Us
     });
 }
 
-/// Build chat-shaped JSON message(s) for a single ViewEvent. Most
-/// events translate to one message; HistoryReplaced fans out as a
-/// single `chat_history_replaced` envelope carrying the full message
-/// list.
-///
-/// All text fields are stripped of ANSI escape sequences — the chat
-/// bubble renders raw text in `whitespace-pre-wrap` and would show
-/// codes like `\x1b[2m...\x1b[0m` as visible `[2m...[0m` junk. The
-/// terminal path (which xterm.js parses natively) is unaffected.
-fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
-    match ev {
-        ViewEvent::UserPrompt(text) => vec![serde_json::json!({
-            "type": "chat_user_message",
-            "text": strip_ansi(text),
-        })
-        .to_string()],
-        ViewEvent::AssistantTextDelta(text) => vec![serde_json::json!({
-            "type": "chat_text_delta",
-            "text": strip_ansi(text),
-        })
-        .to_string()],
-        ViewEvent::ToolCallStart { name, label, input } => vec![serde_json::json!({
-            "type": "chat_tool_call",
-            "name": strip_ansi(label),
-            // Tool name (unmangled, e.g. "TodoWrite") so the chat
-            // surface can pick a custom render (a todo-list card)
-            // instead of the generic one-line indicator. Plus the
-            // raw input so that custom renderer has the data it
-            // needs without a follow-up IPC round-trip.
-            "tool_name": name,
-            "input": input,
-        })
-        .to_string()],
-        ViewEvent::ToolCallResult {
-            name,
-            output,
-            ui_resource,
-        } => {
-            let mut env = serde_json::json!({
-                "type": "chat_tool_result",
-                "name": name,
-                "output": strip_ansi(output),
-            });
-            // Inline an MCP-Apps widget envelope so the chat surface
-            // can mount an iframe alongside the text result. We ship
-            // the full HTML over IPC (a few KB per pinn.ai widget) —
-            // simpler than an asset URL we'd have to also serve, and
-            // the iframe gets an opaque origin from `srcdoc` so the
-            // page can't reach back into our app context.
-            if let Some(ui) = ui_resource {
-                env["ui_resource"] = serde_json::json!({
-                    "uri": ui.uri,
-                    "html": ui.html,
-                    "mime": ui.mime,
-                });
-            }
-            vec![env.to_string()]
-        }
-        ViewEvent::SlashOutput(text) => vec![serde_json::json!({
-            "type": "chat_slash_output",
-            "text": strip_ansi(text),
-        })
-        .to_string()],
-        ViewEvent::TurnDone => vec![serde_json::json!({"type": "chat_done"}).to_string()],
-        ViewEvent::HistoryReplaced(messages) => {
-            let arr: Vec<serde_json::Value> = messages
-                .iter()
-                .map(|m| {
-                    serde_json::json!({
-                        "role": m.role,
-                        "content": strip_ansi(&m.content),
-                    })
-                })
-                .collect();
-            vec![serde_json::json!({
-                "type": "chat_history_replaced",
-                "messages": arr,
-            })
-            .to_string()]
-        }
-        ViewEvent::SessionListRefresh(json) => vec![json.clone()],
-        ViewEvent::ProviderUpdate(json) => vec![json.clone()],
-        ViewEvent::KmsUpdate(json) => vec![json.clone()],
-        ViewEvent::McpUpdate(json) => vec![json.clone()],
-        ViewEvent::ModelPickerOpen(json) => vec![json.clone()],
-        ViewEvent::ContextWarning { file_size_mb } => vec![serde_json::json!({
-            "type": "chat_context_warning",
-            "file_size_mb": file_size_mb,
-        })
-        .to_string()],
-        ViewEvent::ErrorText(text) => vec![serde_json::json!({
-            "type": "chat_text_delta",
-            "text": format!("\n{}\n", strip_ansi(text)),
-        })
-        .to_string()],
-        ViewEvent::McpAppCallToolResult {
-            request_id,
-            content,
-            is_error,
-        } => vec![serde_json::json!({
-            "type": "mcp_call_tool_result",
-            "requestId": request_id,
-            "content": content,
-            "isError": is_error,
-        })
-        .to_string()],
-        // QuitRequested is intercepted by the translator before this
-        // function is called — see the `if matches!(...)` early-return
-        // above. Listed here for match exhaustiveness only.
-        ViewEvent::QuitRequested => vec![],
-        // Right-side plan sidebar update (M1). `None` clears the
-        // sidebar, `Some(plan)` repaints it. Wire format mirrors
-        // `Plan` directly — frontend deserialises into the same
-        // shape `PlanSidebar.tsx` consumes.
-        ViewEvent::PlanUpdate(plan) => {
-            let payload = serde_json::json!({
-                "type": "chat_plan_update",
-                "plan": plan,
-            });
-            vec![payload.to_string()]
-        }
-        // Permission-mode changed (M2). Frontend uses this to render
-        // a status pill (PLAN / AUTO / ASK) and to know whether the
-        // sidebar should show Approve / Cancel buttons.
-        ViewEvent::PermissionModeChanged(mode) => {
-            let mode_str = match mode {
-                crate::permissions::PermissionMode::Auto => "auto",
-                crate::permissions::PermissionMode::Ask => "ask",
-                crate::permissions::PermissionMode::Plan => "plan",
-            };
-            let payload = serde_json::json!({
-                "type": "chat_permission_mode",
-                "mode": mode_str,
-            });
-            vec![payload.to_string()]
-        }
-        // Stalled-turn detector tripped (M4.4). Sidebar renders a
-        // yellow "model seems stuck on step X (N turns)" banner
-        // with Continue / Abort buttons.
-        ViewEvent::PlanStalled {
-            step_id,
-            step_title,
-            turns,
-        } => {
-            let payload = serde_json::json!({
-                "type": "chat_plan_stalled",
-                "step_id": step_id,
-                "step_title": step_title,
-                "turns": turns,
-            });
-            vec![payload.to_string()]
-        }
-    }
-}
-
-/// Strip ANSI escape sequences from a string. Handles the common forms
-/// emitted by `repl::render_help` and tool output:
-///   - CSI sequences:   `ESC [ … (digits/semicolons) … (final byte 0x40-0x7e)`
-///   - OSC sequences:   `ESC ] … (terminator BEL or ST)`
-///   - Bare `ESC X`     where X is any single byte (Fe escape)
-///
-/// Doesn't try to convert colours into anything else — the chat bubble
-/// is plain text, and the user is just asking us to stop leaking
-/// terminal junk into it.
-fn strip_ansi(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == 0x1b && i + 1 < bytes.len() {
-            match bytes[i + 1] {
-                b'[' => {
-                    // CSI: skip parameters/intermediates until a final
-                    // byte in 0x40..=0x7e.
-                    i += 2;
-                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
-                        i += 1;
-                    }
-                    if i < bytes.len() {
-                        i += 1; // consume the final byte
-                    }
-                    continue;
-                }
-                b']' => {
-                    // OSC: terminate on BEL (0x07) or ST (ESC \).
-                    i += 2;
-                    while i < bytes.len() {
-                        if bytes[i] == 0x07 {
-                            i += 1;
-                            break;
-                        }
-                        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
-                            i += 2;
-                            break;
-                        }
-                        i += 1;
-                    }
-                    continue;
-                }
-                _ => {
-                    // Two-byte Fe escape: drop both.
-                    i += 2;
-                    continue;
-                }
-            }
-        }
-        // Pass through. Multi-byte UTF-8 sequences are preserved
-        // intact because we operate at the byte level and only consume
-        // ESC-prefixed sequences.
-        out.push(bytes[i]);
-        i += 1;
-    }
-    // Output bytes are guaranteed valid UTF-8: we either passed through
-    // bytes from the original (valid) UTF-8 input or skipped them. The
-    // ASCII escape bytes we drop are never inside a multi-byte run.
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-#[cfg(test)]
-mod ansi_strip_tests {
-    use super::strip_ansi;
-
-    #[test]
-    fn strips_csi_sgr() {
-        assert_eq!(strip_ansi("\x1b[2mhello\x1b[0m"), "hello");
-        assert_eq!(
-            strip_ansi("\x1b[31;1mred bold\x1b[0m text"),
-            "red bold text"
-        );
-    }
-
-    #[test]
-    fn strips_cursor_moves() {
-        assert_eq!(strip_ansi("a\x1b[2K\rb"), "a\rb");
-    }
-
-    #[test]
-    fn passes_plain_text_through() {
-        assert_eq!(strip_ansi("plain"), "plain");
-        assert_eq!(strip_ansi("with\nnewlines"), "with\nnewlines");
-    }
-
-    #[test]
-    fn strips_osc_with_bel() {
-        assert_eq!(strip_ansi("\x1b]0;title\x07after"), "after");
-    }
-}
-
 #[cfg(test)]
 mod csv_table_tests {
     use super::csv_to_markdown_table;
@@ -419,232 +175,6 @@ mod csv_table_tests {
     fn empty_input_yields_empty_string() {
         assert_eq!(csv_to_markdown_table(""), "");
     }
-}
-
-/// State carried across calls to `render_terminal_ansi` so consecutive
-/// tool calls with the same label coalesce into a single line with a
-/// `×N` count, instead of stacking N copies of `[tool: Ls] ✓`.
-///
-/// The cursor is left at the end of the result line (no trailing CRLF)
-/// so a follow-up matching `ToolCallStart` can rewrite the line in
-/// place via `\r\x1b[2K…`. A pending newline is flushed before the
-/// next non-matching event so streamed agent text or a different tool
-/// still starts on a fresh line.
-#[derive(Default)]
-pub(crate) struct TerminalRenderState {
-    /// Label of the most recently rendered tool call. None when the
-    /// last terminal output wasn't a tool call.
-    last_tool_label: Option<String>,
-    /// How many consecutive same-label tool calls have been merged
-    /// onto the most recent line (1 after the first result, ≥ 2 after
-    /// each merge).
-    last_tool_count: u32,
-    /// True when a `ToolCallStart` was suppressed because its label
-    /// matched the previous call. The matching `ToolCallResult` will
-    /// rewrite the previous line instead of appending a fresh ` ✓`.
-    merging: bool,
-    /// True when the cursor is currently parked at the end of a tool-
-    /// result line (no trailing CRLF). Cleared by emitting `\r\n`
-    /// before the next non-coalescing event.
-    pending_newline_after_tool: bool,
-}
-
-/// Convert a ViewEvent into ANSI bytes suitable for xterm.js. Returns
-/// None when the event is metadata-only (e.g. a SessionListRefresh —
-/// the sidebar handles that via its own dispatch shape).
-fn render_terminal_ansi(state: &mut TerminalRenderState, ev: &ViewEvent) -> Option<String> {
-    // Tool-call coalescing lives ahead of the generic event match so
-    // it can suppress / rewrite output without going through the
-    // pending-newline flush path below.
-    match ev {
-        ViewEvent::ToolCallStart {
-            name: _,
-            label,
-            input: _,
-        } => {
-            if state.pending_newline_after_tool
-                && state.last_tool_label.as_deref() == Some(label.as_str())
-                && state.last_tool_count >= 1
-            {
-                // Same tool again — suppress the start. The matching
-                // result will rewrite the previous line with ×N.
-                state.pending_newline_after_tool = false;
-                state.merging = true;
-                return None;
-            }
-            // Different tool (or first one). The leading \r\n doubles
-            // as the flush for any pending tool-result line.
-            state.last_tool_label = Some(label.clone());
-            state.last_tool_count = 0;
-            state.merging = false;
-            state.pending_newline_after_tool = false;
-            return Some(format!("\r\n\x1b[2m[tool: {label}]\x1b[0m"));
-        }
-        ViewEvent::ToolCallResult { .. } => {
-            if state.merging {
-                state.merging = false;
-                state.last_tool_count += 1;
-                state.pending_newline_after_tool = true;
-                let label = state.last_tool_label.clone().unwrap_or_default();
-                let count = state.last_tool_count;
-                return Some(format!(
-                    "\r\x1b[2K\x1b[2m[tool: {label}]\x1b[0m \x1b[32m✓\x1b[0m \x1b[2m×{count}\x1b[0m"
-                ));
-            }
-            state.last_tool_count = 1;
-            state.pending_newline_after_tool = true;
-            return Some(" \x1b[32m✓\x1b[0m".to_string());
-        }
-        _ => {}
-    }
-
-    let inner = match ev {
-        ViewEvent::UserPrompt(text) => {
-            // Multi-line prompts (typical from a paste): `> ` marker on
-            // the first line only, two-space indent on continuations
-            // so the block reads as a single message. Convert `\n` →
-            // `\r\n` so xterm returns to column 0 instead of staircasing.
-            let marker = "\x1b[2m> \x1b[0m";
-            let indent = "  ";
-            let mut lines = text.split('\n');
-            let mut body = String::new();
-            if let Some(first) = lines.next() {
-                body.push_str(&format!("{marker}{first}"));
-            }
-            for line in lines {
-                body.push_str("\r\n");
-                body.push_str(indent);
-                body.push_str(line);
-            }
-            body.push_str("\r\n");
-            Some(body)
-        }
-        ViewEvent::AssistantTextDelta(text) => {
-            // Newlines from the model arrive as plain `\n`; xterm needs
-            // `\r\n` to start a fresh line at column 0.
-            Some(text.replace('\n', "\r\n"))
-        }
-        ViewEvent::ToolCallStart { .. } | ViewEvent::ToolCallResult { .. } => {
-            unreachable!("handled above")
-        }
-        ViewEvent::SlashOutput(text) => {
-            let body = text.replace('\n', "\r\n");
-            Some(format!("\x1b[2m{body}\x1b[0m\r\n"))
-        }
-        // TurnDone doesn't emit terminal bytes — TerminalView's
-        // `chat_done` handler writes the next prompt (and restores any
-        // line buffer the user typed during streaming). Doubling up
-        // here would print an extra blank line.
-        ViewEvent::TurnDone => None,
-        ViewEvent::HistoryReplaced(messages) => {
-            // Clear scrollback + screen + cursor home, then replay each
-            // historical message in the same ANSI shapes the live stream
-            // uses.
-            let mut out = String::from("\x1b[3J\x1b[2J\x1b[H");
-            for m in messages {
-                let line = match m.role.as_str() {
-                    "user" => {
-                        // Match the live UserPrompt rendering: `> ` on
-                        // the first line only, two-space indent on
-                        // continuations so the whole block reads as a
-                        // single message.
-                        let marker = "\x1b[2m> \x1b[0m";
-                        let indent = "  ";
-                        let mut lines = m.content.split('\n');
-                        let mut body = String::new();
-                        if let Some(first) = lines.next() {
-                            body.push_str(&format!("{marker}{first}"));
-                        }
-                        for l in lines {
-                            body.push_str("\r\n");
-                            body.push_str(indent);
-                            body.push_str(l);
-                        }
-                        body.push_str("\r\n");
-                        body
-                    }
-                    "assistant" => {
-                        format!("{}\r\n", m.content.replace('\n', "\r\n"))
-                    }
-                    _ => format!(
-                        "\x1b[2m{}\x1b[0m\r\n",
-                        m.content.replace('\n', "\r\n")
-                    ),
-                };
-                out.push_str(&line);
-            }
-            Some(out)
-        }
-        ViewEvent::ErrorText(text) => {
-            Some(format!("\r\n\x1b[31m{text}\x1b[0m\r\n"))
-        }
-        ViewEvent::SessionListRefresh(_) => None,
-        ViewEvent::ProviderUpdate(_) => None,
-        ViewEvent::KmsUpdate(_) => None,
-        ViewEvent::McpUpdate(_) => None,
-        ViewEvent::ModelPickerOpen(_) => None,
-        ViewEvent::ContextWarning { file_size_mb } => Some(format!(
-            "\r\n\x1b[33m[ session {:.1} MB — /fork to continue in a new session with summary ]\x1b[0m\r\n",
-            file_size_mb
-        )),
-        // Widget tool-call results are an out-of-band channel for
-        // embedded MCP App iframes. The terminal tab doesn't render
-        // them — they're consumed by the chat-tab translator above
-        // and forwarded to the iframe's JSON-RPC reply path.
-        ViewEvent::McpAppCallToolResult { .. } => None,
-        // QuitRequested is intercepted by the translator early-return
-        // and forwarded to the tao loop; the terminal tab has nothing
-        // to render for it.
-        ViewEvent::QuitRequested => None,
-        // Plan-mode sidebar lives only in the chat-tab translator
-        // (M1). The terminal tab will get text-mode plan rendering
-        // in M5.
-        ViewEvent::PlanUpdate(_) => None,
-        // Mode badge is a chat-tab affordance. Terminal can show a
-        // status indicator in a future polish pass.
-        ViewEvent::PermissionModeChanged(_) => None,
-        // Stalled-plan banner is a chat-tab affordance (M4.4).
-        // Terminal will get text-mode rendering in M5.
-        ViewEvent::PlanStalled { .. } => None,
-    };
-
-    // Non-tool event finished. If we had a pending tool-result line
-    // parked without a CRLF, flush it now so the next event starts
-    // on a fresh line. Reset coalesce state regardless: any output
-    // moves the cursor away from the tool line.
-    match inner {
-        Some(text) => {
-            state.last_tool_label = None;
-            state.last_tool_count = 0;
-            state.merging = false;
-            if state.pending_newline_after_tool {
-                state.pending_newline_after_tool = false;
-                Some(format!("\r\n{text}"))
-            } else {
-                Some(text)
-            }
-        }
-        // Metadata-only events (sidebar refreshes, TurnDone, …) don't
-        // emit terminal bytes, so the cursor stays where it was. Keep
-        // tool-coalesce state intact for the next real event.
-        None => None,
-    }
-}
-
-fn terminal_data_envelope(ansi: &str) -> String {
-    let bytes = ansi.as_bytes();
-    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-    serde_json::json!({"type": "terminal_data", "data": b64}).to_string()
-}
-
-/// Like `terminal_data_envelope` but the frontend handler always
-/// writes a fresh prompt at the end — used for session load / new-
-/// session events so an empty history doesn't leave the user staring
-/// at a blank terminal with no chevron.
-fn terminal_history_replaced_envelope(ansi: &str) -> String {
-    let bytes = ansi.as_bytes();
-    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-    serde_json::json!({"type": "terminal_history_replaced", "data": b64}).to_string()
 }
 
 /// Convert a markdown string to a full standalone HTML document so the
@@ -2716,12 +2246,30 @@ pub fn run_gui() {
                         msg.get("to").and_then(|v| v.as_str()),
                         msg.get("text").and_then(|v| v.as_str()),
                     ) {
-                        let team_dir = std::env::current_dir()
-                            .unwrap_or_default()
-                            .join(crate::team::Mailbox::default_dir());
-                        let mailbox = crate::team::Mailbox::new(team_dir);
-                        let tm = crate::team::TeamMessage::new("user", text);
-                        let _ = mailbox.write_to_mailbox(to, tm);
+                        // M6.34 TEAM1: reject path-traversal recipient
+                        // names from the frontend before they reach
+                        // write_to_mailbox. Mailbox validates too, but
+                        // catching here surfaces the error at the IPC
+                        // boundary instead of swallowing it.
+                        if !crate::team::is_valid_agent_name(to) {
+                            // Silently drop — the frontend's only legal
+                            // sources are the team-tab agent list (validated)
+                            // and the lead-typed user message picker.
+                            // Logging via stderr would surface to the
+                            // terminal pane and isn't worth a structured
+                            // error event for an internal path.
+                            eprintln!(
+                                "[team] team_send_message: rejecting invalid recipient '{}'",
+                                to
+                            );
+                        } else {
+                            let team_dir = std::env::current_dir()
+                                .unwrap_or_default()
+                                .join(crate::team::Mailbox::default_dir());
+                            let mailbox = crate::team::Mailbox::new(team_dir);
+                            let tm = crate::team::TeamMessage::new("user", text);
+                            let _ = mailbox.write_to_mailbox(to, tm);
+                        }
                     }
                 }
                 "team_list" => {
@@ -3035,8 +2583,17 @@ pub fn run_gui() {
                         "error": error,
                     });
                     let _ = proxy_for_ipc.send_event(UserEvent::SessionLoaded(payload.to_string()));
-                    // Broadcast the refreshed list so the sidebar picks up the new title.
                     if ok {
+                        // M6.19 BUG M2: notify the worker so its
+                        // in-memory state.session.title stays in sync
+                        // when the renamed session is the active one.
+                        let _ = shared_for_ipc.input_tx.send(
+                            ShellInput::SessionRenamedExternal {
+                                id: id.to_string(),
+                                title: title.to_string(),
+                            },
+                        );
+                        // Broadcast the refreshed list so the sidebar picks up the new title.
                         let store = SessionStore::default_path().map(SessionStore::new);
                         let list = build_session_list(&store);
                         let _ = proxy_for_ipc.send_event(UserEvent::SessionListRefresh(list));
@@ -3063,6 +2620,16 @@ pub fn run_gui() {
                     });
                     let _ = proxy_for_ipc.send_event(UserEvent::SessionLoaded(payload.to_string()));
                     if ok {
+                        // M6.19 BUG M2: notify the worker so it can
+                        // mint a fresh session if the deleted id was
+                        // the active one. Without this, the next save
+                        // would re-create the file from cached state
+                        // and the "deleted" session would resurrect.
+                        let _ = shared_for_ipc.input_tx.send(
+                            ShellInput::SessionDeletedExternal {
+                                id: id.to_string(),
+                            },
+                        );
                         let store = SessionStore::default_path().map(SessionStore::new);
                         let list = build_session_list(&store);
                         let _ = proxy_for_ipc.send_event(UserEvent::SessionListRefresh(list));

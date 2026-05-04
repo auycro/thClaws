@@ -135,6 +135,19 @@ pub enum ShellInput {
         qualified_name: String,
         arguments: serde_json::Value,
     },
+    /// M6.19 BUG M2: a `session_delete` IPC just removed `id` from
+    /// disk. If the worker's in-flight session matches, it must mint
+    /// a fresh session — otherwise the next save_history would
+    /// re-create the deleted file and the session would resurrect
+    /// with stale state. No-op if `id` doesn't match the current
+    /// session.
+    SessionDeletedExternal { id: String },
+    /// M6.19 BUG M2: a `session_rename` IPC just changed the title of
+    /// `id` on disk. If the worker's in-flight session matches, sync
+    /// the in-memory `state.session.title` so subsequent slash
+    /// commands (e.g. `/sessions`) reflect the new value. No-op if
+    /// `id` doesn't match the current session.
+    SessionRenamedExternal { id: String, title: String },
 }
 
 /// What both tabs render. Each variant maps to a UI affordance:
@@ -373,6 +386,20 @@ pub struct WorkerState {
     /// `rebuild_agent` so a `/model` swap doesn't lose the cancel
     /// plumbing.
     pub cancel: crate::cancel::CancelToken,
+    /// M6.29: active iteration loop. `Some` when `/loop <interval>
+    /// <body>` is running; the cancel handle aborts the spawned tokio
+    /// task on `/loop stop` / session swap / goal-terminal.
+    pub active_loop: Option<ActiveLoop>,
+}
+
+/// M6.29: handle to a running `/loop` task.
+#[derive(Debug)]
+pub struct ActiveLoop {
+    pub interval_secs: Option<u64>,
+    pub body: String,
+    pub started_at: u64,
+    pub iterations_fired: u64,
+    pub abort: tokio::task::AbortHandle,
 }
 
 impl WorkerState {
@@ -401,7 +428,11 @@ impl WorkerState {
             &self.system_prompt,
         )
         .with_approver(self.approver.clone())
-        .with_cancel(self.cancel.clone());
+        .with_cancel(self.cancel.clone())
+        // M6.35 HOOK1: re-snapshot config.hooks on rebuild — config
+        // edits via Settings → save → ReloadConfig take effect on the
+        // next agent. Pre-fix the snapshot was only at first boot.
+        .with_hooks(std::sync::Arc::new(self.config.hooks.clone()));
         self.agent = new_agent;
         self.agent.permission_mode = prev_perm;
         self.agent.thinking_budget = prev_thinking;
@@ -649,7 +680,18 @@ async fn run_worker(
     if !config.kms_active.is_empty() {
         tools.register(std::sync::Arc::new(crate::tools::KmsReadTool));
         tools.register(std::sync::Arc::new(crate::tools::KmsSearchTool));
+        // M6.25 BUG #1: KmsWrite + KmsAppend make the LLM an active
+        // wiki maintainer (not just a passive reader).
+        tools.register(std::sync::Arc::new(crate::tools::KmsWriteTool));
+        tools.register(std::sync::Arc::new(crate::tools::KmsAppendTool));
     }
+
+    // M6.26 BUG #1: Memory tools always-on. The model needs them even
+    // when no entries exist yet (so it can create the first one). Sandbox
+    // carve-out validated by `memory::writable_entry_path`.
+    tools.register(std::sync::Arc::new(crate::tools::MemoryReadTool));
+    tools.register(std::sync::Arc::new(crate::tools::MemoryWriteTool));
+    tools.register(std::sync::Arc::new(crate::tools::MemoryAppendTool));
 
     // M6.11 (H1): daily auto-refresh of the marketplace catalog. No-op
     // when the cache is < 24h old; otherwise spawns a fail-silent
@@ -671,6 +713,18 @@ async fn run_worker(
     // teammate process that happened to share this code path.
     let is_teammate = std::env::var("THCLAWS_TEAM_AGENT").is_ok();
     crate::team::set_is_team_lead(team_enabled && !is_teammate);
+    // M6.34 TEAM3: capture team_dir so the GUI's lead-process exit
+    // can scope the kill to its own teammates only. Even though the
+    // GUI doesn't currently call kill_my_teammates() at shutdown
+    // (the OS reclaims child processes when the GUI quits), recording
+    // the dir keeps parity with the CLI lead and unblocks future
+    // explicit "Stop all teammates" UI affordances.
+    if team_enabled && !is_teammate {
+        let td = std::env::var("THCLAWS_TEAM_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| crate::team::Mailbox::default_dir());
+        crate::team::set_lead_team_dir(&td);
+    }
     let skill_tool = crate::skills::SkillTool::new_from_handle(skill_store.clone());
     tools.register(std::sync::Arc::new(skill_tool));
     // dev-plan/06 P2: SkillList + SkillSearch are always registered
@@ -782,23 +836,69 @@ async fn run_worker(
     if let Some(w) = &warning {
         let _ = events_tx.send(ViewEvent::ErrorText(format!("Provider: {w}")));
     }
+
+    // M6.35 HOOK1+HOOK10: snapshot HooksConfig in an Arc so the agent +
+    // every subagent factory build shares one immutable copy. Register
+    // a broadcaster that forwards hook errors (spawn fail / non-zero
+    // exit / timeout) to the chat surface so users see broken hooks
+    // without tailing stderr.
+    let hooks_arc = std::sync::Arc::new(config.hooks.clone());
+    {
+        let err_tx = events_tx.clone();
+        crate::hooks::set_error_broadcaster(move |msg| {
+            let _ = err_tx.send(ViewEvent::SlashOutput(format!("⚠ {msg}")));
+        });
+    }
     let provider: Arc<dyn Provider> = maybe_provider.unwrap_or_else(|| {
         Arc::new(NoopProvider::new(
             "no LLM provider configured — open Settings → Provider API keys to add one",
         ))
     });
-    let mut agent = Agent::new(provider, tools.clone(), &config.model, &system)
-        .with_approver(approver.clone())
-        .with_cancel(cancel.clone());
-    // Respect the user's configured permission mode (project
-    // `.thclaws/settings.json` can set it to "ask"). Without this the
-    // GUI's Ask mode flag had no effect because the Agent was built
-    // with the default Auto.
-    agent.permission_mode = if config.permissions == "auto" {
+    // M6.33 SUB1 + SUB4: register the Task tool in the GUI worker.
+    // Pre-fix the Task tool was only registered in the CLI's run_repl,
+    // so the GUI agent silently lacked subagents — any agent_def call
+    // came back "unknown tool: Task". SUB4: cancel is threaded into
+    // the factory so ctrl-C in the GUI stops in-flight subagents
+    // (CLI passes None — no cancel plumbing there yet).
+    let perm_mode = if config.permissions == "auto" {
         crate::permissions::PermissionMode::Auto
     } else {
         crate::permissions::PermissionMode::Ask
     };
+    {
+        let plugin_agent_dirs = crate::plugins::plugin_agent_dirs();
+        let agent_defs = crate::agent_defs::AgentDefsConfig::load_with_extra(&plugin_agent_dirs);
+        let base_tools = tools.clone();
+        let factory = Arc::new(crate::subagent::ProductionAgentFactory {
+            provider: provider.clone(),
+            base_tools,
+            model: config.model.clone(),
+            system: system.clone(),
+            max_iterations: config.max_iterations,
+            max_depth: crate::subagent::DEFAULT_MAX_DEPTH,
+            agent_defs: agent_defs.clone(),
+            approver: approver.clone(),
+            permission_mode: perm_mode,
+            cancel: Some(cancel.clone()),
+            // M6.35 HOOK1: subagents inherit GUI worker's hooks so audit
+            // hooks see Task-spawned tool calls.
+            hooks: Some(hooks_arc.clone()),
+        });
+        tools.register(std::sync::Arc::new(
+            crate::subagent::SubAgentTool::new(factory)
+                .with_depth(0)
+                .with_agent_defs(agent_defs),
+        ));
+    }
+    let mut agent = Agent::new(provider, tools.clone(), &config.model, &system)
+        .with_approver(approver.clone())
+        .with_cancel(cancel.clone())
+        .with_hooks(hooks_arc.clone());
+    // Respect the user's configured permission mode (project
+    // `.thclaws/settings.json` can set it to "ask"). Without this the
+    // GUI's Ask mode flag had no effect because the Agent was built
+    // with the default Auto.
+    agent.permission_mode = perm_mode;
     // Mirror the configured mode into the process-wide global so
     // `permissions::current_mode()` (read by the agent's tool-dispatch
     // gate, M2+) starts on the right value before any EnterPlanMode /
@@ -871,7 +971,19 @@ async fn run_worker(
         warned_file_size: false,
         lead_log,
         cancel: cancel.clone(),
+        active_loop: None,
     };
+
+    // M6.35 HOOK2: fire session_start hook now that WorkerState is
+    // built (state.session.id + state.config.model are stable). Pre-fix
+    // the entire hooks subsystem was orphaned — this is the first
+    // place a session_start hook ever runs.
+    crate::hooks::fire_session(
+        &hooks_arc,
+        crate::hooks::HookEvent::SessionStart,
+        &state.session.id,
+        &state.config.model,
+    );
 
     // Lead inbox poller — parity with repl.rs:1524. Without this, teammates
     // message the lead, messages pile up in `.thclaws/team/inboxes/lead.json`
@@ -884,11 +996,19 @@ async fn run_worker(
                 let unread = mailbox.read_unread("lead").unwrap_or_default();
                 if !unread.is_empty() {
                     let ids: Vec<String> = unread.iter().map(|m| m.id.clone()).collect();
-                    let _ = mailbox.mark_as_read("lead", &ids);
+                    // M6.34 TEAM5: send to the worker channel BEFORE
+                    // marking as read on disk. Pre-fix order was
+                    // mark-then-send: if `send` failed (worker
+                    // dropped), the messages were already flagged read
+                    // on disk so a subsequent session would never
+                    // surface them — silent message loss. Post-fix:
+                    // only mark when the send succeeded; if the
+                    // channel is closed, leave the messages unread so
+                    // a future session sees them.
                     if poller_tx.send(ShellInput::TeamMessages(unread)).is_err() {
-                        // Receiver dropped — session ended.
                         return;
                     }
+                    let _ = mailbox.mark_as_read("lead", &ids);
                 }
                 tokio::time::sleep(tokio::time::Duration::from_millis(
                     crate::team::POLL_INTERVAL_MS,
@@ -932,6 +1052,17 @@ async fn run_worker(
                     *g = Some(path);
                 }
                 crate::tools::plan_state::clear();
+                // M6.20 BUG M2: clear any "allow for session" yolo flag
+                // from the prior session — a fresh session must prompt
+                // again rather than silently auto-approving inherited
+                // from session A.
+                state.approver.reset_session_flag();
+                // M6.20 BUG M3: reset permission mode + clear pre-plan
+                // stash. Plan-mode entry from the prior session would
+                // otherwise leak into the fresh session, leaving the
+                // user in Plan with no plan-state to submit against.
+                let _ = crate::permissions::take_pre_plan_mode();
+                crate::permissions::set_current_mode_and_broadcast(state.agent.permission_mode);
                 let _ = events_tx.send(ViewEvent::HistoryReplaced(Vec::new()));
                 let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
                     &state.session_store,
@@ -980,8 +1111,21 @@ async fn run_worker(
                     // lose a turn or two just because the user clicked
                     // another session.
                     save_history(&state.agent, &mut state.session, &state.session_store);
-                    state.config.model = loaded.model.clone();
+                    // M6.19 BUG M1: capture prev_model BEFORE the
+                    // assignment so rebuild_agent failure can roll the
+                    // config back. Pre-fix the in-memory state.config
+                    // got the new model but the agent kept the old
+                    // provider — subsequent turns ran the old agent
+                    // against config.model that no longer matched, and
+                    // the on-disk settings.json wasn't yet written, so
+                    // restart silently lost the swap.
+                    let prev_model =
+                        std::mem::replace(&mut state.config.model, loaded.model.clone());
                     if let Err(e) = state.rebuild_agent(false) {
+                        // Roll back the config so it matches the still-
+                        // active agent. The user sees the error and the
+                        // session stays on its previous model.
+                        state.config.model = prev_model;
                         let _ = events_tx.send(ViewEvent::ErrorText(format!(
                             "Auto-switch to {} failed: {e}",
                             loaded.model
@@ -1029,6 +1173,14 @@ async fn run_worker(
                 // loaded session also uses, the driver would
                 // immediately force-Failed on its first nudge.
                 crate::tools::plan_state::reset_step_attempts_external();
+                // M6.20 BUG M2 + M3: clear yolo flag and reset
+                // permission mode from the prior session. Pre-fix the
+                // user's "allow for session" decision from session A
+                // continued to auto-approve in session B, and a Plan
+                // mode set in A leaked into B with no plan to submit.
+                state.approver.reset_session_flag();
+                let _ = crate::permissions::take_pre_plan_mode();
+                crate::permissions::set_current_mode_and_broadcast(state.agent.permission_mode);
                 let display = DisplayMessage::from_messages(&state.session.messages);
                 let _ = events_tx.send(ViewEvent::HistoryReplaced(display));
                 // Refresh so the sidebar's "current session" highlight
@@ -1090,11 +1242,37 @@ async fn run_worker(
                 let (content, is_error) = match tool {
                     Some(t) => {
                         let mode = crate::permissions::current_mode();
-                        let needs_approval = matches!(
-                            mode,
-                            crate::permissions::PermissionMode::Ask
-                                | crate::permissions::PermissionMode::Plan,
-                        ) && t.requires_approval(&arguments);
+                        // M6.24 BUG M4: in Plan mode, structurally
+                        // BLOCK mutating widget tool calls — match
+                        // the agent loop's behavior at agent.rs:1133.
+                        // Pre-fix the widget path treated Plan as
+                        // "ask" (prompted via approval modal), but a
+                        // user could click Allow on a widget-side
+                        // button while believing they were just
+                        // exploring. Plan mode = read-only
+                        // exploration, period.
+                        if matches!(mode, crate::permissions::PermissionMode::Plan)
+                            && t.requires_approval(&arguments)
+                        {
+                            let blocked = format!(
+                                "Blocked: {qualified_name} is not available in plan mode. \
+                                 Plan mode is read-only exploration — exit plan mode \
+                                 (sidebar Approve/Cancel) before triggering tool actions \
+                                 from MCP widgets.",
+                            );
+                            let _ = events_tx.send(ViewEvent::McpAppCallToolResult {
+                                request_id,
+                                content: serde_json::json!([{
+                                    "type": "text",
+                                    "text": blocked,
+                                }]),
+                                is_error: true,
+                            });
+                            continue;
+                        }
+                        let needs_approval =
+                            matches!(mode, crate::permissions::PermissionMode::Ask,)
+                                && t.requires_approval(&arguments);
                         let denied = if needs_approval {
                             let req = crate::permissions::ApprovalRequest {
                                 tool_name: qualified_name.clone(),
@@ -1129,10 +1307,7 @@ async fn run_worker(
                                     // image2image returns a URL
                                     // string, so text-only suffices.
                                     let text = result.to_text();
-                                    (
-                                        serde_json::json!([{ "type": "text", "text": text }]),
-                                        false,
-                                    )
+                                    (serde_json::json!([{ "type": "text", "text": text }]), false)
                                 }
                                 Err(e) => (
                                     serde_json::json!([{ "type": "text", "text": format!("error: {e}") }]),
@@ -1151,6 +1326,56 @@ async fn run_worker(
                     content,
                     is_error,
                 });
+            }
+            ShellInput::SessionDeletedExternal { id } => {
+                // M6.19 BUG M2: a session_delete IPC just removed `id`
+                // from disk. If it matches the worker's current
+                // session, mint a fresh one — otherwise the next
+                // save_history would resurrect the deleted file with
+                // stale state. No-op if the deleted id wasn't
+                // current.
+                if state.session.id == id {
+                    save_history(&state.agent, &mut state.session, &state.session_store);
+                    state.agent.clear_history();
+                    state.session = Session::new(&state.config.model, state.cwd.to_string_lossy());
+                    state.warned_file_size = false;
+                    if let (Some(store), Ok(mut g)) =
+                        (state.session_store.as_ref(), plan_persist_path.lock())
+                    {
+                        let path = store.path_for(&state.session.id);
+                        let _ = state.session.write_header_if_missing(&path);
+                        *g = Some(path);
+                    }
+                    crate::tools::plan_state::clear();
+                    // M6.20 BUG M2 + M3: same reset on external delete
+                    // of the active session (sidebar trash icon while
+                    // in yolo mode would otherwise carry the flag into
+                    // the freshly-minted replacement).
+                    state.approver.reset_session_flag();
+                    let _ = crate::permissions::take_pre_plan_mode();
+                    crate::permissions::set_current_mode_and_broadcast(state.agent.permission_mode);
+                    let _ = events_tx.send(ViewEvent::HistoryReplaced(Vec::new()));
+                    let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
+                        &state.session_store,
+                        &state.session.id,
+                    )));
+                    let _ = events_tx.send(ViewEvent::SlashOutput(
+                        "(active session was deleted; minted a fresh session)".into(),
+                    ));
+                }
+            }
+            ShellInput::SessionRenamedExternal { id, title } => {
+                // M6.19 BUG M2: keep the worker's in-memory title in
+                // sync after a session_rename IPC. No-op when the
+                // renamed id isn't the current session.
+                if state.session.id == id {
+                    let trimmed = title.trim();
+                    state.session.title = if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    };
+                }
             }
             ShellInput::ReloadConfig => {
                 // Pull the on-disk settings (api_key_set may have just
@@ -1218,9 +1443,19 @@ async fn run_worker(
             }
             ShellInput::ChangeCwd(new_cwd) => {
                 // Process cwd + sandbox were already updated by the GUI
-                // dispatcher before sending this. Here we only refresh the
-                // worker's view: model, system prompt, session metadata.
+                // dispatcher before sending this. Here we refresh the
+                // worker's view: save the OLD session, then mint a
+                // fresh session under the new project, clear plan +
+                // ephemeral mode state, and rebuild the agent.
                 let prev_model = state.config.model.clone();
+
+                // M6.31 PM1: save the OLD session FIRST, while
+                // session_store still points at the OLD project. Any
+                // unsaved messages land in the OLD project's session
+                // file rather than getting silently re-routed to the
+                // NEW project.
+                save_history(&state.agent, &mut state.session, &state.session_store);
+
                 state.cwd = new_cwd.clone();
 
                 // Reload config — `AppConfig::load` reads project settings
@@ -1247,30 +1482,45 @@ async fn run_worker(
 
                 // If the model changed, rebuild the agent without history
                 // — the new provider's message schema may not match the
-                // old conversation, same logic as `/model` swap.
+                // old conversation, same logic as `/model` swap. Even if
+                // rebuild_agent fails, fall through to the unconditional
+                // hygiene block so plan state from the OLD project doesn't
+                // leak (PM1).
                 let model_changed = state.config.model != prev_model;
                 if model_changed {
                     if let Err(e) = state.rebuild_agent(false) {
                         let _ = events_tx.send(ViewEvent::ErrorText(format!(
                             "[cwd-change] agent rebuild failed: {e} (model stays on '{prev_model}')"
                         )));
-                    } else {
-                        // Mint a fresh session — the new model's id and
-                        // empty history shouldn't share the old session.
-                        state.session = crate::session::Session::new(
-                            &state.config.model,
-                            state.cwd.to_string_lossy(),
-                        );
-                        if let (Some(store), Ok(mut g)) =
-                            (state.session_store.as_ref(), plan_persist_path.lock())
-                        {
-                            let path = store.path_for(&state.session.id);
-                            let _ = state.session.write_header_if_missing(&path);
-                            *g = Some(path);
-                        }
-                        crate::tools::plan_state::clear();
                     }
                 }
+
+                // M6.31 PM1: UNCONDITIONAL hygiene block. Pre-fix this
+                // ran only when model_changed; same-model workspace
+                // switch left state.session pointing at OLD session id +
+                // plan_persist_path pointing at OLD project's .jsonl +
+                // plan_state holding OLD project's plan + pre_plan stash
+                // + approver yolo flag all leaked. Resulted in writes to
+                // the wrong location and OLD plan appearing in NEW
+                // project's sidebar. Same hygiene as NewSession +
+                // LoadSession.
+                state.agent.clear_history();
+                state.session =
+                    crate::session::Session::new(&state.config.model, state.cwd.to_string_lossy());
+                state.warned_file_size = false;
+                if let (Some(store), Ok(mut g)) =
+                    (state.session_store.as_ref(), plan_persist_path.lock())
+                {
+                    let path = store.path_for(&state.session.id);
+                    let _ = state.session.write_header_if_missing(&path);
+                    *g = Some(path);
+                }
+                crate::tools::plan_state::clear();
+                crate::tools::plan_state::reset_step_attempts_external();
+                state.approver.reset_session_flag();
+                let _ = crate::permissions::take_pre_plan_mode();
+                crate::permissions::set_current_mode_and_broadcast(state.agent.permission_mode);
+                let _ = events_tx.send(ViewEvent::HistoryReplaced(Vec::new()));
 
                 // Always rebuild the system prompt — the cwd it embeds
                 // changed, even if the model didn't.
@@ -1293,6 +1543,21 @@ async fn run_worker(
             }
         }
     }
+
+    // M6.35 HOOK2: input_rx loop exited (channel closed by handle drop /
+    // GUI shutdown). Fire session_end so audit hooks can record the
+    // close. Best-effort — the hook spawn is fire-and-forget and the
+    // tokio runtime is about to shut down with the worker, so any
+    // hook child that's still booting may be killed by the runtime
+    // teardown. For long-running notification hooks, prefer foreground
+    // commands that exec quickly (`notify-send`, `osascript -e ...`)
+    // over slow shell pipelines.
+    crate::hooks::fire_session(
+        &hooks_arc,
+        crate::hooks::HookEvent::SessionEnd,
+        &state.session.id,
+        &state.config.model,
+    );
 }
 
 pub(crate) fn save_history(agent: &Agent, session: &mut Session, store: &Option<SessionStore>) {
@@ -1367,6 +1632,109 @@ async fn handle_line(
         return;
     }
 
+    // M6.27: `# <name>:<body>` memory-shortcut intercept (Claude Code
+    // parity). `parse_slash` recognizes the shortcut and returns
+    // `SlashCommand::MemoryWrite`; route through `shell_dispatch` so
+    // the same write path runs as `/memory write --body ...`. Strict
+    // pattern (slug-only name + colon) means real markdown headers
+    // like `# Architecture Plan: ...` fall through to the agent
+    // unchanged.
+    if matches!(
+        crate::repl::parse_slash(trimmed),
+        Some(crate::repl::SlashCommand::MemoryWrite { .. })
+    ) && !trimmed.starts_with('/')
+    {
+        crate::shell_dispatch::dispatch(trimmed, state, events_tx, input_tx).await;
+        let _ = events_tx.send(ViewEvent::TurnDone);
+        return;
+    }
+
+    // M6.29: `/goal continue` intercept — fires the audit prompt as
+    // an agent turn (composes with `/loop /goal continue`). Same
+    // rewrite-before-match pattern as `/kms ingest <name> $`. If no
+    // active goal or goal already terminal, surface a notice and
+    // stop the active loop.
+    if matches!(
+        crate::repl::parse_slash(trimmed),
+        Some(crate::repl::SlashCommand::GoalContinue)
+    ) {
+        match crate::goal_state::current() {
+            Some(g) if g.status.is_terminal() => {
+                let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+                    "/goal continue — goal already {}. Stopping loop if active.",
+                    g.status.as_str(),
+                )));
+                if let Some(loop_state) = state.active_loop.take() {
+                    loop_state.abort.abort();
+                }
+                let _ = events_tx.send(ViewEvent::TurnDone);
+                return;
+            }
+            Some(g) => {
+                let prompt = crate::goal_state::build_audit_prompt(&g);
+                crate::goal_state::record_iteration(0);
+                let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+                    "(/goal continue → audit prompt fired — iteration {}, {}s elapsed)",
+                    g.iterations_done.saturating_add(1),
+                    g.time_used_secs(),
+                )));
+                if let Some(l) = state.active_loop.as_mut() {
+                    l.iterations_fired = l.iterations_fired.saturating_add(1);
+                }
+                let stream = Box::pin(state.agent.run_turn(prompt));
+                let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
+                let _ = lead_mb.write_status("lead", "working", None);
+                drive_turn_stream(stream, state, events_tx, cancel, &lead_mb, input_tx).await;
+                // Post-turn: if the model called UpdateGoal with terminal
+                // status, stop the loop so the next firing doesn't run.
+                if let Some(g) = crate::goal_state::current() {
+                    if g.status.is_terminal() {
+                        if let Some(loop_state) = state.active_loop.take() {
+                            loop_state.abort.abort();
+                            let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+                                "loop auto-stopped (goal {})",
+                                g.status.as_str(),
+                            )));
+                        }
+                    }
+                }
+                return;
+            }
+            None => {
+                let _ = events_tx.send(ViewEvent::SlashOutput(
+                    "/goal continue — no active goal. Try /goal start \"<objective>\" first."
+                        .into(),
+                ));
+                let _ = events_tx.send(ViewEvent::TurnDone);
+                return;
+            }
+        }
+    }
+
+    // M6.28: `/kms ingest <name> $` intercept — the `$` source means
+    // "the current chat session". Page slug resolves from
+    // session.title (if set) or session.id (fallback). Rewrite into a
+    // turn-starting prompt that instructs the model to summarize
+    // history and call `KmsWrite`.
+    if let Some(crate::repl::SlashCommand::KmsIngestSession { name, alias, force }) =
+        crate::repl::parse_slash(trimmed)
+    {
+        let (page, source) = crate::repl::resolve_session_alias(
+            alias.as_deref(),
+            state.session.title.as_deref(),
+            &state.session.id,
+        );
+        let rewritten = crate::repl::build_kms_ingest_session_prompt(&name, &page, source, force);
+        let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+            "(/kms ingest {name} $ → page `{page}` — summarize and KmsWrite)"
+        )));
+        let stream = Box::pin(state.agent.run_turn(rewritten));
+        let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
+        let _ = lead_mb.write_status("lead", "working", None);
+        drive_turn_stream(stream, state, events_tx, cancel, &lead_mb, input_tx).await;
+        return;
+    }
+
     if trimmed.starts_with('/') {
         // `/<word> [args]` shortcut — same UX + resolution order as
         // the CLI repl (see repl.rs:2601-2632). If `parse_slash`
@@ -1428,7 +1796,7 @@ async fn handle_line(
             }
         }
 
-        crate::shell_dispatch::dispatch(trimmed, state, events_tx).await;
+        crate::shell_dispatch::dispatch(trimmed, state, events_tx, input_tx).await;
         let _ = events_tx.send(ViewEvent::TurnDone);
         return;
     }
@@ -1621,7 +1989,16 @@ async fn drive_turn_stream(
             .find(|s| s.status == crate::tools::plan_state::StepStatus::InProgress);
         if let Some(step) = in_progress {
             let turns = crate::tools::plan_state::note_turn_completed_without_progress();
-            if turns >= crate::tools::plan_state::STALL_TURN_THRESHOLD {
+            // M6.31 PM2: rising-edge only. Pre-fix `>=` fired
+            // PlanStalled on every subsequent turn after crossing the
+            // threshold (turn 3 → fire, turn 4 → fire again, turn 5 →
+            // fire again, …) — sidebar saw repeated banners until the
+            // user clicked Continue. `==` fires once when the counter
+            // first hits the threshold; any plan mutation
+            // (UpdatePlanStep, force_step_done, the sidebar's
+            // Continue button) resets the counter and re-arms the
+            // detector for the next 3 unproductive turns.
+            if turns == crate::tools::plan_state::STALL_TURN_THRESHOLD {
                 let _ = events_tx.send(ViewEvent::PlanStalled {
                     step_id: step.id.clone(),
                     step_title: step.title.clone(),

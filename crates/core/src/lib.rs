@@ -16,9 +16,12 @@ pub mod context;
 pub mod dotenv;
 pub mod endpoints;
 pub mod error;
+pub mod event_render;
+pub mod goal_state;
 #[cfg(feature = "gui")]
 pub mod gui;
 pub mod hooks;
+pub mod ipc;
 pub mod kms;
 pub mod marketplace;
 pub mod mcp;
@@ -33,6 +36,7 @@ pub mod providers;
 pub mod repl;
 pub mod sandbox;
 pub mod secrets;
+pub mod server;
 pub mod session;
 #[cfg(feature = "gui")]
 pub mod shared_session;

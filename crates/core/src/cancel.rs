@@ -83,7 +83,10 @@ mod tests {
         token.cancel();
         // Should resolve fast (no real wait).
         let res = tokio::time::timeout(Duration::from_millis(50), token.cancelled()).await;
-        assert!(res.is_ok(), "cancelled() should return immediately when flag set");
+        assert!(
+            res.is_ok(),
+            "cancelled() should return immediately when flag set"
+        );
     }
 
     #[tokio::test]

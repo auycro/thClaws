@@ -9,10 +9,13 @@
 //! the definition from `~/.config/thclaws/agents.json` and uses
 //! its instructions, model override, and tool subset.
 
-use crate::agent::{collect_agent_turn, Agent};
-use crate::agent_defs::AgentDef;
+use crate::agent::{collect_agent_turn_with_cancel, Agent};
+use crate::agent_defs::{AgentDef, AgentDefsConfig};
+use crate::cancel::CancelToken;
 use crate::error::{Error, Result};
-use crate::tools::{req_str, Tool};
+use crate::permissions::{ApprovalSink, PermissionMode};
+use crate::providers::Provider;
+use crate::tools::{req_str, Tool, ToolRegistry};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -34,12 +37,164 @@ pub trait AgentFactory: Send + Sync {
     ) -> Result<Agent>;
 }
 
+/// M6.33: production agent factory shared by CLI (`run_repl`) and GUI
+/// (`build_state`). Pre-fix the CLI had its own `ReplAgentFactory` and
+/// the GUI had no factory at all (Task tool unregistered — SUB1).
+/// Consolidated here so both surfaces get identical subagent behavior.
+///
+/// Fields capture the parent's runtime state for propagation to child
+/// agents:
+/// - `provider` / `model` — wire layer for the child's LLM calls
+/// - `base_tools` — tool registry the child inherits (filtered by
+///   agent_def.tools allow-list + agent_def.disallowed_tools deny-list
+///   inside `build`)
+/// - `system` — parent's full system prompt (CLAUDE.md + memory + KMS +
+///   plan + todos), copied to the child + agent_def addendum + the
+///   embedded `subagent.md` "you are a sub-agent" wording
+/// - `max_iterations` — fallback when agent_def doesn't specify
+/// - `max_depth` — recursion ceiling; child gets a Task tool only when
+///   child_depth < max_depth
+/// - `agent_defs` — registry of named agents (for nested Task calls)
+/// - `approver` + `permission_mode` — M6.20 BUG H1: parent's gate
+///   propagates so subagents can't silently bypass Ask mode
+/// - `cancel` — M6.33 SUB4: parent's cancel token propagates so
+///   ctrl-C reaches a runaway subagent. CLI passes `None` (no cancel
+///   plumbing yet); GUI passes the worker's CancelToken.
+pub struct ProductionAgentFactory {
+    pub provider: Arc<dyn Provider>,
+    pub base_tools: ToolRegistry,
+    pub model: String,
+    pub system: String,
+    pub max_iterations: usize,
+    pub max_depth: usize,
+    pub agent_defs: AgentDefsConfig,
+    pub approver: Arc<dyn ApprovalSink>,
+    pub permission_mode: PermissionMode,
+    pub cancel: Option<CancelToken>,
+    /// M6.35 HOOK1: lifecycle hooks propagate parent → subagent so a
+    /// pre/post_tool_use hook fires for tool calls inside a Task spawn,
+    /// not just at the top-level agent. Audit hooks would otherwise miss
+    /// every subagent action — silent gap.
+    pub hooks: Option<Arc<crate::hooks::HooksConfig>>,
+}
+
+#[async_trait]
+impl AgentFactory for ProductionAgentFactory {
+    async fn build(
+        &self,
+        _prompt: &str,
+        agent_def: Option<&AgentDef>,
+        child_depth: usize,
+    ) -> Result<Agent> {
+        let model = agent_def
+            .and_then(|d| d.model.as_deref())
+            .unwrap_or(&self.model);
+
+        // System prompt: parent's full prompt + (optional) agent
+        // instructions + (when nested) the subagent-mode addendum.
+        let mut system = agent_def
+            .map(|d| {
+                if d.instructions.is_empty() {
+                    self.system.clone()
+                } else {
+                    format!(
+                        "{}\n\n# Agent instructions\n{}",
+                        self.system, d.instructions
+                    )
+                }
+            })
+            .unwrap_or_else(|| self.system.clone());
+        if child_depth > 0 {
+            system.push_str(&crate::prompts::load(
+                "subagent",
+                crate::prompts::defaults::SUBAGENT,
+            ));
+        }
+        let max_iter = agent_def
+            .map(|d| d.max_iterations)
+            .unwrap_or(self.max_iterations);
+
+        // Tool registry: agent_def.tools allow-list (when non-empty)
+        // intersects base_tools, then agent_def.disallowed_tools
+        // deny-list removes anything in it. M6.33 SUB2: pre-fix
+        // disallowed_tools was parsed but never applied — agent
+        // definitions claiming `disallowed_tools: Bash` got Bash anyway.
+        let mut tools = if let Some(def) = agent_def {
+            if def.tools.is_empty() {
+                self.base_tools.clone()
+            } else {
+                let mut filtered = ToolRegistry::new();
+                for name in &def.tools {
+                    if let Some(tool) = self.base_tools.get(name) {
+                        filtered.register(tool);
+                    }
+                }
+                filtered
+            }
+        } else {
+            self.base_tools.clone()
+        };
+        if let Some(def) = agent_def {
+            for name in &def.disallowed_tools {
+                tools.remove(name);
+            }
+        }
+
+        // Add a Task tool at the next depth (multi-level recursion).
+        // child_depth < max_depth → register; otherwise the leaf
+        // subagent has no Task tool and the chain stops.
+        if child_depth < self.max_depth {
+            let child_factory = Arc::new(ProductionAgentFactory {
+                provider: self.provider.clone(),
+                base_tools: self.base_tools.clone(),
+                model: self.model.clone(),
+                system: self.system.clone(),
+                max_iterations: self.max_iterations,
+                max_depth: self.max_depth,
+                agent_defs: self.agent_defs.clone(),
+                approver: self.approver.clone(),
+                permission_mode: self.permission_mode,
+                cancel: self.cancel.clone(),
+                hooks: self.hooks.clone(),
+            });
+            let mut child_tool = SubAgentTool::new(child_factory)
+                .with_depth(child_depth)
+                .with_max_depth(self.max_depth)
+                .with_agent_defs(self.agent_defs.clone());
+            if let Some(c) = self.cancel.clone() {
+                child_tool = child_tool.with_cancel(c);
+            }
+            tools.register(Arc::new(child_tool));
+        }
+
+        // M6.33 SUB4: thread parent's cancel token into the child agent
+        // so retry-backoff sleeps + collect_agent_turn observe ctrl-C.
+        let mut agent = Agent::new(self.provider.clone(), tools, model, &system)
+            .with_max_iterations(max_iter)
+            .with_approver(self.approver.clone())
+            .with_permission_mode(self.permission_mode);
+        if let Some(c) = self.cancel.clone() {
+            agent = agent.with_cancel(c);
+        }
+        // M6.35 HOOK1: subagent inherits parent's hooks so audit hooks
+        // see Task-spawned tool calls too.
+        if let Some(h) = self.hooks.clone() {
+            agent = agent.with_hooks(h);
+        }
+        Ok(agent)
+    }
+}
+
 pub struct SubAgentTool {
     factory: Arc<dyn AgentFactory>,
     depth: usize,
     max_depth: usize,
     /// Agent definitions loaded at startup.
     agent_defs: crate::agent_defs::AgentDefsConfig,
+    /// M6.33 SUB4: parent's cancel token. Observed by
+    /// `collect_agent_turn_with_cancel` so ctrl-C reaches a runaway
+    /// subagent. None when no parent cancel is wired (CLI today).
+    cancel: Option<CancelToken>,
 }
 
 impl SubAgentTool {
@@ -51,6 +206,7 @@ impl SubAgentTool {
             agent_defs: crate::agent_defs::AgentDefsConfig::load_with_extra(
                 &crate::plugins::plugin_agent_dirs(),
             ),
+            cancel: None,
         }
     }
 
@@ -66,6 +222,15 @@ impl SubAgentTool {
 
     pub fn with_agent_defs(mut self, defs: crate::agent_defs::AgentDefsConfig) -> Self {
         self.agent_defs = defs;
+        self
+    }
+
+    /// M6.33 SUB4: wire a cancel token. The token is observed inside
+    /// `collect_agent_turn_with_cancel` so a parent ctrl-C / `/cancel`
+    /// short-circuits the subagent's stream instead of waiting for it
+    /// to run to completion.
+    pub fn with_cancel(mut self, token: CancelToken) -> Self {
+        self.cancel = Some(token);
         self
     }
 }
@@ -143,7 +308,10 @@ impl Tool for SubAgentTool {
         let child_depth = self.depth + 1;
         let agent = self.factory.build(&prompt, agent_def, child_depth).await?;
         let stream = agent.run_turn(prompt);
-        let outcome = collect_agent_turn(stream).await?;
+        // M6.33 SUB4: collect_agent_turn_with_cancel observes the
+        // parent's cancel token between stream events. Pre-fix the
+        // subagent stream ran to completion regardless of ctrl-C.
+        let outcome = collect_agent_turn_with_cancel(stream, self.cancel.clone()).await?;
 
         if outcome.text.is_empty() {
             Err(Error::Agent("sub-agent returned empty response".into()))
@@ -161,7 +329,7 @@ mod tests {
     use crate::providers::{EventStream, Provider, ProviderEvent, StreamRequest};
     use crate::tools::ToolRegistry;
     use async_trait::async_trait;
-    use futures::{stream, StreamExt};
+    use futures::stream;
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -262,6 +430,104 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("unknown agent"));
+    }
+
+    struct EchoTool {
+        name: &'static str,
+    }
+    #[async_trait]
+    impl Tool for EchoTool {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn description(&self) -> &'static str {
+            "echo"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type":"object"})
+        }
+        async fn call(&self, _input: Value) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    struct StubProvider;
+    #[async_trait]
+    impl Provider for StubProvider {
+        async fn stream(&self, _r: StreamRequest) -> Result<EventStream> {
+            Ok(Box::pin(stream::iter(vec![Ok(
+                ProviderEvent::MessageStart {
+                    model: "test".into(),
+                },
+            )])))
+        }
+    }
+
+    /// M6.33 SUB2: agent_def.disallowed_tools must be honored. Pre-fix
+    /// the field was parsed but never applied — agent definitions
+    /// claiming `disallowed_tools: Bash` got Bash anyway.
+    #[tokio::test]
+    async fn production_factory_applies_agent_def_disallowed_tools() {
+        let mut base = ToolRegistry::new();
+        base.register(Arc::new(EchoTool { name: "Bash" }));
+        base.register(Arc::new(EchoTool { name: "Read" }));
+
+        let factory = ProductionAgentFactory {
+            provider: Arc::new(StubProvider),
+            base_tools: base,
+            model: "test".into(),
+            system: String::new(),
+            max_iterations: 1,
+            max_depth: 3,
+            agent_defs: AgentDefsConfig::default(),
+            approver: Arc::new(crate::permissions::DenyApprover),
+            permission_mode: PermissionMode::Auto,
+            cancel: None,
+            hooks: None,
+        };
+        let def = AgentDef {
+            name: "restricted".into(),
+            disallowed_tools: vec!["Bash".into()],
+            ..Default::default()
+        };
+        let child = factory.build("go", Some(&def), 1).await.unwrap();
+        let names = child.tools.names();
+        assert!(
+            !names.contains(&"Bash"),
+            "Bash should be removed by disallowed_tools, got {names:?}"
+        );
+        assert!(names.contains(&"Read"), "Read should remain, got {names:?}");
+    }
+
+    /// M6.33 SUB4: parent's cancel token propagates into the built
+    /// child agent so retry-backoff sleeps + the streaming collector
+    /// observe ctrl-C. Pre-fix the subagent ran to completion.
+    #[tokio::test]
+    async fn production_factory_propagates_cancel_token() {
+        let cancel = CancelToken::new();
+        let factory = ProductionAgentFactory {
+            provider: Arc::new(StubProvider),
+            base_tools: ToolRegistry::new(),
+            model: "test".into(),
+            system: String::new(),
+            max_iterations: 1,
+            max_depth: 3,
+            agent_defs: AgentDefsConfig::default(),
+            approver: Arc::new(crate::permissions::DenyApprover),
+            permission_mode: PermissionMode::Auto,
+            cancel: Some(cancel.clone()),
+            hooks: None,
+        };
+        let child = factory.build("go", None, 1).await.unwrap();
+        cancel.cancel();
+        assert!(
+            child
+                .cancel
+                .as_ref()
+                .map(|c| c.is_cancelled())
+                .unwrap_or(false),
+            "child agent should observe parent's cancel token"
+        );
     }
 
     #[tokio::test]

@@ -11,6 +11,16 @@ use serde_json::{json, Value};
 /// Users with larger images need to downscale before reading.
 const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
+/// M6.23 BUG RT1: hard cap on text-file size for the read-whole-file
+/// path. Pre-fix `std::fs::read_to_string` had no cap, so reading a
+/// multi-GB log file could OOM the worker. 100 MB is generous enough
+/// for any real source file or document; logs / data dumps that
+/// exceed it should be sliced via `offset` + `limit`. Note: even
+/// offset+limit currently reads the whole file — a future enhancement
+/// would stream-read for the slice case, but the size cap still
+/// applies for now.
+const MAX_TEXT_BYTES: u64 = 100 * 1024 * 1024;
+
 pub struct ReadTool;
 
 /// Detect a supported image MIME type from the file extension. Returns
@@ -104,6 +114,25 @@ impl Tool for ReadTool {
             .get("limit")
             .and_then(Value::as_u64)
             .map(|n| n as usize);
+
+        // M6.23 BUG RT1: pre-flight size check so a multi-GB file
+        // doesn't OOM the worker via `read_to_string`. The agent's
+        // tool-result truncation (TOOL_RESULT_CONTEXT_LIMIT=50KB)
+        // catches huge OUTPUT, but the read itself happens before
+        // truncation. Cap at 100 MB; require offset+limit for larger
+        // files (with the hint in the error message).
+        let file_size = std::fs::metadata(&path)
+            .map_err(|e| Error::Tool(format!("stat {}: {e}", path.display())))?
+            .len();
+        if file_size > MAX_TEXT_BYTES {
+            return Err(Error::Tool(format!(
+                "{} is {} bytes — over the {}-byte cap. Use `offset` + `limit` to read a slice, \
+                 or use Bash + `head`/`tail`/`sed` for very large files.",
+                path.display(),
+                file_size,
+                MAX_TEXT_BYTES,
+            )));
+        }
 
         let contents = std::fs::read_to_string(&path)
             .map_err(|e| Error::Tool(format!("read {}: {e}", path.display())))?;
@@ -242,7 +271,46 @@ mod tests {
             .await
             .unwrap_err();
         let s = format!("{err}");
-        assert!(s.contains("read"));
+        // M6.23 BUG RT1: error may surface from `stat` (the new
+        // pre-flight size check) instead of `read`. Either word
+        // means we surfaced a clear filesystem-error message.
+        assert!(
+            s.contains("stat") || s.contains("read"),
+            "expected stat/read in error, got: {s}"
+        );
+    }
+
+    /// M6.23 BUG RT1: oversize-file pre-flight check rejects with a
+    /// clear "use offset+limit" hint instead of OOMing on
+    /// `read_to_string`. Tested by stubbing the cap (the production
+    /// MAX_TEXT_BYTES is 100MB which is impractical to fixture).
+    /// Instead verify the error path triggers when metadata reports
+    /// a size > MAX_TEXT_BYTES via a check on the helper logic
+    /// indirectly.
+    #[tokio::test]
+    async fn oversize_text_file_errors_before_read() {
+        // Build a temp file just over the cap by sparse-write — we
+        // don't actually need 100MB of bytes; on most filesystems
+        // `set_len` creates a sparse file that reports the right
+        // metadata.len() without consuming disk.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("huge.txt");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_TEXT_BYTES + 1).unwrap();
+
+        let err = ReadTool
+            .call(json!({"path": path.to_string_lossy()}))
+            .await
+            .unwrap_err();
+        let s = format!("{err}");
+        assert!(
+            s.contains("over the") && s.contains("cap"),
+            "expected oversize error, got: {s}"
+        );
+        assert!(
+            s.contains("offset") && s.contains("limit"),
+            "error should hint at the offset+limit slice escape, got: {s}"
+        );
     }
 
     #[tokio::test]

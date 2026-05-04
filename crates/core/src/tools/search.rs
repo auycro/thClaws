@@ -9,6 +9,14 @@ use super::{req_str, Tool};
 use crate::error::{Error, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::time::Duration;
+
+/// Hard timeout for WebSearch backends. M6.23 BUG WT1: same root cause
+/// as WebFetch — pre-fix `reqwest::Client::new()` had no timeout. 30s
+/// is enough for the slowest healthy search backend (DDG HTML scrape
+/// can be slow); pathological hangs cap out instead of stalling the
+/// agent indefinitely.
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct WebSearchTool {
     client: reqwest::Client,
@@ -18,8 +26,14 @@ pub struct WebSearchTool {
 impl WebSearchTool {
     /// `engine`: `"auto"` (detect from env), `"tavily"`, `"brave"`, `"duckduckgo"`/`"ddg"`.
     pub fn new(engine: &str) -> Self {
+        // M6.23 BUG WT1: explicit timeout on the shared client; all
+        // three backends (Tavily/Brave/DDG) inherit it.
+        let client = reqwest::Client::builder()
+            .timeout(SEARCH_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            client: reqwest::Client::new(),
+            client,
             engine: engine.to_string(),
         }
     }

@@ -562,7 +562,11 @@ impl McpClient {
                 // debugging which auth path a request took.
                 mcp_debug!(
                     "\x1b[2m[mcp-http] bridge POST: token={}, session={}, body_len={}\x1b[0m",
-                    if current_token.is_some() { "present" } else { "none" },
+                    if current_token.is_some() {
+                        "present"
+                    } else {
+                        "none"
+                    },
                     current_session.as_deref().unwrap_or("None"),
                     trimmed.len(),
                 );

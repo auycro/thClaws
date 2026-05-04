@@ -337,6 +337,16 @@ impl SkillStore {
             if !skill_md.exists() {
                 continue;
             }
+            // M6.20 BUG M5: load-time policy gate. Pre-fix
+            // `enforce_scripts_policy` only ran at install time, so a
+            // skill installed BEFORE the org pushed a policy with
+            // `allow_external_scripts: false` continued to load on
+            // restart. Apply the same gate here so policy rotation
+            // takes effect on next launch.
+            if let Err(e) = enforce_scripts_policy(&path) {
+                eprintln!("\x1b[33m[skills] skipping {}: {e}\x1b[0m", path.display());
+                continue;
+            }
             if let Some(skill) = Self::parse_skill(&path, &skill_md) {
                 self.skills.insert(skill.name.clone(), skill);
             }
@@ -1132,17 +1142,25 @@ impl Tool for SkillTool {
     }
 
     fn input_schema(&self) -> Value {
-        let store = self.store.lock().unwrap();
-        let available = store.names().join(", ");
+        // M6.18 BUG M1: don't enumerate skill names here. Pre-fix the
+        // schema description shipped every installed skill name on
+        // every request, which:
+        //   1. Doubled the per-turn token cost vs the system-prompt
+        //      "Available skills" section (which already lists names
+        //      under the "full" / "names-only" strategies).
+        //   2. Defeated the entire point of the "discover-tool-only"
+        //      strategy — that mode hides names from the system prompt
+        //      to make the prompt constant-size, but the tool def
+        //      leaked them anyway.
+        // The system prompt's strategy renderer is the single source
+        // of truth for what skill names the model sees. The model
+        // calls SkillList / SkillSearch under "discover-tool-only".
         json!({
             "type": "object",
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": format!(
-                        "Skill to invoke. Available: {}",
-                        if available.is_empty() { "none" } else { &available }
-                    )
+                    "description": "Name of the skill to invoke. See the system prompt's `# Available skills` section, or call `SkillList()` / `SkillSearch(query: ...)` to discover."
                 }
             },
             "required": ["name"]

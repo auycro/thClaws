@@ -2,6 +2,14 @@ use super::{req_str, Tool};
 use crate::error::{Error, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::time::Duration;
+
+/// Hard timeout for the WebFetch HTTP request. M6.23 BUG WT1: pre-fix
+/// the client had no timeout, so a hanging server / slow DNS would
+/// stall the agent indefinitely (and the agent's cancel token wasn't
+/// observed at the .send().await boundary). 30s is generous for normal
+/// pages while preventing pathological hangs.
+const WEB_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct WebFetchTool {
     client: reqwest::Client,
@@ -9,9 +17,15 @@ pub struct WebFetchTool {
 
 impl WebFetchTool {
     pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::new(),
-        }
+        // M6.23 BUG WT1: explicit timeout. `reqwest::Client::new()` has
+        // no default; we add one so a slow upstream can't take down
+        // the agent. Falls back to no-timeout client if the builder
+        // fails (extremely unlikely; defensive).
+        let client = reqwest::Client::builder()
+            .timeout(WEB_FETCH_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self { client }
     }
 }
 
