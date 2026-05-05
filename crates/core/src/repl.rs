@@ -222,6 +222,13 @@ pub enum SlashCommand {
         objective: String,
         budget_tokens: Option<u64>,
         budget_time_secs: Option<u64>,
+        /// Phase D1: when true, the worker auto-queues the next
+        /// `/goal continue` after each finishing turn (provided the
+        /// turn made tool calls, status is still Active, and no /loop
+        /// is wrapping). Opt-in via `--auto` on /goal start so the
+        /// default behavior (manual or /loop-driven continuation)
+        /// stays unchanged.
+        auto_continue: bool,
     },
     /// M6.29: show current goal state + budget consumption.
     GoalStatus,
@@ -1338,10 +1345,17 @@ fn parse_goal_start_args(rest: &str) -> SlashCommand {
     let mut objective_parts: Vec<String> = Vec::new();
     let mut budget_tokens: Option<u64> = None;
     let mut budget_time_secs: Option<u64> = None;
+    let mut auto_continue = false;
     let mut i = 0;
     while i < tokens.len() {
         let tok = tokens[i].as_str();
         match tok {
+            "--auto" | "--auto-continue" => {
+                // Phase D1: opt-in auto-continuation. After each goal
+                // turn finishes, the worker queues another /goal
+                // continue automatically — no /loop wrapper needed.
+                auto_continue = true;
+            }
             "--budget-tokens" | "--tokens" => {
                 i += 1;
                 if i >= tokens.len() {
@@ -1391,6 +1405,7 @@ fn parse_goal_start_args(rest: &str) -> SlashCommand {
         objective,
         budget_tokens,
         budget_time_secs,
+        auto_continue,
     }
 }
 
@@ -2088,6 +2103,31 @@ pub fn build_provider(config: &AppConfig) -> Result<Arc<dyn Provider>> {
                     .with_strip_model_prefix("thaillm/"),
             ))
         }
+        ProviderKind::Nvidia => {
+            // NVIDIA NIM — OpenAI-compatible hosted inference at
+            // integrate.api.nvidia.com. The `/v1/models` endpoint serves
+            // many vendor namespaces (`nvidia/…`, `meta/…`, `google/…`,
+            // `mistralai/…`); we store every entry under a uniform
+            // `nvidia/` routing prefix so `from_model_id` auto-routes the
+            // whole NIM catalog with one rule. Strip the prefix before
+            // hitting the upstream so NVIDIA-owned models stored as
+            // `nvidia/nvidia/<name>` reach the API as `nvidia/<name>`,
+            // and third-party-owned models like `nvidia/meta/<name>` go
+            // out as `meta/<name>`. Override via NVIDIA_BASE_URL for
+            // on-prem NIM deployments.
+            let base = std::env::var("NVIDIA_BASE_URL")
+                .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
+            let url = if base.ends_with("/chat/completions") {
+                base
+            } else {
+                format!("{}/chat/completions", base.trim_end_matches('/'))
+            };
+            Ok(Arc::new(
+                OpenAIProvider::new(api_key)
+                    .with_base_url(url)
+                    .with_strip_model_prefix("nvidia/"),
+            ))
+        }
         ProviderKind::Ollama
         | ProviderKind::OllamaAnthropic
         | ProviderKind::LMStudio
@@ -2320,10 +2360,25 @@ pub async fn run_print_mode(config: AppConfig, prompt: &str) -> Result<()> {
         .with_permission_mode(perm_mode);
 
     let mut stream = Box::pin(agent.run_turn(prompt.to_string()));
+    let mut last_was_thinking = false;
     while let Some(ev) = stream.next().await {
         match ev {
             Ok(AgentEvent::Text(s)) => {
+                if last_was_thinking {
+                    println!();
+                    last_was_thinking = false;
+                }
                 print!("{s}");
+                let _ = std::io::stdout().flush();
+            }
+            Ok(AgentEvent::Thinking(s)) => {
+                // Reasoning models (DeepSeek v4/r1, OpenAI o-series, NVIDIA NIM
+                // glm4.7, …) emit reasoning_content before the final answer.
+                // Print dim-italic so it's distinguishable from the answer in
+                // -p / scripted output, but still visible (otherwise the user
+                // sees nothing for many seconds while the model thinks).
+                print!("\x1b[2;3m{s}\x1b[0m");
+                last_was_thinking = true;
                 let _ = std::io::stdout().flush();
             }
             Ok(AgentEvent::Done { .. }) => {
@@ -2333,7 +2388,14 @@ pub async fn run_print_mode(config: AppConfig, prompt: &str) -> Result<()> {
                 eprintln!("\nerror: {e}");
                 std::process::exit(1);
             }
-            _ => {}
+            _ => {
+                // Any other event after thinking should also start on a
+                // new line so the dim-italic doesn't run into it.
+                if last_was_thinking {
+                    println!();
+                    last_was_thinking = false;
+                }
+            }
         }
     }
     Ok(())
@@ -3182,6 +3244,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                 lead_log!("{COLOR_GREEN}");
                 let _ = std::io::stdout().flush();
                 let mut stream = Box::pin(agent.run_turn(team_prompt));
+                let mut last_was_thinking = false;
                 loop {
                     let ev = tokio::select! {
                         ev = stream.next() => ev,
@@ -3195,11 +3258,26 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     let Some(ev) = ev else { break };
                     match ev {
                         Ok(AgentEvent::Text(s)) => {
+                            if last_was_thinking {
+                                println!();
+                                last_was_thinking = false;
+                            }
                             print!("{s}");
                             lead_log!("{s}");
                             let _ = std::io::stdout().flush();
                         }
+                        Ok(AgentEvent::Thinking(s)) => {
+                            // Dim-italic so reasoning is visibly distinct from
+                            // the final answer (DeepSeek v4/r1, glm4.7, etc.).
+                            print!("\x1b[2;3m{s}\x1b[0m");
+                            last_was_thinking = true;
+                            let _ = std::io::stdout().flush();
+                        }
                         Ok(AgentEvent::ToolCallStart { name, .. }) => {
+                            // Tool-call line already starts with \n, so any
+                            // prior thinking is naturally separated; clear
+                            // the flag so we don't double-line.
+                            last_was_thinking = false;
                             print!(
                                 "{COLOR_RESET}\n{COLOR_DIM}[tool: {name}]{COLOR_RESET}{COLOR_GREEN}"
                             );
@@ -5813,18 +5891,27 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     objective,
                     budget_tokens,
                     budget_time_secs,
+                    auto_continue,
                 } => {
                     let new_goal = crate::goal_state::GoalState::new(
                         objective.clone(),
                         budget_tokens,
                         budget_time_secs,
+                        auto_continue,
                     );
                     crate::goal_state::set(Some(new_goal));
-                    tool_registry.register(Arc::new(crate::tools::UpdateGoalTool));
+                    // Phase C1: register the three split goal-lifecycle
+                    // tools (RecordGoalProgress / MarkGoalComplete /
+                    // MarkGoalBlocked) — authority separation prevents
+                    // the model from slipping into "mark complete to
+                    // escape the loop".
+                    tool_registry.register(Arc::new(crate::tools::RecordGoalProgressTool));
+                    tool_registry.register(Arc::new(crate::tools::MarkGoalCompleteTool));
+                    tool_registry.register(Arc::new(crate::tools::MarkGoalBlockedTool));
                     // System prompt + agent rebuild aren't strictly
-                    // required (UpdateGoal is a callable tool either
+                    // required (the goal tools are callable either
                     // way) but rebuilding ensures the model sees the
-                    // new tool in its catalog this turn.
+                    // new tools in its catalog this turn.
                     println!(
                         "{COLOR_DIM}goal started: \"{}\" (budget_tokens={}, budget_time={}){COLOR_RESET}",
                         objective,
@@ -5959,6 +6046,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
         let turn_start = std::time::Instant::now();
         let mut stream = Box::pin(agent.run_turn(line.to_string()));
         let mut _cancelled = false;
+        let mut last_was_thinking = false;
         loop {
             let ev = tokio::select! {
                 ev = stream.next() => ev,
@@ -5973,11 +6061,25 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
             match ev {
                 Ok(AgentEvent::IterationStart { .. }) => {}
                 Ok(AgentEvent::Text(s)) => {
+                    if last_was_thinking {
+                        println!();
+                        last_was_thinking = false;
+                    }
                     print!("{s}");
                     lead_log!("{s}");
                     let _ = std::io::stdout().flush();
                 }
+                Ok(AgentEvent::Thinking(s)) => {
+                    // Dim-italic so reasoning is visibly distinct from
+                    // the model's final answer in the CLI stream.
+                    print!("\x1b[2;3m{s}\x1b[0m");
+                    last_was_thinking = true;
+                    let _ = std::io::stdout().flush();
+                }
                 Ok(AgentEvent::ToolCallStart { name, input, .. }) => {
+                    // Tool-call line already starts with \n, so any prior
+                    // thinking is naturally separated; clear the flag.
+                    last_was_thinking = false;
                     let detail = match name.as_str() {
                         "Bash" => input
                             .get("command")
@@ -6841,6 +6943,7 @@ mod tests {
                 objective: "ship the auth refactor".into(),
                 budget_tokens: Some(200_000),
                 budget_time_secs: Some(1800),
+                auto_continue: false,
             })
         );
         // Without quotes — objective is words up to first --flag.
@@ -6850,6 +6953,32 @@ mod tests {
                 objective: "build a REST API".into(),
                 budget_tokens: Some(50_000),
                 budget_time_secs: None,
+                auto_continue: false,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_slash_goal_start_with_auto_flag() {
+        // Phase D1: --auto flips auto_continue so the worker queues the
+        // next /goal continue automatically after each finishing turn.
+        assert_eq!(
+            parse_slash("/goal start \"refactor X\" --auto --budget-tokens 10000"),
+            Some(SlashCommand::GoalStart {
+                objective: "refactor X".into(),
+                budget_tokens: Some(10_000),
+                budget_time_secs: None,
+                auto_continue: true,
+            })
+        );
+        // --auto-continue alias.
+        assert_eq!(
+            parse_slash("/goal start \"refactor X\" --auto-continue"),
+            Some(SlashCommand::GoalStart {
+                objective: "refactor X".into(),
+                budget_tokens: None,
+                budget_time_secs: None,
+                auto_continue: true,
             })
         );
     }

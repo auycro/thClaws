@@ -13,7 +13,7 @@ Budget:
 - Tokens remaining: {{ remaining_tokens }}
 - Iterations completed: {{ iterations_done }}
 
-Prior audit summary (from the last `UpdateGoal` call):
+Prior audit summary (from the most recent goal-tool call):
 {{ prior_audit }}
 
 Avoid repeating work that is already done. Choose the next concrete action toward the objective.
@@ -29,8 +29,10 @@ Before deciding that the goal is achieved, perform a completion audit against th
 
 Do not rely on intent, partial progress, elapsed effort, memory of earlier work, or a plausible final answer as proof of completion. Only mark the goal achieved when the audit shows that the objective has actually been achieved and no required work remains. If any requirement is missing, incomplete, or unverified, keep working instead of marking the goal complete.
 
-If the objective is achieved, call `UpdateGoal(status: "complete", audit: "<short summary of evidence>")` so the iteration loop terminates and usage accounting is preserved. Report final elapsed time + token consumption in your response.
+If the objective is achieved, call `MarkGoalComplete(audit: "<short summary of the evidence the audit verified>", reason: "<optional user-facing message>")` so the iteration loop terminates and usage accounting is preserved. Report final elapsed time + token consumption in your response.
 
-If the goal cannot continue productively (missing input, external blocker, ambiguous spec), call `UpdateGoal(status: "blocked", reason: "<what's needed>")` and explain to the user. Do not call UpdateGoal with status "complete" merely because the budget is nearly exhausted or because you are stopping work — use "blocked" or just continue.
+If the goal cannot continue productively (missing input, external blocker, ambiguous spec), call `MarkGoalBlocked(reason: "<what's needed from the user>", audit: "<optional summary of work done so far>")` and explain to the user. Do not call MarkGoalComplete merely because the budget is nearly exhausted or because you are stopping work — use MarkGoalBlocked or just continue.
 
-If neither completion nor blockage applies: do the next concrete piece of work toward the objective and let the next iteration loop fire.
+If you want to checkpoint a partial audit summary mid-loop (so the next iteration sees what you've already verified, without ending the loop), call `RecordGoalProgress(audit: "<what was just checked>")`. This stays Active.
+
+If none of those apply: do the next concrete piece of work toward the objective and let the next iteration loop fire.

@@ -16,11 +16,22 @@ pub mod context;
 pub mod dotenv;
 pub mod endpoints;
 pub mod error;
+// event_render, ipc, server, file_preview all transitively depend on
+// crate::shared_session (which is gui-gated below) and/or `comrak`
+// (also gui-gated in Cargo.toml). M6.36 SERVE9 introduced them as
+// always-on by mistake; gate them behind the same `gui` feature so
+// the CLI-only thclaws-cli binary still builds.
+#[cfg(feature = "gui")]
 pub mod event_render;
+pub mod external_url;
+#[cfg(feature = "gui")]
+pub mod file_preview;
 pub mod goal_state;
 #[cfg(feature = "gui")]
 pub mod gui;
 pub mod hooks;
+pub mod instructions;
+#[cfg(feature = "gui")]
 pub mod ipc;
 pub mod kms;
 pub mod marketplace;
@@ -33,9 +44,11 @@ pub mod plugins;
 pub mod policy;
 pub mod prompts;
 pub mod providers;
+pub mod recent_dirs;
 pub mod repl;
 pub mod sandbox;
 pub mod secrets;
+#[cfg(feature = "gui")]
 pub mod server;
 pub mod session;
 #[cfg(feature = "gui")]
@@ -47,6 +60,7 @@ pub mod skills;
 pub mod sso;
 pub mod subagent;
 pub mod team;
+pub mod theme;
 pub mod tokens;
 pub mod tools;
 pub mod types;

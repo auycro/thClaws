@@ -156,6 +156,13 @@ pub enum ShellInput {
 pub enum ViewEvent {
     UserPrompt(String),
     AssistantTextDelta(String),
+    /// A chunk of the model's reasoning (`reasoning_content` from
+    /// DeepSeek v4 / OpenAI o-series / NVIDIA NIM glm4.7 / etc., or
+    /// `<think>`-tagged spans from implicit thinking models). Chat
+    /// renders it dimmed/collapsed above the assistant text; terminal
+    /// renders it dim-italic so the live thinking is visible without
+    /// looking like the model's final answer.
+    AssistantThinkingDelta(String),
     ToolCallStart {
         name: String,
         label: String,
@@ -195,6 +202,11 @@ pub enum ViewEvent {
     /// Emitted after `/mcp add | remove` so the sidebar reflects the
     /// new state without waiting for the next full session_update.
     McpUpdate(String),
+    /// Goal-state sidebar refresh (Phase A). Carries the latest snapshot
+    /// of the active /goal — `None` means the goal was cleared. Frontend
+    /// renders a compact indicator (objective, iterations, tokens
+    /// used/budget, status) above the plan sidebar.
+    GoalUpdate(Option<crate::goal_state::GoalState>),
     /// Open the GUI's interactive model picker — pre-built JSON payload
     /// shaped like `{type: "model_picker_open", provider, current,
     /// models: [{id, context, max_output}, ...]}`. Emitted by the
@@ -390,6 +402,16 @@ pub struct WorkerState {
     /// <body>` is running; the cancel handle aborts the spawned tokio
     /// task on `/loop stop` / session swap / goal-terminal.
     pub active_loop: Option<ActiveLoop>,
+    /// Phase B2 (mirror of codex's empty-turn anti-loop): `true` if the
+    /// most recent agent turn fired at least one ToolCallStart event.
+    /// Set false at the start of each turn, flipped true on the first
+    /// tool call. Read by the `/goal continue` intercept — when an
+    /// active /loop fires it after a turn that produced no tool calls
+    /// (model just monologued, no concrete progress), the next firing
+    /// is suppressed once, so glm-class reasoning models can't burn the
+    /// loop budget on pure thinking. Init `true` so the very first
+    /// /loop /goal continue isn't pre-suppressed.
+    pub last_turn_made_tool_calls: bool,
 }
 
 /// M6.29: handle to a running `/loop` task.
@@ -677,6 +699,26 @@ async fn run_worker(
         });
     }
 
+    // Goal-state → ViewEvent bridge + JSONL persistence (Phase A). Same
+    // pattern as plan_state above; reuses `plan_persist_path` because
+    // both snapshot kinds always target the same session JSONL — every
+    // session swap (via /new, /load, /fork) needs to retarget both at
+    // once anyway, and sharing the Arc means we don't have two paths
+    // that can drift out of sync. Locks are independent per-call so
+    // there's no extra contention.
+    {
+        let goal_tx = events_tx.clone();
+        let path_arc = plan_persist_path.clone();
+        crate::goal_state::set_broadcaster(move |goal_opt| {
+            let _ = goal_tx.send(ViewEvent::GoalUpdate(goal_opt.cloned()));
+            if let Ok(g) = path_arc.lock() {
+                if let Some(p) = g.as_ref() {
+                    let _ = crate::session::append_goal_snapshot(p, goal_opt);
+                }
+            }
+        });
+    }
+
     if !config.kms_active.is_empty() {
         tools.register(std::sync::Arc::new(crate::tools::KmsReadTool));
         tools.register(std::sync::Arc::new(crate::tools::KmsSearchTool));
@@ -938,6 +980,9 @@ async fn run_worker(
     // a fresh `Session::new`, but Some(plan) for a session loaded
     // off disk that already had a plan_snapshot in its JSONL).
     crate::tools::plan_state::restore_from_session(current_session.plan.clone());
+    // Same restore for goal_state — the broadcaster fires
+    // ViewEvent::GoalUpdate so the sidebar picks up a /load.
+    crate::goal_state::restore_from_session(current_session.goal.clone());
 
     // Lead status + output log so the Team tab can show a 'lead' pane.
     // `run_repl` writes these from the CLI loop; in GUI mode nobody does,
@@ -972,6 +1017,10 @@ async fn run_worker(
         lead_log,
         cancel: cancel.clone(),
         active_loop: None,
+        // Init true: the very first /loop /goal continue firing
+        // happens before any turn has run, so the suppression check
+        // would otherwise gate the loop forever on iteration 0.
+        last_turn_made_tool_calls: true,
     };
 
     // M6.35 HOOK2: fire session_start hook now that WorkerState is
@@ -1134,8 +1183,8 @@ async fn run_worker(
                     }
                     let provider_name = target_kind.name();
                     let _ = events_tx.send(ViewEvent::SlashOutput(format!(
-                        "(auto-switched to {provider_name}/{} to match session)",
-                        loaded.model
+                        "(auto-switched to {} to match session)",
+                        format_provider_model(provider_name, &loaded.model)
                     )));
                     // Keep `.thclaws/settings.json` in sync so a
                     // restart lands on the same provider/model.
@@ -1166,6 +1215,7 @@ async fn run_worker(
                     *g = Some(store.path_for(&state.session.id));
                 }
                 crate::tools::plan_state::restore_from_session(state.session.plan.clone());
+                crate::goal_state::restore_from_session(state.session.goal.clone());
                 // M6.9 (Bug E1): reset the per-step attempt counter
                 // on session swap. The counter is process-global and
                 // would otherwise leak across sessions — if the prior
@@ -1430,8 +1480,8 @@ async fn run_worker(
                         });
                         let _ = events_tx.send(ViewEvent::ProviderUpdate(payload.to_string()));
                         let _ = events_tx.send(ViewEvent::SlashOutput(format!(
-                            "(provider reloaded: {provider_name}/{})",
-                            state.config.model
+                            "(provider reloaded: {})",
+                            format_provider_model(provider_name, &state.config.model)
                         )));
                     }
                     Err(e) => {
@@ -1671,6 +1721,22 @@ async fn handle_line(
                 return;
             }
             Some(g) => {
+                // Phase B2: anti-loop guard mirroring codex's runtime
+                // continuation suppression. If a /loop is wrapping us
+                // AND the previous turn produced zero tool calls (model
+                // monologued without doing anything concrete), skip
+                // this firing once and let the next interval try again.
+                // Reset the flag on suppression so we don't dead-loop.
+                if state.active_loop.is_some() && !state.last_turn_made_tool_calls {
+                    let _ = events_tx.send(ViewEvent::SlashOutput(
+                        "(/goal continue suppressed: prior turn made no tool calls — \
+                         model just monologued. Will retry next /loop firing.)"
+                            .into(),
+                    ));
+                    state.last_turn_made_tool_calls = true;
+                    let _ = events_tx.send(ViewEvent::TurnDone);
+                    return;
+                }
                 let prompt = crate::goal_state::build_audit_prompt(&g);
                 crate::goal_state::record_iteration(0);
                 let _ = events_tx.send(ViewEvent::SlashOutput(format!(
@@ -1685,8 +1751,9 @@ async fn handle_line(
                 let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
                 let _ = lead_mb.write_status("lead", "working", None);
                 drive_turn_stream(stream, state, events_tx, cancel, &lead_mb, input_tx).await;
-                // Post-turn: if the model called UpdateGoal with terminal
-                // status, stop the loop so the next firing doesn't run.
+                // Post-turn: if the model called MarkGoalComplete /
+                // MarkGoalBlocked (or any path that mutated status to
+                // terminal), stop the loop so the next firing doesn't run.
                 if let Some(g) = crate::goal_state::current() {
                     if g.status.is_terminal() {
                         if let Some(loop_state) = state.active_loop.take() {
@@ -1696,6 +1763,26 @@ async fn handle_line(
                                 g.status.as_str(),
                             )));
                         }
+                    } else if g.auto_continue
+                        && state.active_loop.is_none()
+                        && state.last_turn_made_tool_calls
+                        && !cancel.is_cancelled()
+                    {
+                        // Phase D1: opt-in auto-continuation. The goal
+                        // was started with --auto, no /loop is wrapping
+                        // (would double-fire), the just-finished turn
+                        // made tool calls (Phase B2 empty-turn guard
+                        // would otherwise re-trigger here too), and the
+                        // user didn't cancel. Queue another /goal
+                        // continue immediately so the next iteration
+                        // fires without waiting for /loop interval.
+                        // std::sync::mpsc — sync send, no .await. If the
+                        // worker channel is somehow disconnected the send
+                        // errors silently and the user can fire /goal
+                        // continue manually to recover.
+                        let _ = input_tx.send(crate::shared_session::ShellInput::Line(
+                            "/goal continue".into(),
+                        ));
                     }
                 }
                 return;
@@ -1893,6 +1980,11 @@ async fn drive_turn_stream(
     lead_mb: &crate::team::Mailbox,
     input_tx: &mpsc::Sender<ShellInput>,
 ) {
+    // Phase B2: reset the empty-turn flag at the start of every turn.
+    // Flipped to true on the first ToolCallStart below; if the model
+    // produces zero tool calls during this turn, the next /loop /goal
+    // continue firing gets suppressed once.
+    state.last_turn_made_tool_calls = false;
     loop {
         // M6.17 BUG H1: race the next stream event against the cancel
         // signal so a long tool run / stalled provider stream doesn't
@@ -1921,7 +2013,11 @@ async fn drive_turn_stream(
                 write_lead_log(&state.lead_log, &s);
                 let _ = events_tx.send(ViewEvent::AssistantTextDelta(s));
             }
+            Ok(AgentEvent::Thinking(s)) => {
+                let _ = events_tx.send(ViewEvent::AssistantThinkingDelta(s));
+            }
             Ok(AgentEvent::ToolCallStart { name, input, .. }) => {
+                state.last_turn_made_tool_calls = true;
                 let label = format_tool_label(&name, &input);
                 write_lead_log(
                     &state.lead_log,
@@ -2273,6 +2369,9 @@ async fn handle_team_messages(
                 write_lead_log(&state.lead_log, &s);
                 let _ = events_tx.send(ViewEvent::AssistantTextDelta(s));
             }
+            Ok(AgentEvent::Thinking(s)) => {
+                let _ = events_tx.send(ViewEvent::AssistantThinkingDelta(s));
+            }
             Ok(AgentEvent::ToolCallStart { name, input, .. }) => {
                 let label = format_tool_label(&name, &input);
                 write_lead_log(
@@ -2489,6 +2588,21 @@ fn team_grounding_prompt(model: &str, team_enabled: bool) -> String {
 /// intact — only ASCII control chars get replaced. Then collapses
 /// runs of whitespace so a sanitized multi-line string doesn't read
 /// as `Line 1   Line 2  ` after stripping.
+/// Render `<provider>/<model>` for status-line messages without doubling
+/// the provider segment when the model id already carries a routing
+/// prefix. Most prefix-routed providers (ollama, ollama-cloud, thaillm,
+/// nvidia, openrouter) embed the provider name in the model id; naively
+/// prepending it again gives `nvidia/nvidia/<owner>/<name>` which reads
+/// like a bug.
+fn format_provider_model(provider: &str, model: &str) -> String {
+    let prefix = format!("{provider}/");
+    if model.starts_with(&prefix) {
+        model.to_string()
+    } else {
+        format!("{prefix}{model}")
+    }
+}
+
 fn sanitize_label_field(s: &str) -> String {
     let cleaned: String = s
         .chars()

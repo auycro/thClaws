@@ -40,6 +40,7 @@ pub enum ProviderKind {
     OpenAICompat,
     DeepSeek,
     ThaiLLM,
+    Nvidia,
 }
 
 impl ProviderKind {
@@ -61,6 +62,7 @@ impl ProviderKind {
         Self::OpenAICompat,
         Self::DeepSeek,
         Self::ThaiLLM,
+        Self::Nvidia,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -82,6 +84,7 @@ impl ProviderKind {
             Self::OpenAICompat => "openai-compat",
             Self::DeepSeek => "deepseek",
             Self::ThaiLLM => "thaillm",
+            Self::Nvidia => "nvidia",
         }
     }
 
@@ -134,6 +137,11 @@ impl ProviderKind {
             // bare model id. OpenThaiGPT v7.2 is the most general-purpose
             // default; users can `/model thaillm/<other>` to switch.
             Self::ThaiLLM => "thaillm/OpenThaiGPT-ThaiLLM-8B-Instruct-v7.2",
+            // NVIDIA NIM — OpenAI-compatible hosted inference at integrate.api.nvidia.com.
+            // Stored ids use a uniform `nvidia/` routing prefix; for NVIDIA-owned models
+            // that yields a doubled prefix (`nvidia/nvidia/<name>`), the outer one stripped
+            // by build_provider before the request. Override via NVIDIA_BASE_URL for on-prem.
+            Self::Nvidia => "nvidia/nvidia/nemotron-3-super-120b-a12b",
         }
     }
 
@@ -153,6 +161,7 @@ impl ProviderKind {
             Self::OpenAICompat => Some("OPENAI_COMPAT_BASE_URL"),
             Self::DeepSeek => Some("DEEPSEEK_BASE_URL"),
             Self::ThaiLLM => Some("THAILLM_BASE_URL"),
+            Self::Nvidia => Some("NVIDIA_BASE_URL"),
             _ => None,
         }
     }
@@ -197,6 +206,7 @@ impl ProviderKind {
             Self::OpenAICompat => Some("http://localhost:8000/v1"),
             Self::DeepSeek => Some("https://api.deepseek.com/v1"),
             Self::ThaiLLM => Some("http://thaillm.or.th/api/v1"),
+            Self::Nvidia => Some("https://integrate.api.nvidia.com/v1"),
             _ => None,
         }
     }
@@ -221,6 +231,7 @@ impl ProviderKind {
             Self::OpenAICompat => Some("OPENAI_COMPAT_API_KEY"),
             Self::DeepSeek => Some("DEEPSEEK_API_KEY"),
             Self::ThaiLLM => Some("THAILLM_API_KEY"),
+            Self::Nvidia => Some("NVIDIA_API_KEY"),
         }
     }
 
@@ -318,7 +329,8 @@ impl ProviderKind {
             | Self::LMStudio
             | Self::AzureAIFoundry
             | Self::OpenAICompat
-            | Self::DeepSeek => None,
+            | Self::DeepSeek
+            | Self::Nvidia => None,
         }
     }
 
@@ -388,6 +400,16 @@ impl ProviderKind {
             Some(Self::OllamaCloud)
         } else if model.starts_with("azure/") {
             Some(Self::AzureAIFoundry)
+        } else if model.starts_with("nvidia/") {
+            // NVIDIA NIM (integrate.api.nvidia.com). The catalogue stores
+            // every NIM model under a uniform `nvidia/` routing prefix
+            // regardless of upstream owner namespace — `nvidia/nvidia/<name>`
+            // for NVIDIA-owned models, `nvidia/meta/<name>`, `nvidia/google/<name>`
+            // etc. for third-party-owned. `build_provider` strips the outer
+            // `nvidia/` so the upstream sees the original namespaced id.
+            // OpenRouter proxies the same models as `openrouter/nvidia/...`;
+            // the `openrouter/` check above catches those first.
+            Some(Self::Nvidia)
         } else {
             None
         }
@@ -576,6 +598,7 @@ pub enum ProviderEvent {
     ToolUseStart {
         id: String,
         name: String,
+        thought_signature: Option<String>,
     },
     ToolUseDelta {
         partial_json: String,
@@ -600,6 +623,126 @@ pub trait Provider: Send + Sync {
             "list_models not supported by this provider".into(),
         ))
     }
+}
+
+/// Does the active provider have credentials (env var set) or is it
+/// a no-auth local provider? Used by sidebar/UI code (and the
+/// `model_set` / `config_poll` IPC arms in M6.36) to flag the active
+/// provider's readiness without spinning up a real provider instance.
+///
+/// M6.36 SERVE9e: lifted out of `gui.rs` to an always-on home so the
+/// WS transport's IPC handlers can use the same readiness check.
+pub fn provider_has_credentials(cfg: &crate::config::AppConfig) -> bool {
+    kind_has_credentials(cfg.detect_provider_kind().ok())
+}
+
+/// True when `kind` has credentials available (env var, or no-auth
+/// local provider). Same logic the GUI's auto-fallback path uses.
+pub fn kind_has_credentials(kind: Option<ProviderKind>) -> bool {
+    let Some(kind) = kind else { return false };
+    match kind {
+        ProviderKind::AgentSdk => true,
+        ProviderKind::Ollama | ProviderKind::OllamaAnthropic | ProviderKind::LMStudio => true,
+        other => other
+            .api_key_env()
+            .and_then(|v| std::env::var(v).ok())
+            .map(|val| !val.trim().is_empty())
+            .unwrap_or(false),
+    }
+}
+
+/// Build the cross-provider model-list payload the sidebar's inline
+/// model picker dropdown consumes. Catalogue rows for every known
+/// provider plus a live Ollama probe so models the user just
+/// `ollama pull`-ed appear without a restart.
+///
+/// M6.36 SERVE9g — moved from `gui.rs` so the WS transport's
+/// `request_all_models` IPC arm can call it from the always-on
+/// dispatch table. Async because of the Ollama probe (`tokio::time::
+/// timeout` against a possibly-unreachable host).
+pub async fn build_all_models_payload() -> String {
+    let cat = crate::model_catalogue::EffectiveCatalogue::load();
+    let ollama_live: Vec<String> = {
+        let base = std::env::var("OLLAMA_BASE_URL")
+            .unwrap_or_else(|_| crate::providers::ollama::DEFAULT_BASE_URL.to_string());
+        let provider = crate::providers::ollama::OllamaProvider::new().with_base_url(base);
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(800),
+            provider.list_models(),
+        )
+        .await
+        {
+            Ok(Ok(models)) => models.into_iter().map(|m| m.id).collect(),
+            _ => Vec::new(),
+        }
+    };
+    let mut groups: Vec<serde_json::Value> = Vec::new();
+    for kind in ProviderKind::ALL {
+        let name = kind.name();
+        let mut model_ids: std::collections::BTreeMap<String, Option<u32>> =
+            std::collections::BTreeMap::new();
+        for (id, entry) in cat.list_models_for_provider(name) {
+            let canonical = if ProviderKind::detect(&id) == Some(*kind) {
+                id
+            } else {
+                format!("{name}/{id}")
+            };
+            model_ids.insert(canonical, entry.context);
+        }
+        if matches!(kind, ProviderKind::Ollama) {
+            for id in &ollama_live {
+                model_ids.entry(id.clone()).or_insert(None);
+            }
+        }
+        if model_ids.is_empty() {
+            continue;
+        }
+        let model_rows: Vec<serde_json::Value> = model_ids
+            .into_iter()
+            .map(|(id, ctx)| serde_json::json!({ "id": id, "context": ctx }))
+            .collect();
+        groups.push(serde_json::json!({
+            "provider": name,
+            "models": model_rows,
+        }));
+    }
+    serde_json::json!({
+        "type": "all_models_list",
+        "groups": groups,
+        "ollama_reachable": !ollama_live.is_empty(),
+    })
+    .to_string()
+}
+
+/// If `cfg.model`'s provider has no credentials, pick the first
+/// provider that does and return its default model. Returns `None`
+/// when the current model is already fine or nothing else is usable.
+///
+/// Called by the GUI at startup and after `api_key_set` so the
+/// sidebar's active-provider indicator + persisted settings.json land
+/// on whatever the user actually has configured. Same logic now
+/// callable from the WS transport's settings handlers.
+pub fn auto_fallback_model(cfg: &crate::config::AppConfig) -> Option<String> {
+    if provider_has_credentials(cfg) {
+        return None;
+    }
+    const ORDER: &[ProviderKind] = &[
+        ProviderKind::Anthropic,
+        ProviderKind::OpenAI,
+        ProviderKind::AgenticPress,
+        ProviderKind::OpenRouter,
+        ProviderKind::Gemini,
+        ProviderKind::DashScope,
+        ProviderKind::ZAi,
+        ProviderKind::DeepSeek,
+        ProviderKind::ThaiLLM,
+    ];
+    for kind in ORDER {
+        if kind_has_credentials(Some(*kind)) {
+            return Some(kind.default_model().to_string());
+        }
+    }
+    None
 }
 
 #[cfg(test)]

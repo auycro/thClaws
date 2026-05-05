@@ -145,23 +145,36 @@ async fn main() {
 
     // M6.36 SERVE5: --serve mode short-circuits the CLI/GUI dispatch.
     // Single-purpose deployment shape — operator runs one process per
-    // project on a server.
+    // project on a server. Gated behind `gui` because crate::server
+    // transitively depends on crate::shared_session (also gui-gated)
+    // — they share the same WorkerState engine. The CLI-only
+    // thclaws-cli binary doesn't ship --serve.
     if cli.serve {
-        let bind_ip: std::net::IpAddr = match cli.bind.parse() {
-            Ok(ip) => ip,
-            Err(e) => {
-                eprintln!("\x1b[31m--bind: invalid IP '{}': {e}\x1b[0m", cli.bind);
+        #[cfg(feature = "gui")]
+        {
+            let bind_ip: std::net::IpAddr = match cli.bind.parse() {
+                Ok(ip) => ip,
+                Err(e) => {
+                    eprintln!("\x1b[31m--bind: invalid IP '{}': {e}\x1b[0m", cli.bind);
+                    std::process::exit(1);
+                }
+            };
+            let config = thclaws_core::server::ServeConfig {
+                bind: std::net::SocketAddr::new(bind_ip, cli.port),
+            };
+            if let Err(e) = thclaws_core::server::run(config).await {
+                eprintln!("\n\x1b[31mserve error: {e}\x1b[0m");
                 std::process::exit(1);
             }
-        };
-        let config = thclaws_core::server::ServeConfig {
-            bind: std::net::SocketAddr::new(bind_ip, cli.port),
-        };
-        if let Err(e) = thclaws_core::server::run(config).await {
-            eprintln!("\n\x1b[31mserve error: {e}\x1b[0m");
+            return;
+        }
+        #[cfg(not(feature = "gui"))]
+        {
+            eprintln!(
+                "\x1b[31m--serve not available — rebuild with: cargo build --features gui --bin thclaws\x1b[0m"
+            );
             std::process::exit(1);
         }
-        return;
     }
 
     if !use_cli {

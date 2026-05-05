@@ -64,12 +64,25 @@ struct SessionHeader {
 }
 
 /// A single message event line in the JSONL file.
+///
+/// `provider` + `model` are populated only for `assistant` lines so a
+/// reader can attribute which model produced each turn. The session
+/// header carries the model the session was created with; assistant
+/// lines carry whatever model was active at write time. Today every
+/// model switch mints a fresh session, so these are redundant with the
+/// header — but the per-line attribution future-proofs scenarios where
+/// model switching becomes mid-session (and is cheap to add now while
+/// the schema is still under our control).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MessageEvent {
     #[serde(rename = "type")]
     kind: String, // "user", "assistant", "system"
     content: Vec<crate::types::ContentBlock>,
     timestamp: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
 }
 
 /// Append-only event for renaming an existing session. Keeps the JSONL
@@ -92,6 +105,18 @@ struct PlanSnapshotEvent {
     #[serde(rename = "type")]
     kind: String, // always "plan_snapshot"
     plan: Option<crate::tools::plan_state::Plan>,
+    timestamp: u64,
+}
+
+/// Same shape as PlanSnapshotEvent but for `/goal` state. Latest snapshot
+/// wins on load — `null` goal means the active goal was cleared (status
+/// moved to terminal or `/goal abandon`). Decoupled from PlanSnapshotEvent
+/// so a session can carry a plan + goal independently.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GoalSnapshotEvent {
+    #[serde(rename = "type")]
+    kind: String, // always "goal_snapshot"
+    goal: Option<crate::goal_state::GoalState>,
     timestamp: u64,
 }
 
@@ -141,6 +166,13 @@ pub struct Session {
     /// button (not by `/load` itself).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<crate::tools::plan_state::Plan>,
+    /// Active goal (M6.29 + Phase A sidebar). `None` when no goal is in
+    /// flight. Persisted alongside the conversation so `/load` restores
+    /// the goal sidebar with elapsed iterations + token consumption
+    /// intact. Cleared via `/goal abandon` or by completing the goal
+    /// (status moves to terminal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<crate::goal_state::GoalState>,
 }
 
 impl PartialEq for Session {
@@ -176,6 +208,7 @@ impl Session {
             title: None,
             last_saved_count: 0,
             plan: None,
+            goal: None,
         }
     }
 
@@ -259,6 +292,11 @@ impl Session {
 
         let new_messages = &self.messages[self.last_saved_count..];
         let now = now_secs();
+        // Provider name is derived from the session's active model.
+        // Cached once outside the loop since `self.model` is stable for
+        // every message in this batch (model swaps mint a fresh session).
+        let provider_name =
+            crate::providers::ProviderKind::detect(&self.model).map(|k| k.name().to_string());
         let mut event_lines: Vec<String> = Vec::with_capacity(new_messages.len());
         for msg in new_messages {
             let role_str = match msg.role {
@@ -266,10 +304,21 @@ impl Session {
                 crate::types::Role::Assistant => "assistant",
                 crate::types::Role::System => "system",
             };
+            let is_assistant = matches!(msg.role, crate::types::Role::Assistant);
             let event = MessageEvent {
                 kind: role_str.into(),
                 content: msg.content.clone(),
                 timestamp: now,
+                provider: if is_assistant {
+                    provider_name.clone()
+                } else {
+                    None
+                },
+                model: if is_assistant {
+                    Some(self.model.clone())
+                } else {
+                    None
+                },
             };
             event_lines.push(serde_json::to_string(&event)?);
         }
@@ -311,6 +360,21 @@ impl Session {
     ) -> Result<()> {
         append_plan_snapshot(path, plan)?;
         self.plan = plan.cloned();
+        self.updated_at = now_secs();
+        Ok(())
+    }
+
+    /// Append a goal snapshot to the JSONL. Same contract as
+    /// `append_plan_snapshot_to` — fires after every `goal_state`
+    /// mutation so a `/load` restores the goal sidebar (objective,
+    /// elapsed iterations, token consumption, status) intact.
+    pub fn append_goal_snapshot_to(
+        &mut self,
+        path: &Path,
+        goal: Option<&crate::goal_state::GoalState>,
+    ) -> Result<()> {
+        append_goal_snapshot(path, goal)?;
+        self.goal = goal.cloned();
         self.updated_at = now_secs();
         Ok(())
     }
@@ -406,11 +470,11 @@ impl Session {
                         .map(|a| a.len())
                         .unwrap_or(0);
                 }
-                "plan_snapshot" => {
+                "plan_snapshot" | "goal_snapshot" => {
                     // Per M6.16.1: do NOT bump last_timestamp from
-                    // plan_snapshot events (restore-on-load fires the
+                    // snapshot events (restore-on-load fires the
                     // broadcaster which writes a fresh snapshot —
-                    // not user activity).
+                    // not user activity). Same rule for goal_snapshot.
                 }
                 "user" | "assistant" | "system" => {
                     if let Some(ts) = val.get("timestamp").and_then(|v| v.as_u64()) {
@@ -488,6 +552,7 @@ impl Session {
         let mut last_timestamp = 0u64;
         let mut title: Option<String> = None;
         let mut plan: Option<crate::tools::plan_state::Plan> = None;
+        let mut goal: Option<crate::goal_state::GoalState> = None;
         let mut skipped: usize = 0;
 
         for (line_num, line_result) in reader.lines().enumerate() {
@@ -587,6 +652,26 @@ impl Session {
                     }
                 };
                 plan = ev.plan;
+            } else if kind == "goal_snapshot" {
+                // Latest goal_snapshot wins. `null` goal means the
+                // active goal was cleared (terminal status reached or
+                // user-initiated /goal abandon). Same recency-protection
+                // rule as plan_snapshot — restore-on-load fires its own
+                // broadcaster which writes a fresh snapshot, so don't
+                // bump last_timestamp from these events.
+                let ev: GoalSnapshotEvent = match serde_json::from_value(val) {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        eprintln!(
+                            "\x1b[33m[session] {}:{}: skipping malformed goal_snapshot ({e})\x1b[0m",
+                            path.display(),
+                            line_num + 1
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                };
+                goal = ev.goal;
             } else if kind == "compaction" {
                 // Replay checkpoint: everything accumulated so far is
                 // archived-on-disk but gets replaced in memory by the
@@ -722,6 +807,7 @@ impl Session {
             title,
             last_saved_count: msg_count,
             plan,
+            goal,
         })
     }
 
@@ -826,6 +912,25 @@ pub fn append_plan_snapshot(
     };
     let line = serde_json::to_string(&event)?;
     // M6.24 BUG M4: lock the write.
+    append_locked(path, |file| writeln!(file, "{}", line))
+}
+
+/// Module-level companion to [`Session::append_goal_snapshot_to`]. Used
+/// by the GUI's `goal_state` broadcaster, which only has the JSONL path
+/// in scope — no owned `&mut Session` to update.
+pub fn append_goal_snapshot(
+    path: &Path,
+    goal: Option<&crate::goal_state::GoalState>,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let event = GoalSnapshotEvent {
+        kind: "goal_snapshot".into(),
+        goal: goal.cloned(),
+        timestamp: now_secs(),
+    };
+    let line = serde_json::to_string(&event)?;
     append_locked(path, |file| writeln!(file, "{}", line))
 }
 
@@ -1167,6 +1272,51 @@ mod tests {
         assert_eq!(event["type"], "user");
         assert!(event["content"].is_array());
         assert!(event["timestamp"].is_number());
+    }
+
+    #[test]
+    fn assistant_messages_carry_provider_and_model_attribution() {
+        let dir = tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+
+        let mut session = Session::new("claude-sonnet-4-5", "/tmp");
+        session.sync(vec![Message::user("ping"), Message::assistant("pong")]);
+        store.save(&mut session).unwrap();
+
+        let contents = std::fs::read_to_string(store.path_for(&session.id)).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+
+        // User line: no provider/model attribution.
+        let user_ev: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(user_ev["type"], "user");
+        assert!(user_ev.get("provider").is_none());
+        assert!(user_ev.get("model").is_none());
+
+        // Assistant line: carries provider + model from the session.
+        let asst_ev: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(asst_ev["type"], "assistant");
+        assert_eq!(asst_ev["provider"], "anthropic");
+        assert_eq!(asst_ev["model"], "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn old_sessions_without_provider_model_still_load() {
+        // Backward compat: a JSONL file written before M-now (no
+        // provider/model fields on assistant lines) must still load.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"header","id":"sess-old","model":"gpt-4o","cwd":"/tmp","created_at":1000}
+{"type":"user","content":[{"type":"text","text":"hi"}],"timestamp":1001}
+{"type":"assistant","content":[{"type":"text","text":"hello"}],"timestamp":1002}
+"#,
+        )
+        .unwrap();
+
+        let loaded = Session::load_from(&path).unwrap();
+        assert_eq!(loaded.id, "sess-old");
+        assert_eq!(loaded.messages.len(), 2);
     }
 
     #[test]

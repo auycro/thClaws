@@ -37,6 +37,7 @@ const GEMINI_URL: &str = "https://generativelanguage.googleapis.com/v1beta/model
 const OLLAMA_CLOUD_URL: &str = "https://ollama.com/v1/models";
 const DEEPSEEK_URL: &str = "https://api.deepseek.com/v1/models";
 const THAILLM_URL: &str = "http://thaillm.or.th/api/v1/models";
+const NVIDIA_URL: &str = "https://integrate.api.nvidia.com/v1/models";
 const DEFAULT_TARGET: &str = "crates/core/resources/model_catalogue.json";
 
 // ── Wire types ──────────────────────────────────────────────────────
@@ -340,6 +341,46 @@ async fn run() -> Result<String, String> {
         }
     } else {
         report.push("  thaillm:     skipped (no THAILLM_API_KEY)".into());
+    }
+
+    // 4d. NVIDIA NIM — OpenAI-compatible `/v1/models` at
+    //     integrate.api.nvidia.com. The endpoint returns ids from many
+    //     vendor namespaces (`nvidia/…`, `meta/…`, `google/…`,
+    //     `mistralai/…`, etc.). We prepend a uniform `nvidia/` routing
+    //     prefix so a single `from_model_id` rule auto-routes everything
+    //     served by NIM — same pattern Ollama Cloud uses for its mixed
+    //     vendor catalog. The `nvidia/` prefix is stripped in
+    //     `build_provider` before the request hits the upstream, which
+    //     means NVIDIA-owned models stored as `nvidia/nvidia/<name>`
+    //     restore the original `nvidia/<name>` id on the wire. Context
+    //     comes from OpenRouter's mirror where available; falls back to
+    //     provider default (131072).
+    if let Ok(key) = std::env::var("NVIDIA_API_KEY") {
+        match fetch_nvidia(&key).await {
+            Ok(ids) => {
+                let prefixed: Vec<String> =
+                    ids.into_iter().map(|id| format!("nvidia/{id}")).collect();
+                let pc = cat
+                    .providers
+                    .entry("nvidia".into())
+                    .or_insert_with(ProviderCatalogue::default);
+                if pc.default_context.is_none() {
+                    pc.default_context = Some(131072);
+                }
+                let added = merge_discovered(
+                    &mut cat,
+                    "nvidia",
+                    NVIDIA_URL,
+                    prefixed,
+                    &openrouter_ctx_by_bare,
+                    &today,
+                );
+                push_provider_stats(&mut report, "nvidia", &added, None);
+            }
+            Err(e) => report.push(format!("  nvidia:      FAILED ({e})")),
+        }
+    } else {
+        report.push("  nvidia:      skipped (no NVIDIA_API_KEY)".into());
     }
 
     // 5. Derive agent-sdk rows from anthropic. The Claude CLI subprocess
@@ -680,6 +721,24 @@ async fn fetch_thaillm(key: &str) -> Result<Vec<String>, String> {
         .map_err(|e| format!("GET {THAILLM_URL}: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("thaillm HTTP {}", resp.status()));
+    }
+    let env: OpenAIEnvelope = resp.json().await.map_err(|e| format!("json: {e}"))?;
+    Ok(env.data.into_iter().map(|m| m.id).collect())
+}
+
+/// Fetch the NVIDIA NIM model list. The endpoint is OpenAI-compatible —
+/// `/v1/models` returns `{data:[{id,...}]}`. Model IDs already include
+/// the `nvidia/` owner prefix (e.g. `nvidia/nemotron-3-super-120b-a12b`),
+/// so no additional prefix is applied by the caller.
+async fn fetch_nvidia(key: &str) -> Result<Vec<String>, String> {
+    let resp = client()?
+        .get(NVIDIA_URL)
+        .bearer_auth(key)
+        .send()
+        .await
+        .map_err(|e| format!("GET {NVIDIA_URL}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("nvidia HTTP {}", resp.status()));
     }
     let env: OpenAIEnvelope = resp.json().await.map_err(|e| format!("json: {e}"))?;
     Ok(env.data.into_iter().map(|m| m.id).collect())

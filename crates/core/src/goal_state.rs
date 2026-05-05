@@ -2,11 +2,15 @@
 //!
 //! A goal is a user-supplied objective with optional token + time budgets.
 //! State persists per-session (carried in `WorkerState.goal` and serialized
-//! to session JSONL as `{"type": "goal_state", ...}` events). The `/goal
+//! to session JSONL as `{"type": "goal_snapshot", ...}` events). The `/goal
 //! continue` command builds an audit prompt from the current state +
-//! consumed budget; the model can mark the goal complete via the
-//! `UpdateGoal` tool, which mutates the global state via the broadcaster
-//! (same pattern as `plan_state`).
+//! consumed budget; the model mutates state via the three goal-lifecycle
+//! tools (Phase C1 — authority split):
+//!   - `RecordGoalProgress` — mid-loop checkpoint, status stays Active
+//!   - `MarkGoalComplete`   — terminal Complete (audit required)
+//!   - `MarkGoalBlocked`    — terminal Blocked (reason required)
+//! All three call `apply()` which fires the broadcaster (same pattern as
+//! `plan_state`).
 //!
 //! The `goal-continue` audit prompt template (see
 //! `default_prompts/goal_continue.md`) bakes in the discipline:
@@ -77,6 +81,14 @@ pub struct GoalState {
     pub last_message: Option<String>,
     /// Wall-clock timestamp when status moved to terminal.
     pub completed_at: Option<u64>,
+    /// Phase D1: when true, the worker auto-queues another `/goal
+    /// continue` after each finishing turn (provided tool calls were
+    /// made, status is still Active, and no `/loop` is wrapping).
+    /// Default false — opt in via `/goal start ... --auto`.
+    /// `#[serde(default)]` so older sessions that pre-date this field
+    /// still deserialize cleanly on /load.
+    #[serde(default)]
+    pub auto_continue: bool,
 }
 
 impl GoalState {
@@ -84,6 +96,7 @@ impl GoalState {
         objective: String,
         budget_tokens: Option<u64>,
         budget_time_secs: Option<u64>,
+        auto_continue: bool,
     ) -> Self {
         Self {
             objective,
@@ -96,6 +109,7 @@ impl GoalState {
             last_audit: None,
             last_message: None,
             completed_at: None,
+            auto_continue,
         }
     }
 
@@ -222,8 +236,15 @@ fn fire_broadcaster() {
 
 /// M6.29: build the goal-continue audit prompt by filling the embedded
 /// template with the current goal's objective + budget consumption.
+///
+/// Phase B1: when a token budget is set AND it's been exhausted
+/// (`tokens_used >= budget_tokens`), swap to the `GOAL_BUDGET_LIMIT`
+/// soft-stop template instead. The runtime keeps firing iterations
+/// until the model marks the goal terminal, but each fire injects the
+/// "wrap up" prompt — discouraging new substantive work and pushing the
+/// model toward summarize / identify blockers / give next step.
+/// Mirrors codex's runtime continuation soft-stop behavior.
 pub fn build_audit_prompt(g: &GoalState) -> String {
-    let template = crate::prompts::defaults::GOAL_CONTINUE;
     let token_budget = g
         .budget_tokens
         .map(|n| n.to_string())
@@ -233,6 +254,12 @@ pub fn build_audit_prompt(g: &GoalState) -> String {
         .map(|n| n.to_string())
         .unwrap_or_else(|| "(unlimited)".to_string());
     let time_used = g.time_used_secs();
+    let budget_exhausted = g.budget_tokens.map(|b| g.tokens_used >= b).unwrap_or(false);
+    let template = if budget_exhausted {
+        crate::prompts::defaults::GOAL_BUDGET_LIMIT
+    } else {
+        crate::prompts::defaults::GOAL_CONTINUE
+    };
     let prior_audit = g
         .last_audit
         .as_deref()
@@ -273,7 +300,7 @@ mod tests {
     fn set_and_get_round_trip() {
         let _g = lock();
         reset();
-        let gs = GoalState::new("ship feature X".into(), Some(100_000), None);
+        let gs = GoalState::new("ship feature X".into(), Some(100_000), None, false);
         set(Some(gs.clone()));
         assert_eq!(
             current().as_ref().map(|c| c.objective.as_str()),
@@ -286,7 +313,7 @@ mod tests {
     fn apply_mutates_active_goal() {
         let _g = lock();
         reset();
-        set(Some(GoalState::new("test".into(), None, None)));
+        set(Some(GoalState::new("test".into(), None, None, false)));
         let changed = apply(|g| {
             g.tokens_used = 500;
             true
@@ -311,7 +338,7 @@ mod tests {
     fn record_iteration_increments_counters() {
         let _g = lock();
         reset();
-        set(Some(GoalState::new("test".into(), None, None)));
+        set(Some(GoalState::new("test".into(), None, None, false)));
         record_iteration(100);
         record_iteration(250);
         let g = current().unwrap();
@@ -330,13 +357,13 @@ mod tests {
 
     #[test]
     fn tokens_remaining_handles_no_budget() {
-        let g = GoalState::new("x".into(), None, None);
+        let g = GoalState::new("x".into(), None, None, false);
         assert_eq!(g.tokens_remaining(), None);
     }
 
     #[test]
     fn tokens_remaining_saturates() {
-        let mut g = GoalState::new("x".into(), Some(1_000), None);
+        let mut g = GoalState::new("x".into(), Some(1_000), None, false);
         g.tokens_used = 1_500;
         assert_eq!(g.tokens_remaining(), Some(0));
     }
@@ -344,9 +371,81 @@ mod tests {
     #[test]
     fn build_audit_prompt_substitutes_template_vars() {
         let _g = lock();
-        let g = GoalState::new("ship X".into(), Some(100_000), None);
+        let g = GoalState::new("ship X".into(), Some(100_000), None, false);
         let p = build_audit_prompt(&g);
         assert!(p.contains("ship X"));
         assert!(p.contains("100000"));
+    }
+
+    #[test]
+    fn build_audit_prompt_uses_continue_template_under_budget() {
+        let _g = lock();
+        let mut g = GoalState::new("ship X".into(), Some(100_000), None, false);
+        g.tokens_used = 50_000;
+        let p = build_audit_prompt(&g);
+        // Continue template includes the audit checklist instruction.
+        assert!(p.contains("completion audit"));
+        assert!(!p.contains("budget-exhausted"));
+    }
+
+    #[test]
+    fn build_audit_prompt_swaps_to_budget_limit_template_when_exhausted() {
+        let _g = lock();
+        let mut g = GoalState::new("ship X".into(), Some(100_000), None, false);
+        g.tokens_used = 100_000; // exactly at budget
+        let p = build_audit_prompt(&g);
+        assert!(p.contains("budget-exhausted"));
+        assert!(p.contains("Wrap up this turn"));
+        // Soft-stop template doesn't carry the full audit checklist.
+        assert!(!p.contains("completion audit"));
+    }
+
+    #[test]
+    fn build_audit_prompt_uses_continue_template_when_no_budget_set() {
+        let _g = lock();
+        let mut g = GoalState::new("ship X".into(), None, None, false);
+        g.tokens_used = 9_999_999;
+        let p = build_audit_prompt(&g);
+        assert!(p.contains("completion audit"));
+        assert!(!p.contains("budget-exhausted"));
+    }
+
+    #[test]
+    fn auto_continue_defaults_off_and_can_be_enabled() {
+        // Phase D1: --auto on /goal start flips this; default new() is
+        // false so the historical manual / /loop-driven cadence stays.
+        let g = GoalState::new("ship X".into(), None, None, false);
+        assert!(!g.auto_continue);
+        let g2 = GoalState::new("ship X".into(), None, None, true);
+        assert!(g2.auto_continue);
+    }
+
+    #[test]
+    fn auto_continue_round_trips_through_serde() {
+        // Phase D1: persistence — goal_snapshot must round-trip the
+        // auto_continue flag so /load resumes a session in the same
+        // continuation mode it was started in.
+        let mut g = GoalState::new("ship X".into(), Some(50_000), None, true);
+        g.tokens_used = 12_345;
+        let json = serde_json::to_string(&g).unwrap();
+        let back: GoalState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.auto_continue, true);
+        assert_eq!(back.tokens_used, 12_345);
+        // Older snapshots without the field deserialize as false
+        // (#[serde(default)]).
+        let legacy = serde_json::json!({
+            "objective": "old goal",
+            "started_at": 100,
+            "budget_tokens": null,
+            "budget_time_secs": null,
+            "tokens_used": 0,
+            "iterations_done": 0,
+            "status": "active",
+            "last_audit": null,
+            "last_message": null,
+            "completed_at": null,
+        });
+        let g_legacy: GoalState = serde_json::from_value(legacy).unwrap();
+        assert!(!g_legacy.auto_continue);
     }
 }

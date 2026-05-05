@@ -61,7 +61,7 @@ pub use pptx_read::PptxReadTool;
 pub use read::ReadTool;
 pub use search::WebSearchTool;
 pub use todo::TodoWriteTool;
-pub use update_goal::UpdateGoalTool;
+pub use update_goal::{MarkGoalBlockedTool, MarkGoalCompleteTool, RecordGoalProgressTool};
 pub use web::WebFetchTool;
 pub use write::WriteTool;
 pub use xlsx_create::XlsxCreateTool;

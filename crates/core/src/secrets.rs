@@ -103,6 +103,7 @@ const MANAGED: &[ProviderKind] = &[
     ProviderKind::OpenAICompat,
     ProviderKind::DeepSeek,
     ProviderKind::ThaiLLM,
+    ProviderKind::Nvidia,
 ];
 
 fn entry(provider: &str) -> Result<keyring::Entry> {

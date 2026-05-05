@@ -6,6 +6,7 @@ import { FilesView } from "./components/FilesView";
 import { TeamView } from "./components/TeamView";
 import { Sidebar } from "./components/Sidebar";
 import { PlanSidebar } from "./components/PlanSidebar";
+import { GoalSidebar } from "./components/GoalSidebar";
 import { SettingsModal } from "./components/SettingsModal";
 import { SettingsMenu } from "./components/SettingsMenu";
 import { InstructionsEditorModal } from "./components/InstructionsEditorModal";
@@ -490,6 +491,11 @@ export default function App() {
             );
           })}
         </div>
+        {/* Goal-state sidebar (M6.29 Phase A). Compact 240px column
+            mounted to the LEFT of the plan sidebar. Renders nothing
+            when no /goal is active. Independent from plan-state — a
+            session can carry both, one, or neither. */}
+        <GoalSidebar />
         {/* Plan-mode sidebar (M1). Renders nothing when no plan is
             active — plan_state's broadcaster fires `chat_plan_update`
             with `null` to clear it on `/new` / `/load` of a plan-less
