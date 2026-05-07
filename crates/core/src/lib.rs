@@ -47,6 +47,7 @@ pub mod providers;
 pub mod recent_dirs;
 pub mod repl;
 pub mod sandbox;
+pub mod schedule;
 pub mod secrets;
 #[cfg(feature = "gui")]
 pub mod server;
@@ -56,6 +57,8 @@ pub mod shared_session;
 pub mod shell_bang;
 #[cfg(feature = "gui")]
 pub mod shell_dispatch;
+#[cfg(feature = "gui")]
+pub mod side_channel;
 pub mod skills;
 pub mod sso;
 pub mod subagent;

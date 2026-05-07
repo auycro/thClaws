@@ -90,6 +90,19 @@ pub async fn run(config: ServeConfig) -> crate::error::Result<()> {
     // appear until the first browser tab connects.
     shared.ready_gate.signal();
     let pending_asks: PendingAsks = Arc::new(Mutex::new(HashMap::new()));
+    run_with_engine(config, approver, shared, pending_asks).await
+}
+
+/// Same as [`run`], but reuses an engine constructed by the caller. Used
+/// by the `--serve --gui` combo path so the desktop window and any
+/// browser tab share one Agent + Session — i.e. the same conversation
+/// is visible from both surfaces.
+pub async fn run_with_engine(
+    config: ServeConfig,
+    approver: Arc<crate::permissions::GuiApprover>,
+    shared: Arc<SharedSessionHandle>,
+    pending_asks: PendingAsks,
+) -> crate::error::Result<()> {
     let state = ServeState {
         shared,
         approver,

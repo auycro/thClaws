@@ -192,6 +192,7 @@ async fn check_stdio_command_allowed(
                  binary will run with your user privileges.",
                 config.command, config.name
             )),
+            originator: crate::permissions::AgentOrigin::Main,
         };
         return match approver.approve(&req).await {
             crate::permissions::ApprovalDecision::Allow

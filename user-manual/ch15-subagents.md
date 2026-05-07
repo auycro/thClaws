@@ -73,15 +73,43 @@ Frontmatter fields:
 
 ## Invoking
 
+There are **two surfaces** for spawning a subagent:
+
+### Model-driven — the `Task` tool
+
 The parent agent invokes via `Task`:
 
 ```
 Task(agent: "reviewer", prompt: "Check src/api for naming violations")
 ```
 
-Typically you don't call this directly — you ask the parent a
-question in English and it decides. The model sees the list of
-available agents in its system prompt (rendered from the agent defs).
+Typically you don't call this directly — you ask the parent a question in English and it decides. The model sees the list of available agents in its system prompt (rendered from the agent defs).
+
+The `Task` tool **blocks the parent's turn** until the child finishes — the parent then sees the result as a tool result and continues. The child's intermediate reasoning isn't echoed into the parent's context (that's the whole point — keep main context clean), but the parent does pay for one full child run before its next move.
+
+### User-driven — the `/agent` slash command (GUI)
+
+In the desktop GUI, you can spawn a subagent **yourself** without going through the main agent's reasoning:
+
+```
+/agent translator แปลไฟล์ src/foo.md เป็นภาษาไทย
+```
+
+The chat surface confirms: `✓ spawned background agent 'translator' (id: side-abc123)`. While the translator runs:
+
+- **Main agent keeps accepting input** — you can keep working with it. Side-channel agents run on their own tokio task, concurrent with main.
+- **Main's history is unaffected.** The prompt + result never enter the main conversation. The side-channel result lands as a separate bordered card in the chat surface (amber border = running, green = done, red = error).
+- **Cancel is independent.** Pressing the main agent's stop button does NOT kill side-channels. To cancel a side-channel use `/agent cancel <id>`.
+- **Permission requests stay distinguishable.** If the side-channel asks for `Bash` approval while main is also doing tool calls, the approval modal labels each request with its source ("translator (background) wants to run Bash" vs "Main wants to run Bash") so you don't accidentally approve the wrong one.
+
+```
+/agents                    # list active background agents
+/agent cancel side-abc123  # signal cancel to a specific channel
+```
+
+Side-channel agents share the same AgentDef registry — the named agents available via `Task` are the same ones available via `/agent`. Permissions, sandbox, MCP servers, and KMS access all behave identically.
+
+`/agent` is the right surface when you know specifically what you want done, the work is well-scoped, and you want to keep doing other things in the main conversation while it runs. The model-driven `Task` tool stays the right choice when the parent agent's reasoning should decide whether/when to delegate.
 
 ## Recursion
 
@@ -117,17 +145,22 @@ project's existing agent with the same name. That means:
   the plugin's is ignored until you remove yours.
 - `/plugin show <name>` lists the `agent dirs` the plugin contributes.
 
-## Subagents vs Teams
+## Subagents vs Side-channel agents vs Teams
 
-| | Subagents | Teams |
-|---|---|---|
-| **Process model** | In-process, one agent at a time | Multiple `thclaws --team-agent` processes, tmux-orchestrated |
-| **Parallelism** | Serial (recursion depth, not concurrency) | Truly concurrent |
-| **Isolation** | Shared sandbox | Optional git worktree per teammate |
-| **Messaging** | None — child returns a string | Filesystem mailbox + task queue |
-| **Overhead** | Negligible | High — spins up 1+ extra processes |
-| **Use for** | Focus a sub-problem, reduce context | Parallel streams of work with coordination |
+| | Task subagent | `/agent` side-channel | Teams |
+|---|---|---|---|
+| **Trigger** | Model decides via `Task` tool | User types `/agent` | Model uses `SpawnTeammate` |
+| **Process model** | In-process, blocks parent's turn | In-process tokio task, concurrent with parent | Multiple `thclaws --team-agent` processes, tmux-orchestrated |
+| **Parallelism** | Serial (recursion depth, not concurrency) | Concurrent with main, but each side-channel sequential | Truly concurrent |
+| **Main's history** | Tool result lands in parent's context | Untouched — result is a separate side bubble | Untouched — teammates have their own sessions |
+| **Isolation** | Shared sandbox | Shared sandbox | Optional git worktree per teammate |
+| **Cancel** | Inherits parent's cancel | Independent — own cancel via `/agent cancel <id>` | Independent — `kill` the teammate process |
+| **Messaging** | None — child returns a string | None — final result delivered as event | Filesystem mailbox + task queue |
+| **Overhead** | Negligible | Negligible | High — spins up 1+ extra processes |
+| **Use for** | Model-driven sub-problem reduction | User-driven side errands while main works | Parallel streams of long-running work |
 
-Rule of thumb: start with subagents. Reach for teams when the work
-genuinely fans out (e.g. "build the backend while I build the
-frontend").
+Rule of thumb:
+
+- **Default to model-driven `Task`** — let the parent agent decide when to delegate. Lowest ceremony.
+- **Reach for `/agent`** when *you* (the user) know specifically what you want a specialist to do AND want to keep working in main while it runs. "Translate this file to Thai while I keep coding."
+- **Reach for teams** when the work genuinely fans out across long-running parallel streams (build backend + frontend + ops in three parallel processes).

@@ -1,6 +1,6 @@
 [package]
 name = "thclaws-core"
-version = "0.8.0"
+version = "0.8.3"
 edition = "2021"
 description = "thClaws — native Rust AI agent workspace with CLI and desktop GUI."
 license = "MIT OR Apache-2.0"
@@ -96,6 +96,20 @@ native-dialog = { version = "0.9.6", optional = true }
 # binary) compile without `rand_core` — the dependency lands when the
 # policy-tool bin pulls it in.
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast", "pkcs8", "pem"] }
+# Cron-expression parser used by the scheduling subsystem to validate
+# expressions at `thclaws schedule add` time and to compute next-fire
+# times in the in-process scheduler (Step 2). chrono is already a
+# transitive dep, so this adds little binary weight.
+cron = "0.12"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+# Filesystem watcher used by the scheduler daemon's `watchWorkspace`
+# trigger. notify wraps the per-OS native APIs (FSEvents/inotify/
+# ReadDirectoryChangesW); the debouncer coalesces editor save bursts
+# (vim/VS Code emit 3-5 events per save) into single fire events.
+# We use the debouncer's re-exported notify (single-version pin)
+# rather than depending on `notify` directly — avoids the trait-
+# mismatch that two notify majors in the dep tree would cause.
+notify-debouncer-mini = "0.4"
 
 [features]
 default = []
@@ -146,3 +160,9 @@ winresource = "0.1"
 # Issue #48.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
+
+# kill(pid, 0) probe used by the scheduler daemon's PID-file
+# liveness check. Already a transitive dep via tokio + reqwest;
+# pulling it in directly avoids hand-rolling extern "C" declarations.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

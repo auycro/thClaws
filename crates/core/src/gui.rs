@@ -355,7 +355,22 @@ fn is_macos_close_shortcut(event: &tao::event::KeyEvent, modifiers: ModifiersSta
 // the always-on dispatch table.
 // build_all_models_payload migrated; request_all_models removed in SERVE9k.
 
-fn request_gui_shutdown(shared: &SharedSessionHandle, control_flow: &mut ControlFlow) {
+fn request_gui_shutdown(
+    shared: &SharedSessionHandle,
+    control_flow: &mut ControlFlow,
+    latest_window_size: Option<(f64, f64)>,
+) {
+    // Persist the latest window size so the next launch restores it.
+    // Only writes when the size actually changed from what's on disk —
+    // avoids a no-op rewrite that would touch the file's mtime.
+    if let Some((w, h)) = latest_window_size {
+        let mut project = crate::config::ProjectConfig::load().unwrap_or_default();
+        if project.window_width != Some(w) || project.window_height != Some(h) {
+            project.window_width = Some(w);
+            project.window_height = Some(h);
+            let _ = project.save();
+        }
+    }
     let _ = shared.input_tx.send(ShellInput::SaveAndQuit);
     // Kill any spawned teammate processes.
     let _ = std::process::Command::new("pkill")
@@ -365,18 +380,59 @@ fn request_gui_shutdown(shared: &SharedSessionHandle, control_flow: &mut Control
 }
 
 pub fn run_gui() {
+    run_gui_inner(None);
+}
+
+/// Combo entry point for `--serve --gui`: builds the desktop window and
+/// the HTTP/WebSocket server in the same process, sharing one engine.
+/// Browser tabs and the desktop window see the same conversation; tool
+/// approvals raised on the desktop apply to both.
+///
+/// Note: GuiApprover's approval-request channel is owned by the desktop
+/// window's forwarder, so today the browser surface does not get its
+/// own `approval_request` dispatches. Same trade-off as `--serve` alone,
+/// where approval forwarding is also unwired (the rx is dropped). For
+/// the combo, this means: approve on the desktop window, the action
+/// applies to whichever surface triggered it.
+pub fn run_gui_with_serve(config: crate::server::ServeConfig) {
+    run_gui_inner(Some(config));
+}
+
+fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
+
+    // Pick a sensible default window size based on the primary
+    // monitor's logical resolution: roomy on workstation-class
+    // displays (>=1920x1080), conservative on laptop screens. Only
+    // applies when no explicit size lives in `.thclaws/settings.json`.
+    let (default_w, default_h) = {
+        let big = event_loop
+            .primary_monitor()
+            .map(|m| {
+                let size = m.size();
+                let scale = m.scale_factor().max(0.0001);
+                let logical_w = size.width as f64 / scale;
+                let logical_h = size.height as f64 / scale;
+                logical_w >= 1920.0 && logical_h >= 1080.0
+            })
+            .unwrap_or(false);
+        if big {
+            (1760.0, 962.0)
+        } else {
+            (1200.0, 800.0)
+        }
+    };
 
     let (win_w, win_h, initial_zoom) = crate::config::ProjectConfig::load()
         .map(|c| {
             (
-                c.window_width.unwrap_or(1200.0),
-                c.window_height.unwrap_or(800.0),
+                c.window_width.unwrap_or(default_w),
+                c.window_height.unwrap_or(default_h),
                 c.gui_scale.unwrap_or(1.0),
             )
         })
-        .unwrap_or((1200.0, 800.0, 1.0));
+        .unwrap_or((default_w, default_h, 1.0));
     let window = WindowBuilder::new()
         .with_title(&crate::branding::current().name)
         .with_inner_size(LogicalSize::new(win_w, win_h))
@@ -409,6 +465,29 @@ pub fn run_gui() {
         tokio::sync::oneshot::Sender<String>,
     >::new()));
     let pending_asks_for_ipc = pending_asks.clone();
+
+    // Combo mode: spin up the HTTP/WS server on the active tokio runtime
+    // sharing the same engine (approver, shared session, pending asks)
+    // as the desktop window. Browser tabs land in the same conversation
+    // the user is looking at on the desktop. Errors print to stderr and
+    // the GUI keeps running — losing the server is degraded, not fatal.
+    if let Some(serve_config) = serve {
+        let approver_for_serve = approver.clone();
+        let shared_for_serve = shared.clone();
+        let pending_asks_for_serve = pending_asks.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::server::run_with_engine(
+                serve_config,
+                approver_for_serve,
+                shared_for_serve,
+                pending_asks_for_serve,
+            )
+            .await
+            {
+                eprintln!("\x1b[31m[serve] error: {e}\x1b[0m");
+            }
+        });
+    }
 
     // Forwarder: AskUserQuestion tool calls -> frontend composer handoff.
     let proxy_for_ask = proxy.clone();
@@ -482,6 +561,7 @@ pub fn run_gui() {
                             "tool_name": req.tool_name,
                             "input": req.input,
                             "summary": req.summary,
+                            "originator": req.originator,
                         });
                         let _ = proxy_inner.send_event(UserEvent::Dispatch(payload.to_string()));
                     }
@@ -494,6 +574,7 @@ pub fn run_gui() {
                     "tool_name": req.tool_name,
                     "input": req.input,
                     "summary": req.summary,
+                    "originator": req.originator,
                 });
                 let _ = proxy_for_approval.send_event(UserEvent::Dispatch(payload.to_string()));
             }
@@ -865,6 +946,11 @@ pub fn run_gui() {
     #[cfg(target_os = "macos")]
     let mut macos_modifiers = ModifiersState::empty();
 
+    // Latest logical window size, updated on every WindowEvent::Resized
+    // and persisted to .thclaws/settings.json on shutdown so the next
+    // launch restores it.
+    let mut latest_window_size: Option<(f64, f64)> = None;
+
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
 
@@ -934,7 +1020,7 @@ pub fn run_gui() {
                 let _ = webview.evaluate_script(&js);
             }
             Event::UserEvent(UserEvent::QuitRequested) => {
-                request_gui_shutdown(&shared_for_events, control_flow);
+                request_gui_shutdown(&shared_for_events, control_flow, latest_window_size);
             }
             Event::UserEvent(UserEvent::ZoomChanged(scale)) => {
                 let _ = webview.zoom(scale);
@@ -951,13 +1037,21 @@ pub fn run_gui() {
                 event: WindowEvent::KeyboardInput { event, .. },
                 ..
             } if is_macos_close_shortcut(&event, macos_modifiers) => {
-                request_gui_shutdown(&shared_for_events, control_flow);
+                request_gui_shutdown(&shared_for_events, control_flow, latest_window_size);
             }
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
-                request_gui_shutdown(&shared_for_events, control_flow);
+                request_gui_shutdown(&shared_for_events, control_flow, latest_window_size);
+            }
+            Event::WindowEvent {
+                event: WindowEvent::Resized(physical_size),
+                ..
+            } => {
+                let scale_factor = window.scale_factor();
+                let logical = physical_size.to_logical::<f64>(scale_factor);
+                latest_window_size = Some((logical.width, logical.height));
             }
             _ => {}
         }

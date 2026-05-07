@@ -26,8 +26,9 @@ deploy โปรเจกต์จริง ไม่ว่าจะเป็น
 | 15 | [Subagent](ch15-subagents.md) |
 | 16 | [Plugin](ch16-plugins.md) |
 | 17 | [ทีมของ Agent](ch17-agent-teams.md) |
+| 19 | [การตั้งเวลา (Scheduling)](ch19-scheduling.md) |
 
-> **ส่วนที่ 2 — กรณีศึกษา (บทที่ 18–24)** — walkthrough สำหรับสร้าง
+> **ส่วนที่ 2 — กรณีศึกษา (บทที่ 18, 20–24)** — walkthrough สำหรับสร้าง
 > โปรเจกต์จริงด้วย thClaws (เว็บ static, Node.js app, AI agent, การ
 > deploy ขึ้น Agentic Press) ยังอยู่ระหว่างพัฒนา จะถูกเพิ่มเข้ามาในคู่มือ
 > เมื่อรีวิวและพร้อมเผยแพร่ทีละบท

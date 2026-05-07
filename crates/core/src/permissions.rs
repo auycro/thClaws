@@ -125,12 +125,56 @@ pub fn set_current_mode_and_broadcast(mode: PermissionMode) {
     fire_mode_changed(mode);
 }
 
+/// Identity of the agent making an approval request. The frontend
+/// uses this to render "Main wants to run Bash" vs "translator (side
+/// channel) wants to run Bash" so the user can disambiguate when
+/// multiple agents request permission concurrently. Defaults to
+/// `Main` for back-compat with code paths that haven't been
+/// concurrency-aware yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentOrigin {
+    /// Main agent — the user's primary conversation surface.
+    Main,
+    /// Side-channel subagent spawned by the user via `/agent <name>`.
+    /// Runs concurrently with the main agent on its own tokio task,
+    /// independent of main's history.
+    SideChannel {
+        /// Stable id assigned at spawn time (e.g. `side-abc123…`).
+        /// User can reference this id in `/agent cancel <id>`.
+        id: String,
+        /// AgentDef name from `.thclaws/agents/*.md` or plugin agent
+        /// dirs (e.g. `translator`, `researcher`).
+        agent_name: String,
+    },
+    /// Subagent spawned by the model via the `Task` tool. Different
+    /// from `SideChannel` semantically — the model decided to spawn
+    /// this, not the user.
+    Subagent {
+        /// AgentDef name.
+        agent_name: String,
+        /// Recursion depth (0 = direct child of main, capped at
+        /// `DEFAULT_MAX_DEPTH = 3`).
+        depth: usize,
+    },
+}
+
+impl Default for AgentOrigin {
+    fn default() -> Self {
+        Self::Main
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ApprovalRequest {
     pub tool_name: String,
     pub input: Value,
     /// Optional short preview line the sink can show to the user.
     pub summary: Option<String>,
+    /// Identity of the agent making this request. Used by the GUI to
+    /// disambiguate concurrent permission requests across main +
+    /// side-channel agents. Defaults to `Main`.
+    pub originator: AgentOrigin,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,6 +330,9 @@ pub struct GuiApprovalRequest {
     pub tool_name: String,
     pub input: Value,
     pub summary: Option<String>,
+    /// Carried through from `ApprovalRequest.originator`. Frontend
+    /// renders "Main" vs "translator (side)" based on this.
+    pub originator: AgentOrigin,
 }
 
 /// Bridge between the agent's async `approve()` call and the GUI
@@ -370,6 +417,7 @@ impl ApprovalSink for GuiApprover {
             tool_name: req.tool_name.clone(),
             input: req.input.clone(),
             summary: req.summary.clone(),
+            originator: req.originator.clone(),
         };
         if let Ok(mut u) = self.unresolved.lock() {
             u.insert(id, out.clone());
@@ -405,6 +453,7 @@ mod tests {
             tool_name: "X".into(),
             input: serde_json::json!({}),
             summary: None,
+            originator: AgentOrigin::Main,
         };
         assert_eq!(a.approve(&req).await, ApprovalDecision::Allow);
     }
@@ -416,6 +465,7 @@ mod tests {
             tool_name: "X".into(),
             input: serde_json::json!({}),
             summary: None,
+            originator: AgentOrigin::Main,
         };
         assert_eq!(d.approve(&req).await, ApprovalDecision::Deny);
     }
@@ -427,6 +477,7 @@ mod tests {
             tool_name: "T".into(),
             input: serde_json::json!({}),
             summary: None,
+            originator: AgentOrigin::Main,
         };
         assert_eq!(a.approve(&req).await, ApprovalDecision::Allow);
         assert_eq!(a.approve(&req).await, ApprovalDecision::Deny);
@@ -441,6 +492,7 @@ mod tests {
             tool_name: "T".into(),
             input: serde_json::json!({}),
             summary: None,
+            originator: AgentOrigin::Main,
         };
         // First call resolves AllowForSession → Allow (and sets the flag).
         assert_eq!(a.approve(&req).await, ApprovalDecision::Allow);
@@ -456,6 +508,7 @@ mod tests {
             tool_name: "Write".into(),
             input: serde_json::json!({"path": "foo.txt"}),
             summary: Some("Write to foo.txt".into()),
+            originator: AgentOrigin::Main,
         };
         let approver_for_task = approver.clone();
         let call = tokio::spawn(async move { approver_for_task.approve(&req).await });
@@ -465,6 +518,73 @@ mod tests {
         assert_eq!(call.await.unwrap(), ApprovalDecision::Allow);
     }
 
+    /// `originator` field on ApprovalRequest must round-trip into
+    /// the GuiApprovalRequest forwarded to the frontend, with the
+    /// SideChannel variant preserving id + agent_name. Frontend uses
+    /// these to render "translator (side) wants to run Bash".
+    #[tokio::test]
+    async fn gui_approver_propagates_side_channel_originator() {
+        let (approver, mut rx) = GuiApprover::new();
+        let req = ApprovalRequest {
+            tool_name: "Bash".into(),
+            input: serde_json::json!({"command": "ls"}),
+            summary: None,
+            originator: AgentOrigin::SideChannel {
+                id: "side-abc123".into(),
+                agent_name: "translator".into(),
+            },
+        };
+        let approver_c = approver.clone();
+        let call = tokio::spawn(async move { approver_c.approve(&req).await });
+        let outbound = rx.recv().await.expect("request forwarded");
+        match &outbound.originator {
+            AgentOrigin::SideChannel { id, agent_name } => {
+                assert_eq!(id, "side-abc123");
+                assert_eq!(agent_name, "translator");
+            }
+            other => panic!("expected SideChannel, got {other:?}"),
+        }
+        approver.resolve(outbound.id, ApprovalDecision::Allow);
+        let _ = call.await;
+    }
+
+    #[test]
+    fn agent_origin_default_is_main() {
+        assert_eq!(AgentOrigin::default(), AgentOrigin::Main);
+    }
+
+    #[test]
+    fn agent_origin_serializes_with_kind_tag() {
+        let main = serde_json::to_value(AgentOrigin::Main).unwrap();
+        assert_eq!(main, serde_json::json!({"kind": "main"}));
+        let side = serde_json::to_value(AgentOrigin::SideChannel {
+            id: "side-1".into(),
+            agent_name: "translator".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            side,
+            serde_json::json!({
+                "kind": "side_channel",
+                "id": "side-1",
+                "agent_name": "translator",
+            })
+        );
+        let sub = serde_json::to_value(AgentOrigin::Subagent {
+            agent_name: "researcher".into(),
+            depth: 1,
+        })
+        .unwrap();
+        assert_eq!(
+            sub,
+            serde_json::json!({
+                "kind": "subagent",
+                "agent_name": "researcher",
+                "depth": 1,
+            })
+        );
+    }
+
     #[tokio::test]
     async fn gui_approver_allow_for_session_sticks() {
         let (approver, mut rx) = GuiApprover::new();
@@ -472,6 +592,7 @@ mod tests {
             tool_name: "Bash".into(),
             input: serde_json::json!({"command": "ls"}),
             summary: None,
+            originator: AgentOrigin::Main,
         };
         // First call: user picks AllowForSession → Allow + flag flips.
         let approver_c = approver.clone();
@@ -493,6 +614,7 @@ mod tests {
             tool_name: "Write".into(),
             input: serde_json::json!({}),
             summary: None,
+            originator: AgentOrigin::Main,
         };
         assert_eq!(approver.approve(&req).await, ApprovalDecision::Deny);
     }
@@ -507,6 +629,7 @@ mod tests {
             tool_name: "Bash".into(),
             input: serde_json::json!({"command": "ls"}),
             summary: None,
+            originator: AgentOrigin::Main,
         };
         // Set the yolo flag.
         let approver_c = approver.clone();
@@ -537,6 +660,7 @@ mod tests {
             tool_name: "Bash".into(),
             input: serde_json::json!({"command": "ls"}),
             summary: None,
+            originator: AgentOrigin::Main,
         };
         // Flag set → auto-allow.
         assert_eq!(approver.approve(&req).await, ApprovalDecision::Allow);

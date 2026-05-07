@@ -4,12 +4,12 @@
 //! `--cli`: interactive REPL in the terminal (same as thclaws-cli).
 //! `--print`: non-interactive single-prompt mode (implies --cli).
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use thclaws_core::config::AppConfig;
 use thclaws_core::dotenv::load_dotenv;
 use thclaws_core::repl::{run_print_mode, run_repl};
 use thclaws_core::sandbox::Sandbox;
-use thclaws_core::{endpoints, secrets};
+use thclaws_core::{endpoints, schedule, secrets};
 
 #[derive(Parser)]
 #[command(
@@ -25,6 +25,11 @@ use thclaws_core::{endpoints, secrets};
     about = "thClaws AI agent workspace (GUI + CLI)"
 )]
 struct Cli {
+    /// Subcommands. When omitted, the legacy flag-based CLI runs
+    /// (GUI default / `--cli` REPL / `--print` / `--serve`).
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Run in CLI mode (interactive REPL) instead of GUI
     #[arg(long)]
     cli: bool,
@@ -87,8 +92,9 @@ struct Cli {
     /// `--bind 0.0.0.0` exposes the server publicly (only with auth
     /// in front: e.g. Tailscale, Cloudflare Access, reverse proxy
     /// with basic auth). One project per process; cd into the project
-    /// dir before running. Mutually exclusive with --cli / --print /
-    /// the GUI default.
+    /// dir before running. Compose with `--gui` to also open the
+    /// desktop window on the same engine; mutually exclusive with
+    /// --cli / --print.
     #[arg(long)]
     serve: bool,
 
@@ -102,8 +108,95 @@ struct Cli {
     #[arg(long, default_value = "127.0.0.1")]
     bind: String,
 
+    /// Open the desktop GUI window. GUI is the implicit default when no
+    /// other surface flag is set, so this flag's main use is composing
+    /// with `--serve` (`--serve --gui`): the desktop window and any
+    /// browser tab attach to the same Agent + Session — same
+    /// conversation, two surfaces.
+    #[arg(long)]
+    gui: bool,
+
+    /// Disable the in-process scheduler. Schedules stay in the store
+    /// but won't auto-fire while this process runs — use external
+    /// cron / launchd or `thclaws schedule run <id>` instead. Has no
+    /// effect on `--print` and the `schedule` subcommand, neither of
+    /// which spawn the scheduler in the first place.
+    #[arg(long)]
+    no_scheduler: bool,
+
     /// Prompt (positional args joined with spaces)
     prompt: Vec<String>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Manage scheduled jobs.
+    #[command(subcommand)]
+    Schedule(ScheduleCmd),
+    /// Run the scheduler daemon in the foreground. Normally invoked
+    /// by launchd / systemd via `thclaws schedule install`. Run it
+    /// manually to test schedules without installing the supervisor
+    /// (Ctrl-C to stop).
+    Daemon,
+}
+
+#[derive(Subcommand)]
+enum ScheduleCmd {
+    /// Add a new schedule. Errors if the id already exists.
+    Add {
+        /// Stable id for the schedule (used as the lookup key and log dir name).
+        id: String,
+        /// Standard 5-field POSIX cron expression (e.g. "30 8 * * MON-FRI").
+        #[arg(long)]
+        cron: String,
+        /// Prompt text to feed `thclaws --print` when this schedule fires.
+        #[arg(long)]
+        prompt: String,
+        /// Working directory for the spawned job. Defaults to the current
+        /// working directory at add time.
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Override model alias for this job (defaults to whatever the
+        /// cwd's `.thclaws/settings.json` picks).
+        #[arg(long)]
+        model: Option<String>,
+        /// Per-job iteration cap.
+        #[arg(long)]
+        max_iterations: Option<usize>,
+        /// Per-job timeout in seconds. Default 600 (10 min). Pass 0 for no timeout.
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+        /// Add as disabled. Edit `~/.config/thclaws/schedules.json` (set
+        /// `"enabled": true`) to turn it on later.
+        #[arg(long)]
+        disabled: bool,
+        /// Also fire when any file in the schedule's working directory
+        /// changes (debounced ~2s). Daemon-only — the in-process
+        /// scheduler ignores this flag.
+        #[arg(long)]
+        watch: bool,
+    },
+    /// List all schedules.
+    List,
+    /// Print one schedule's full record as JSON.
+    Show { id: String },
+    /// Remove a schedule (does not delete its log directory).
+    Rm { id: String },
+    /// Fire a schedule once, synchronously. Captures stdout+stderr to
+    /// `~/.local/share/thclaws/logs/<id>/<ts>.log` and returns the
+    /// child's exit code as this process's exit code.
+    Run { id: String },
+    /// Install the scheduler daemon as a user-level supervised
+    /// service (launchd plist on macOS, systemd-user unit on Linux).
+    /// On macOS this also bootstraps the agent so the daemon starts
+    /// immediately and on every login.
+    Install,
+    /// Stop and remove the daemon's supervisor entry. Schedules in
+    /// the store are preserved.
+    Uninstall,
+    /// Print scheduler daemon status (running / stale / not running)
+    /// and a brief recent-fires summary across all schedules.
+    Status,
 }
 
 /// Hide the console allocated for the Windows console-subsystem binary when
@@ -141,7 +234,57 @@ async fn main() {
     }
 
     let cli = Cli::parse();
+
+    // Subcommand short-circuit. `thclaws schedule …` and
+    // `thclaws daemon` don't need the bootstrap, don't open a
+    // session, and shouldn't fall through to GUI/CLI/serve
+    // dispatch — handle them here and exit.
+    match cli.command {
+        Some(Command::Schedule(sub)) => {
+            let code = run_schedule_subcommand(sub);
+            std::process::exit(code);
+        }
+        Some(Command::Daemon) => {
+            // The daemon spawns its own scheduler — ensure the
+            // app.rs auto-spawn block below does NOT also spawn one
+            // (would mean two schedulers running against the same
+            // store). The `cli.command.is_some()` check below
+            // handles that.
+            match schedule::run_daemon().await {
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("\x1b[31m[daemon] {e}\x1b[0m");
+                    std::process::exit(1);
+                }
+            }
+        }
+        None => {}
+    }
+
     let use_cli = cli.cli || cli.print;
+
+    // First-run bootstrap: drop a `.thclaws/settings.json` with model +
+    // permissions defaults into the project so users get a working
+    // config the first time they `cd` in. Skipped if a config already
+    // exists or if a Claude Code `.claude/settings.json` is present.
+    thclaws_core::config::ProjectConfig::ensure_default_exists();
+
+    // In-process scheduler (Step 2): spawn a background tokio task
+    // that polls `~/.config/thclaws/schedules.json` every 30s and
+    // fires due jobs as `thclaws --print` subprocesses. Skipped for
+    // `--print` (short-lived, would add subprocess noise to a 5s
+    // run) and when the user passes `--no-scheduler`. The task
+    // ends when the process exits.
+    if !cli.print && !cli.no_scheduler {
+        match std::env::current_exe() {
+            Ok(binary) => {
+                schedule::spawn_scheduler_task(binary);
+            }
+            Err(e) => {
+                eprintln!("\x1b[33m[schedule] could not resolve current_exe: {e} — scheduler disabled\x1b[0m");
+            }
+        }
+    }
 
     // M6.36 SERVE5: --serve mode short-circuits the CLI/GUI dispatch.
     // Single-purpose deployment shape — operator runs one process per
@@ -149,6 +292,9 @@ async fn main() {
     // transitively depends on crate::shared_session (also gui-gated)
     // — they share the same WorkerState engine. The CLI-only
     // thclaws-cli binary doesn't ship --serve.
+    //
+    // `--serve --gui` is the combo path: same process owns the desktop
+    // window and the HTTP/WS listener, both attached to one engine.
     if cli.serve {
         #[cfg(feature = "gui")]
         {
@@ -159,10 +305,19 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            let config = thclaws_core::server::ServeConfig {
+            let serve_config = thclaws_core::server::ServeConfig {
                 bind: std::net::SocketAddr::new(bind_ip, cli.port),
             };
-            if let Err(e) = thclaws_core::server::run(config).await {
+            if cli.gui {
+                if use_cli {
+                    eprintln!("\x1b[31m--gui is incompatible with --cli/--print\x1b[0m");
+                    std::process::exit(1);
+                }
+                detach_console_for_gui();
+                thclaws_core::gui::run_gui_with_serve(serve_config);
+                return;
+            }
+            if let Err(e) = thclaws_core::server::run(serve_config).await {
                 eprintln!("\n\x1b[31mserve error: {e}\x1b[0m");
                 std::process::exit(1);
             }
@@ -245,6 +400,264 @@ async fn main() {
         if let Err(e) = run_repl(config).await {
             eprintln!("\n\x1b[31merror: {e}\x1b[0m");
             std::process::exit(1);
+        }
+    }
+}
+
+/// Dispatch table for `thclaws schedule …`. Returns the exit code the
+/// process should report. `run` returns the child's exit code (or 124
+/// on timeout, mirroring GNU `timeout(1)`); the management subcommands
+/// return 0 on success and 1 on user error.
+fn run_schedule_subcommand(cmd: ScheduleCmd) -> i32 {
+    match cmd {
+        ScheduleCmd::Add {
+            id,
+            cron,
+            prompt,
+            cwd,
+            model,
+            max_iterations,
+            timeout,
+            disabled,
+            watch,
+        } => {
+            let cwd_path = match cwd {
+                Some(p) => std::path::PathBuf::from(p),
+                None => match std::env::current_dir() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("\x1b[31merror: cannot read current dir: {e}\x1b[0m");
+                        return 1;
+                    }
+                },
+            };
+            if !cwd_path.exists() {
+                eprintln!(
+                    "\x1b[31merror: cwd does not exist: {}\x1b[0m",
+                    cwd_path.display()
+                );
+                return 1;
+            }
+            let mut store = match schedule::ScheduleStore::load() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("\x1b[31merror: load schedule store: {e}\x1b[0m");
+                    return 1;
+                }
+            };
+            let entry = schedule::Schedule {
+                id: id.clone(),
+                cron,
+                cwd: cwd_path,
+                prompt,
+                model,
+                max_iterations,
+                timeout_secs: if timeout == 0 { None } else { Some(timeout) },
+                enabled: !disabled,
+                watch_workspace: watch,
+                last_run: None,
+                last_exit: None,
+            };
+            if let Err(e) = store.add(entry) {
+                eprintln!("\x1b[31merror: {e}\x1b[0m");
+                return 1;
+            }
+            if let Err(e) = store.save() {
+                eprintln!("\x1b[31merror: save schedule store: {e}\x1b[0m");
+                return 1;
+            }
+            println!("added schedule '{id}'");
+            0
+        }
+        ScheduleCmd::List => {
+            let store = match schedule::ScheduleStore::load() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("\x1b[31merror: load schedule store: {e}\x1b[0m");
+                    return 1;
+                }
+            };
+            if store.schedules.is_empty() {
+                println!(
+                    "no schedules — `thclaws schedule add <id> --cron \"...\" --prompt \"...\"`"
+                );
+                return 0;
+            }
+            // Compact list: id, cron, enabled flag, watchWorkspace
+            // indicator, last-run timestamp (or "never"), and cwd.
+            // One line per schedule.
+            for s in &store.schedules {
+                let status = if s.enabled { "on " } else { "off" };
+                let watch = if s.watch_workspace {
+                    "+watch"
+                } else {
+                    "      "
+                };
+                let last = s.last_run.as_deref().unwrap_or("never");
+                let exit = match s.last_exit {
+                    Some(0) => " ok ",
+                    Some(_) => " err",
+                    None => "    ",
+                };
+                println!(
+                    "{status} {exit} {watch}  {:24}  {:20}  {}  {}",
+                    s.id,
+                    s.cron,
+                    last,
+                    s.cwd.display()
+                );
+            }
+            0
+        }
+        ScheduleCmd::Show { id } => {
+            let store = match schedule::ScheduleStore::load() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("\x1b[31merror: load schedule store: {e}\x1b[0m");
+                    return 1;
+                }
+            };
+            match store.get(&id) {
+                Some(s) => match serde_json::to_string_pretty(s) {
+                    Ok(json) => {
+                        println!("{json}");
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("\x1b[31merror: serialize: {e}\x1b[0m");
+                        1
+                    }
+                },
+                None => {
+                    eprintln!("\x1b[31merror: no schedule with id '{id}'\x1b[0m");
+                    1
+                }
+            }
+        }
+        ScheduleCmd::Rm { id } => {
+            let mut store = match schedule::ScheduleStore::load() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("\x1b[31merror: load schedule store: {e}\x1b[0m");
+                    return 1;
+                }
+            };
+            if !store.remove(&id) {
+                eprintln!("\x1b[31merror: no schedule with id '{id}'\x1b[0m");
+                return 1;
+            }
+            if let Err(e) = store.save() {
+                eprintln!("\x1b[31merror: save schedule store: {e}\x1b[0m");
+                return 1;
+            }
+            println!("removed schedule '{id}'");
+            0
+        }
+        ScheduleCmd::Install => match schedule::install_daemon() {
+            Ok(report) => {
+                println!("wrote {}", report.supervisor_path.display());
+                if report.next_steps.is_empty() {
+                    println!("daemon bootstrapped — `thclaws schedule status` to verify");
+                } else {
+                    println!("\nnext steps:");
+                    for step in &report.next_steps {
+                        println!("  $ {step}");
+                    }
+                }
+                0
+            }
+            Err(e) => {
+                eprintln!("\x1b[31merror: {e}\x1b[0m");
+                1
+            }
+        },
+        ScheduleCmd::Uninstall => match schedule::uninstall_daemon() {
+            Ok(path) => {
+                if path.exists() {
+                    println!(
+                        "warning: supervisor file at {} still exists",
+                        path.display()
+                    );
+                    1
+                } else {
+                    println!("daemon uninstalled");
+                    0
+                }
+            }
+            Err(e) => {
+                eprintln!("\x1b[31merror: {e}\x1b[0m");
+                1
+            }
+        },
+        ScheduleCmd::Status => {
+            let status = schedule::daemon_status();
+            match status {
+                schedule::DaemonStatus::Running(pid) => {
+                    println!("daemon: \x1b[32mrunning\x1b[0m (pid {pid})");
+                }
+                schedule::DaemonStatus::Stale(pid) => {
+                    println!(
+                        "daemon: \x1b[33mstale PID file\x1b[0m (last pid {pid} not alive — \
+                         supervisor will reclaim on next start)"
+                    );
+                }
+                schedule::DaemonStatus::NotRunning => {
+                    println!(
+                        "daemon: \x1b[33mnot running\x1b[0m \
+                         (`thclaws schedule install` to enable)"
+                    );
+                }
+            }
+            // Compact recent-fires summary so the user can see
+            // whether jobs are firing without `tail`-ing each log.
+            match schedule::ScheduleStore::load() {
+                Ok(store) if !store.schedules.is_empty() => {
+                    println!("\nrecent fires:");
+                    for s in &store.schedules {
+                        let last = s.last_run.as_deref().unwrap_or("never");
+                        let exit = match s.last_exit {
+                            Some(0) => "ok ",
+                            Some(_) => "err",
+                            None => "—  ",
+                        };
+                        println!("  {exit}  {:24}  {}", s.id, last);
+                    }
+                }
+                _ => {}
+            }
+            0
+        }
+        ScheduleCmd::Run { id } => {
+            // Use the *currently running* binary as the spawn target so
+            // the scheduled job runs against the same thclaws build that
+            // registered it. `current_exe` follows symlinks on macOS so
+            // a homebrew-installed thclaws still resolves correctly.
+            let binary = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("\x1b[31merror: cannot resolve current_exe: {e}\x1b[0m");
+                    return 1;
+                }
+            };
+            match schedule::run_once(&id, &binary) {
+                Ok(outcome) => {
+                    eprintln!(
+                        "\x1b[36m[schedule] '{id}' ran in {}.{:03}s, log: {}\x1b[0m",
+                        outcome.duration.as_secs(),
+                        outcome.duration.subsec_millis(),
+                        outcome.log_path.display(),
+                    );
+                    if outcome.timed_out {
+                        eprintln!("\x1b[33m[schedule] '{id}' timed out\x1b[0m");
+                        return 124;
+                    }
+                    outcome.exit_code.unwrap_or(1)
+                }
+                Err(e) => {
+                    eprintln!("\x1b[31merror: {e}\x1b[0m");
+                    1
+                }
+            }
         }
     }
 }

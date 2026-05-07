@@ -1,12 +1,49 @@
 import { useEffect, useState } from "react";
 import { send, subscribe } from "../hooks/useIPC";
 
+/**
+ * Identity of the agent that fired this approval request. Tagged at
+ * the backend so the modal can disambiguate concurrent permission
+ * asks from main + side-channel agents. Mirrors the Rust
+ * `permissions::AgentOrigin` enum (serde tagged `kind`).
+ */
+type AgentOrigin =
+  | { kind: "main" }
+  | { kind: "side_channel"; id: string; agent_name: string }
+  | { kind: "subagent"; agent_name: string; depth: number };
+
 type PendingRequest = {
   id: number;
   tool_name: string;
   input: unknown;
   summary: string | null;
+  originator: AgentOrigin;
 };
+
+function originLabel(o: AgentOrigin): string {
+  switch (o.kind) {
+    case "main":
+      return "Main";
+    case "side_channel":
+      return `${o.agent_name} (background)`;
+    case "subagent":
+      return `${o.agent_name} (subagent · depth ${o.depth})`;
+  }
+}
+
+function originAccent(o: AgentOrigin): string {
+  // Visual distinction so concurrent requests don't all look the same.
+  // Main = accent (default); side-channel = warning amber; subagent
+  // = secondary blue.
+  switch (o.kind) {
+    case "main":
+      return "var(--accent)";
+    case "side_channel":
+      return "#d97706";
+    case "subagent":
+      return "#2563eb";
+  }
+}
 
 type Decision = "allow" | "allow_for_session" | "deny";
 
@@ -32,6 +69,11 @@ export function ApprovalModal() {
           // if we already have this id in the queue so the modal
           // doesn't spawn duplicates after a webview reload or race.
           if (prev.some((r) => r.id === newId)) return prev;
+          // `originator` tagged on every request so the modal can
+          // render which agent is asking when concurrent agents
+          // request permissions. Default to `main` for back-compat
+          // with backends that don't yet emit the field.
+          const originator = (msg.originator as AgentOrigin) ?? { kind: "main" };
           return [
             ...prev,
             {
@@ -39,6 +81,7 @@ export function ApprovalModal() {
               tool_name: (msg.tool_name as string) ?? "?",
               input: msg.input,
               summary: (msg.summary as string | null) ?? null,
+              originator,
             },
           ];
         });
@@ -78,10 +121,12 @@ export function ApprovalModal() {
           className="px-4 py-2 border-b text-sm font-semibold flex items-center gap-2"
           style={{ borderColor: "var(--border)" }}
         >
-          <span style={{ color: "var(--accent)" }}>●</span>
-          <span>Agent wants to run</span>
-          <code className="px-1.5 py-0.5 rounded text-xs font-mono"
-            style={{ background: "var(--bg-secondary)" }}>
+          <span style={{ color: originAccent(current.originator) }}>●</span>
+          <span>{originLabel(current.originator)} wants to run</span>
+          <code
+            className="px-1.5 py-0.5 rounded text-xs font-mono"
+            style={{ background: "var(--bg-secondary)" }}
+          >
             {current.tool_name}
           </code>
         </div>

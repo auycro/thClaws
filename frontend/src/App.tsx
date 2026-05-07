@@ -12,6 +12,7 @@ import { SettingsMenu } from "./components/SettingsMenu";
 import { InstructionsEditorModal } from "./components/InstructionsEditorModal";
 import { SecretsBackendDialog } from "./components/SecretsBackendDialog";
 import { ApprovalModal } from "./components/ApprovalModal";
+import { ScheduleAddModal } from "./components/ScheduleAddModal";
 import { ModelPickerModal, type PickerModel } from "./components/ModelPickerModal";
 import { ContextWarningBanner } from "./components/ContextWarningBanner";
 import { useEditingShortcuts } from "./hooks/useEditingShortcuts";
@@ -562,6 +563,7 @@ export default function App() {
         />
       )}
       <ApprovalModal />
+      <ScheduleAddModal />
       <ContextWarningBanner />
       {modelPicker && (
         <ModelPickerModal

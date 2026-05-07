@@ -106,6 +106,7 @@ pub fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
         ViewEvent::KmsUpdate(json) => vec![json.clone()],
         ViewEvent::McpUpdate(json) => vec![json.clone()],
         ViewEvent::ModelPickerOpen(json) => vec![json.clone()],
+        ViewEvent::ScheduleAddOpen(json) => vec![json.clone()],
         ViewEvent::ContextWarning { file_size_mb } => vec![serde_json::json!({
             "type": "chat_context_warning",
             "file_size_mb": file_size_mb,
@@ -174,6 +175,48 @@ pub fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
             });
             vec![payload.to_string()]
         }
+        ViewEvent::SideChannelStart { id, agent_name } => vec![serde_json::json!({
+            "type": "chat_side_channel_start",
+            "id": id,
+            "agent_name": agent_name,
+        })
+        .to_string()],
+        ViewEvent::SideChannelTextDelta { id, text } => vec![serde_json::json!({
+            "type": "chat_side_channel_text_delta",
+            "id": id,
+            "text": text,
+        })
+        .to_string()],
+        ViewEvent::SideChannelToolCall {
+            id,
+            tool_name,
+            label,
+        } => vec![serde_json::json!({
+            "type": "chat_side_channel_tool_call",
+            "id": id,
+            "tool_name": tool_name,
+            "label": label,
+        })
+        .to_string()],
+        ViewEvent::SideChannelDone {
+            id,
+            agent_name,
+            duration_ms,
+            result_text,
+        } => vec![serde_json::json!({
+            "type": "chat_side_channel_done",
+            "id": id,
+            "agent_name": agent_name,
+            "duration_ms": duration_ms,
+            "result_text": result_text,
+        })
+        .to_string()],
+        ViewEvent::SideChannelError { id, error } => vec![serde_json::json!({
+            "type": "chat_side_channel_error",
+            "id": id,
+            "error": error,
+        })
+        .to_string()],
     }
 }
 
@@ -331,13 +374,20 @@ pub fn render_terminal_ansi(state: &mut TerminalRenderState, ev: &ViewEvent) -> 
         ViewEvent::TurnDone => None,
         ViewEvent::HistoryReplaced(messages) => {
             let mut out = String::from("\x1b[3J\x1b[2J\x1b[H");
-            for m in messages {
+            for (i, m) in messages.iter().enumerate() {
                 let line = match m.role.as_str() {
                     "user" => {
+                        // Prepend a blank line before every user
+                        // message except the first — restored history
+                        // can be a wall of tool indicators between
+                        // turns and the gap makes conversation
+                        // boundaries scannable. The very first
+                        // message doesn't need it (no scroll above).
+                        let lead = if i == 0 { "" } else { "\r\n" };
                         let marker = "\x1b[2m> \x1b[0m";
                         let indent = "  ";
                         let mut lines = m.content.split('\n');
-                        let mut body = String::new();
+                        let mut body = String::from(lead);
                         if let Some(first) = lines.next() {
                             body.push_str(&format!("{marker}{first}"));
                         }
@@ -362,6 +412,7 @@ pub fn render_terminal_ansi(state: &mut TerminalRenderState, ev: &ViewEvent) -> 
         ViewEvent::KmsUpdate(_) => None,
         ViewEvent::McpUpdate(_) => None,
         ViewEvent::ModelPickerOpen(_) => None,
+        ViewEvent::ScheduleAddOpen(_) => None,
         ViewEvent::ContextWarning { file_size_mb } => Some(format!(
             "\r\n\x1b[33m[ session {:.1} MB — /fork to continue in a new session with summary ]\x1b[0m\r\n",
             file_size_mb
@@ -372,6 +423,37 @@ pub fn render_terminal_ansi(state: &mut TerminalRenderState, ev: &ViewEvent) -> 
         ViewEvent::GoalUpdate(_) => None,
         ViewEvent::PermissionModeChanged(_) => None,
         ViewEvent::PlanStalled { .. } => None,
+        // Side-channel events surface only on chat-shaped renderer.
+        // CLI REPL / terminal pane gets a one-line ANSI marker for
+        // start + done so users running thclaws --cli still see
+        // background-agent activity without a custom renderer. Text
+        // deltas and intermediate tool calls are dropped on terminal
+        // — too noisy without a separate panel.
+        ViewEvent::SideChannelStart { id, agent_name } => Some(format!(
+            "\r\n\x1b[2m[agent {agent_name} ({id}) — running in background]\x1b[0m\r\n"
+        )),
+        ViewEvent::SideChannelTextDelta { .. } => None,
+        ViewEvent::SideChannelToolCall { .. } => None,
+        ViewEvent::SideChannelDone {
+            id,
+            agent_name,
+            duration_ms,
+            result_text,
+        } => {
+            let secs = *duration_ms as f64 / 1000.0;
+            // Two-line emit: status header + result body. Result is
+            // displayed in dim italic so it's distinguishable from
+            // main agent's stream. Long results stay on a single
+            // panel — user can grep terminal scrollback.
+            let body = result_text.replace('\n', "\r\n");
+            Some(format!(
+                "\r\n\x1b[36m[agent {agent_name} ({id}) ✓ done in {secs:.2}s]\x1b[0m\r\n\
+                 \x1b[2;3m{body}\x1b[0m\r\n"
+            ))
+        }
+        ViewEvent::SideChannelError { id, error } => Some(format!(
+            "\r\n\x1b[31m[agent {id} ✗ {error}]\x1b[0m\r\n"
+        )),
     };
 
     match inner {
@@ -476,5 +558,50 @@ mod chat_render_tests {
         assert_eq!(dispatches.len(), 1);
         let parsed: serde_json::Value = serde_json::from_str(&dispatches[0]).unwrap();
         assert_eq!(parsed["type"], "chat_done");
+    }
+
+    /// Restored chat history is rendered into the terminal as one
+    /// linear ANSI string. Each user message after the first should
+    /// start with a blank line so conversation turns are visually
+    /// separated from the dim tool / assistant rows between them.
+    #[test]
+    fn history_replaced_blank_line_before_user_messages() {
+        use crate::shared_session::DisplayMessage;
+        let mut state = TerminalRenderState::default();
+        let msgs = vec![
+            DisplayMessage {
+                role: "user".into(),
+                content: "first prompt".into(),
+            },
+            DisplayMessage {
+                role: "assistant".into(),
+                content: "ok".into(),
+            },
+            DisplayMessage {
+                role: "tool".into(),
+                content: "Bash".into(),
+            },
+            DisplayMessage {
+                role: "user".into(),
+                content: "follow-up".into(),
+            },
+        ];
+        let out = render_terminal_ansi(&mut state, &ViewEvent::HistoryReplaced(msgs))
+            .expect("HistoryReplaced should produce ANSI");
+        // First user message: no leading blank line (it follows the
+        // clear-screen escapes). Second user message: leading \r\n
+        // before the `> ` marker.
+        let stripped = strip_ansi(&out);
+        assert!(stripped.contains("> first prompt"));
+        assert!(
+            stripped.contains("\r\n\r\n> follow-up"),
+            "expected blank line before second user prompt; got: {stripped:?}"
+        );
+        // No double-blank before the FIRST user message — that would
+        // look weird at the very top of restored scrollback.
+        assert!(
+            !stripped.contains("\r\n\r\n> first prompt"),
+            "first user prompt should not have a leading blank line; got: {stripped:?}"
+        );
     }
 }

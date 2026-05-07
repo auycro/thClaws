@@ -214,6 +214,12 @@ pub enum ViewEvent {
     /// The CLI renderer ignores this — a CLI TUI picker is a future
     /// follow-up.
     ModelPickerOpen(String),
+    /// Open the schedule-add modal — pre-built JSON payload shaped
+    /// `{type: "schedule_add_open", defaults: {cwd, timeoutSecs}}`.
+    /// Emitted by the `/schedule add` slash command from a GUI surface.
+    /// CLI renderer ignores this; the REPL handler prints help text
+    /// instead since a multi-field form doesn't fit a terminal line.
+    ScheduleAddOpen(String),
     /// The session's on-disk JSONL has crossed the fork threshold.
     /// Frontend renders a dismissible banner with a "Fork into new
     /// session with summary" action. Fired once per session.
@@ -260,6 +266,48 @@ pub enum ViewEvent {
         step_title: String,
         turns: usize,
     },
+    /// User-spawned side-channel agent started running. `id` is the
+    /// stable handle the user can reference in `/agent cancel <id>`;
+    /// `agent_name` is the AgentDef name (e.g. `translator`). Frontend
+    /// renders a "🔄 1 background agent running" status indicator above
+    /// the chat input area when at least one side-channel is active.
+    SideChannelStart {
+        id: String,
+        agent_name: String,
+    },
+    /// Streaming text delta from a side-channel agent's response.
+    /// Frontend appends to the in-progress side-channel bubble.
+    SideChannelTextDelta {
+        id: String,
+        text: String,
+    },
+    /// A tool call inside a side-channel agent. Surfaced for
+    /// completeness so the per-thread drill-down stream has the
+    /// same fidelity as the main agent's tool indicators. Most users
+    /// will only see the final result, not these.
+    SideChannelToolCall {
+        id: String,
+        tool_name: String,
+        label: String,
+    },
+    /// Side-channel agent finished. `duration_ms` is wall-clock from
+    /// spawn to idle; `result_text` is the final assistant message
+    /// (concatenated text blocks). Frontend renders a "✓ done in
+    /// 5m23s" header on the side-channel bubble.
+    SideChannelDone {
+        id: String,
+        agent_name: String,
+        duration_ms: u64,
+        result_text: String,
+    },
+    /// Side-channel agent errored or was cancelled before completion.
+    /// `error` is a one-line description; the bubble flips to a red
+    /// header. Cancellation (via `/agent cancel`) lands here too with
+    /// `error: "cancelled"`.
+    SideChannelError {
+        id: String,
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +319,13 @@ pub struct DisplayMessage {
 impl DisplayMessage {
     pub fn from_messages(messages: &[Message]) -> Vec<Self> {
         let mut out: Vec<DisplayMessage> = Vec::new();
+        // Map tool_use_id → tool name so when we later see a
+        // ToolResult we can ask "was the parent call AskUserQuestion?"
+        // — that's the one tool whose result IS the user's reply
+        // and so deserves to render as a user bubble in the chat tab.
+        let mut tool_use_names: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
         for m in messages {
             let role = match m.role {
                 Role::User => "user",
@@ -283,11 +338,12 @@ impl DisplayMessage {
             // for this canonical message; ToolUse blocks emit their own
             // `tool` entries (so they render the same compact ▸/✓
             // indicator as live AgentEvent::ToolCallStart in ChatView);
-            // ToolResult is dropped entirely — the chat tab is for the
-            // user↔assistant exchange, raw tool output lives on the
-            // Terminal tab.
+            // most ToolResults are dropped (raw tool output lives on
+            // the Terminal tab) — except AskUserQuestion's, which IS
+            // the user's typed reply and renders as a user bubble.
             let mut text_parts: Vec<String> = Vec::new();
             let mut deferred_tools: Vec<DisplayMessage> = Vec::new();
+            let mut deferred_user_replies: Vec<DisplayMessage> = Vec::new();
             for b in &m.content {
                 match b {
                     ContentBlock::Text { text } => text_parts.push(text.clone()),
@@ -296,14 +352,38 @@ impl DisplayMessage {
                     // dedicated "show thinking" toggle, surface this
                     // there instead of the main bubble.
                     ContentBlock::Thinking { .. } => {}
-                    ContentBlock::ToolUse { name, .. } => {
+                    ContentBlock::ToolUse { id, name, .. } => {
+                        tool_use_names.insert(id.clone(), name.clone());
                         deferred_tools.push(DisplayMessage {
                             role: "tool".into(),
                             content: name.clone(),
                         });
                     }
-                    // Tool results don't surface on history restore.
-                    ContentBlock::ToolResult { .. } => {}
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } => {
+                        // AskUserQuestion's result IS what the user
+                        // typed — surface it so chat history shows
+                        // both the question and the answer rather
+                        // than a question with an invisible reply.
+                        // Other tools' raw output stays on Terminal.
+                        if tool_use_names
+                            .get(tool_use_id)
+                            .map(|n| n == "AskUserQuestion")
+                            .unwrap_or(false)
+                        {
+                            let reply = content.to_text();
+                            let trimmed = reply.trim();
+                            if !trimmed.is_empty() {
+                                deferred_user_replies.push(DisplayMessage {
+                                    role: "user".into(),
+                                    content: trimmed.to_string(),
+                                });
+                            }
+                        }
+                    }
                     // Inline image attached by the user (paste /
                     // drag-drop). Render as a brief placeholder in
                     // the chat-list digest; the actual pixels stay
@@ -315,6 +395,9 @@ impl DisplayMessage {
             // Emit text bubble first (if any), then any tool indicators
             // — preserves the live-mode ordering where the assistant's
             // narration appears before the tool calls it triggered.
+            // AskUserQuestion replies render LAST within their parent
+            // user message so the prior assistant question reads
+            // before the answer in the chat list.
             let text = text_parts.join("\n");
             if !text.is_empty() {
                 out.push(DisplayMessage {
@@ -323,6 +406,7 @@ impl DisplayMessage {
                 });
             }
             out.extend(deferred_tools);
+            out.extend(deferred_user_replies);
         }
         out
     }
@@ -412,6 +496,17 @@ pub struct WorkerState {
     /// loop budget on pure thinking. Init `true` so the very first
     /// /loop /goal continue isn't pre-suppressed.
     pub last_turn_made_tool_calls: bool,
+    /// AgentFactory used to spawn subagents (`Task` tool) and side-
+    /// channel agents (`/agent` slash command). Built once at worker
+    /// init and cloned per spawn — reusing the factory means side
+    /// channels inherit the same provider, base tools, system prompt,
+    /// and approver as the main agent.
+    pub agent_factory: std::sync::Arc<dyn crate::subagent::AgentFactory>,
+    /// Loaded agent definitions (`.thclaws/agents/*.md` + plugin agent
+    /// dirs). Side-channel `/agent` validates names against this list
+    /// before spawning; the factory uses it to register a Task tool
+    /// for the spawned child.
+    pub agent_defs: crate::agent_defs::AgentDefsConfig,
 }
 
 /// M6.29: handle to a running `/loop` task.
@@ -597,6 +692,23 @@ fn append_skills_section(system: &mut String, store: &crate::skills::SkillStore,
                 system.push('\n');
             }
         }
+    }
+}
+
+/// True when two paths refer to the same on-disk directory. Prefers
+/// `canonicalize` so symlinks / `..` segments / trailing slashes
+/// don't cause spurious "different" verdicts. Falls back to literal
+/// equality only when canonicalization fails (e.g. path doesn't
+/// exist) — in which case the strict comparison is the safer guess.
+///
+/// Used by the `ChangeCwd` worker arm to short-circuit the no-op
+/// path the StartupModal "Start" button takes on every launch (and
+/// to keep that "Start" button cheap for any user who confirms an
+/// unchanged cwd).
+fn paths_equivalent(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => a == b,
     }
 }
 
@@ -907,9 +1019,9 @@ async fn run_worker(
     } else {
         crate::permissions::PermissionMode::Ask
     };
-    {
-        let plugin_agent_dirs = crate::plugins::plugin_agent_dirs();
-        let agent_defs = crate::agent_defs::AgentDefsConfig::load_with_extra(&plugin_agent_dirs);
+    let plugin_agent_dirs = crate::plugins::plugin_agent_dirs();
+    let agent_defs_state = crate::agent_defs::AgentDefsConfig::load_with_extra(&plugin_agent_dirs);
+    let factory_state: Arc<dyn crate::subagent::AgentFactory> = {
         let base_tools = tools.clone();
         let factory = Arc::new(crate::subagent::ProductionAgentFactory {
             provider: provider.clone(),
@@ -918,7 +1030,7 @@ async fn run_worker(
             system: system.clone(),
             max_iterations: config.max_iterations,
             max_depth: crate::subagent::DEFAULT_MAX_DEPTH,
-            agent_defs: agent_defs.clone(),
+            agent_defs: agent_defs_state.clone(),
             approver: approver.clone(),
             permission_mode: perm_mode,
             cancel: Some(cancel.clone()),
@@ -927,11 +1039,12 @@ async fn run_worker(
             hooks: Some(hooks_arc.clone()),
         });
         tools.register(std::sync::Arc::new(
-            crate::subagent::SubAgentTool::new(factory)
+            crate::subagent::SubAgentTool::new(factory.clone())
                 .with_depth(0)
-                .with_agent_defs(agent_defs),
+                .with_agent_defs(agent_defs_state.clone()),
         ));
-    }
+        factory
+    };
     let mut agent = Agent::new(provider, tools.clone(), &config.model, &system)
         .with_approver(approver.clone())
         .with_cancel(cancel.clone())
@@ -1021,6 +1134,8 @@ async fn run_worker(
         // happens before any turn has run, so the suppression check
         // would otherwise gate the loop forever on iteration 0.
         last_turn_made_tool_calls: true,
+        agent_factory: factory_state,
+        agent_defs: agent_defs_state,
     };
 
     // M6.35 HOOK2: fire session_start hook now that WorkerState is
@@ -1330,6 +1445,7 @@ async fn run_worker(
                                 summary: Some(format!(
                                     "MCP-App widget requested `{qualified_name}`. Allow?"
                                 )),
+                                originator: crate::permissions::AgentOrigin::Main,
                             };
                             matches!(
                                 state.approver.approve(&req).await,
@@ -1492,6 +1608,16 @@ async fn run_worker(
                 }
             }
             ShellInput::ChangeCwd(new_cwd) => {
+                // No-op short-circuit: the StartupModal's "Start"
+                // button sends `set_cwd` even when the path is
+                // unchanged, which used to trigger the full session-
+                // reset flow below — minting a fresh session and
+                // dropping a 248-byte header-only ghost on disk
+                // every launch. When the canonical path matches the
+                // worker's current cwd, there's nothing to do.
+                if paths_equivalent(&new_cwd, &state.cwd) {
+                    continue;
+                }
                 // Process cwd + sandbox were already updated by the GUI
                 // dispatcher before sending this. Here we refresh the
                 // worker's view: save the OLD session, then mint a
@@ -2890,5 +3016,161 @@ mod tests {
         // Should look like the full-strategy output.
         assert!(out.contains("**pdf**"));
         assert!(out.contains("Render PDFs"));
+    }
+
+    /// AskUserQuestion's tool_result IS what the user typed back —
+    /// chat history must surface it as a user bubble so the answer
+    /// stays paired with the question across reloads / forks /
+    /// /clear-then-/load. Other tools' results stay hidden.
+    #[test]
+    fn display_messages_surface_ask_user_replies() {
+        use crate::types::{ContentBlock, Role};
+        let messages = vec![
+            // Initial user prompt.
+            crate::types::Message {
+                role: Role::User,
+                content: vec![ContentBlock::text("search for ai news and summarize")],
+            },
+            // Assistant calls Bash (raw tool output stays hidden) and
+            // then AskUserQuestion (its result becomes a user bubble).
+            crate::types::Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::ToolUse {
+                        id: "call_bash_1".into(),
+                        name: "Bash".into(),
+                        input: serde_json::json!({}),
+                        thought_signature: None,
+                    },
+                    ContentBlock::ToolUse {
+                        id: "call_ask_1".into(),
+                        name: "AskUserQuestion".into(),
+                        input: serde_json::json!({"question": "Reuters or HN?"}),
+                        thought_signature: None,
+                    },
+                ],
+            },
+            // Tool results — Bash's gets dropped, AskUser's becomes
+            // a user bubble.
+            crate::types::Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "call_bash_1".into(),
+                        content: "raw bash stdout 12345".to_string().into(),
+                        is_error: false,
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: "call_ask_1".into(),
+                        content: "Try Hacker News".to_string().into(),
+                        is_error: false,
+                    },
+                ],
+            },
+        ];
+
+        let display = DisplayMessage::from_messages(&messages);
+        // Expect: initial user prompt, then 2 tool indicators (Bash,
+        // AskUserQuestion), then the AskUser reply as a user bubble.
+        // The Bash tool_result content stays hidden.
+        let kinds_and_content: Vec<(&str, &str)> = display
+            .iter()
+            .map(|d| (d.role.as_str(), d.content.as_str()))
+            .collect();
+        assert_eq!(
+            kinds_and_content,
+            vec![
+                ("user", "search for ai news and summarize"),
+                ("tool", "Bash"),
+                ("tool", "AskUserQuestion"),
+                ("user", "Try Hacker News"),
+            ],
+            "AskUser reply should surface; bash output should not"
+        );
+    }
+
+    /// Tool results without a known parent tool_use are silently
+    /// dropped (defensive: a malformed history shouldn't crash or
+    /// leak random tool output as user bubbles).
+    #[test]
+    fn display_messages_drops_orphan_tool_results() {
+        use crate::types::{ContentBlock, Role};
+        let messages = vec![crate::types::Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "no_matching_tool_use".into(),
+                content: "orphaned content".to_string().into(),
+                is_error: false,
+            }],
+        }];
+        let display = DisplayMessage::from_messages(&messages);
+        assert!(display.is_empty(), "orphan tool_result must not render");
+    }
+
+    #[test]
+    fn paths_equivalent_identical() {
+        let p = std::env::temp_dir();
+        assert!(paths_equivalent(&p, &p));
+    }
+
+    #[test]
+    fn paths_equivalent_different_dirs_not_equal() {
+        let a = std::env::temp_dir();
+        let b = std::path::PathBuf::from("/");
+        assert!(!paths_equivalent(&a, &b));
+    }
+
+    #[test]
+    fn paths_equivalent_handles_trailing_slash() {
+        // Two PathBufs that point at the same dir but have different
+        // string forms (with and without trailing slash) should
+        // compare equal via canonicalize.
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().to_path_buf();
+        let b: std::path::PathBuf = format!("{}/", a.to_string_lossy()).into();
+        assert!(paths_equivalent(&a, &b));
+    }
+
+    #[test]
+    fn paths_equivalent_falls_back_to_strict_equality_on_missing() {
+        // Non-existent paths can't canonicalize; helper falls back
+        // to literal comparison so we don't panic.
+        let a = std::path::PathBuf::from("/nope/does/not/exist/aaa");
+        let b = std::path::PathBuf::from("/nope/does/not/exist/aaa");
+        assert!(paths_equivalent(&a, &b));
+        let c = std::path::PathBuf::from("/nope/does/not/exist/bbb");
+        assert!(!paths_equivalent(&a, &c));
+    }
+
+    /// Empty AskUser replies (user submitted blank) shouldn't render
+    /// a stray empty user bubble.
+    #[test]
+    fn display_messages_skips_empty_ask_user_replies() {
+        use crate::types::{ContentBlock, Role};
+        let messages = vec![
+            crate::types::Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "call_ask".into(),
+                    name: "AskUserQuestion".into(),
+                    input: serde_json::json!({"question": "?"}),
+                    thought_signature: None,
+                }],
+            },
+            crate::types::Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_ask".into(),
+                    content: "   \n  ".to_string().into(),
+                    is_error: false,
+                }],
+            },
+        ];
+        let display = DisplayMessage::from_messages(&messages);
+        // Should have just the AskUserQuestion tool indicator, no
+        // user bubble for the whitespace-only reply.
+        assert_eq!(display.len(), 1);
+        assert_eq!(display[0].role, "tool");
+        assert_eq!(display[0].content, "AskUserQuestion");
     }
 }

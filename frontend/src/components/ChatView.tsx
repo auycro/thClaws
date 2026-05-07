@@ -14,6 +14,18 @@ import {
 } from "./SlashCommandPopup";
 import { McpAppIframe } from "./McpAppIframe";
 
+/// Format a wall-clock duration for human display in a side-channel
+/// status header. Sub-second readings show 0.X s; minutes get the
+/// `Xm Ys` form so a 5-minute background agent reads cleanly.
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  const totalSec = ms / 1000;
+  if (totalSec < 60) return `${totalSec.toFixed(1)}s`;
+  const m = Math.floor(totalSec / 60);
+  const s = Math.round(totalSec % 60);
+  return `${m}m ${s}s`;
+}
+
 type ChatMessage = {
   role: "user" | "assistant" | "tool" | "system";
   content: string;
@@ -46,6 +58,25 @@ type ChatMessage = {
     uri: string;
     html: string;
     mime?: string;
+  };
+  /// Side-channel agent state, set when this message represents a
+  /// `/agent` spawn (one bubble per spawn, updated in place as
+  /// the side channel streams events). When present, `role` is
+  /// "system" and the bubble renders with a status header instead
+  /// of the standard text body.
+  sideChannel?: {
+    id: string;
+    agentName: string;
+    status: "running" | "done" | "error";
+    /// Accumulated stream output (text deltas) while running, or
+    /// final result text after `chat_side_channel_done`.
+    result: string;
+    /// Set on `chat_side_channel_done` — wall-clock duration ms.
+    durationMs?: number;
+    /// Set on `chat_side_channel_error`.
+    error?: string;
+    /// Initial timestamp for "elapsed" display while running.
+    startedAt: number;
   };
 };
 
@@ -421,6 +452,113 @@ export function ChatView({ active, modalOpen }: Props) {
             setAskPrompt(null);
           }
           break;
+        // ─── Side-channel agent lifecycle (/agent slash command) ──
+        case "chat_side_channel_start": {
+          const id = String(msg.id ?? "");
+          const agentName = String(msg.agent_name ?? "");
+          if (!id) break;
+          // One bubble per side-channel spawn — pushed at the
+          // current bottom of the chat, then updated in place via
+          // the delta / done / error events below.
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "system",
+              content: "",
+              sideChannel: {
+                id,
+                agentName,
+                status: "running",
+                result: "",
+                startedAt: Date.now(),
+              },
+            },
+          ]);
+          break;
+        }
+        case "chat_side_channel_text_delta": {
+          const id = String(msg.id ?? "");
+          const text = String(msg.text ?? "");
+          if (!id) break;
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.sideChannel?.id === id
+                ? {
+                    ...m,
+                    sideChannel: {
+                      ...m.sideChannel,
+                      result: m.sideChannel.result + text,
+                    },
+                  }
+                : m,
+            ),
+          );
+          break;
+        }
+        case "chat_side_channel_tool_call": {
+          // Surface as a small tag inside the running bubble. Keeps
+          // the user aware that the agent is doing work even when
+          // it's not emitting text.
+          const id = String(msg.id ?? "");
+          const toolName = String(msg.tool_name ?? "");
+          if (!id) break;
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.sideChannel?.id === id
+                ? {
+                    ...m,
+                    sideChannel: {
+                      ...m.sideChannel,
+                      result: `${m.sideChannel.result}\n[tool: ${toolName}]`,
+                    },
+                  }
+                : m,
+            ),
+          );
+          break;
+        }
+        case "chat_side_channel_done": {
+          const id = String(msg.id ?? "");
+          if (!id) break;
+          const durationMs = Number(msg.duration_ms ?? 0);
+          const result = String(msg.result_text ?? "");
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.sideChannel?.id === id
+                ? {
+                    ...m,
+                    sideChannel: {
+                      ...m.sideChannel,
+                      status: "done",
+                      durationMs,
+                      result,
+                    },
+                  }
+                : m,
+            ),
+          );
+          break;
+        }
+        case "chat_side_channel_error": {
+          const id = String(msg.id ?? "");
+          const error = String(msg.error ?? "unknown error");
+          if (!id) break;
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.sideChannel?.id === id
+                ? {
+                    ...m,
+                    sideChannel: {
+                      ...m.sideChannel,
+                      status: "error",
+                      error,
+                    },
+                  }
+                : m,
+            ),
+          );
+          break;
+        }
       }
     });
     // Ask the backend for the slash command catalogue once on mount.
@@ -661,6 +799,57 @@ export function ChatView({ active, modalOpen }: Props) {
           </div>
         )}
         {messages.map((msg, i) => {
+          // Side-channel agent bubble — rendered first because
+          // these are role:"system" but with a custom layout that
+          // diverges from the standard system bubble below.
+          if (msg.sideChannel) {
+            const sc = msg.sideChannel;
+            const accent =
+              sc.status === "running"
+                ? "#d97706"
+                : sc.status === "done"
+                  ? "var(--accent-success, #16a34a)"
+                  : "var(--accent-error, #dc2626)";
+            const statusLine =
+              sc.status === "running"
+                ? `▸ running…`
+                : sc.status === "done"
+                  ? `✓ done in ${formatDuration(sc.durationMs ?? 0)}`
+                  : `✗ ${sc.error ?? "error"}`;
+            return (
+              <div key={i} className="flex justify-start pt-2">
+                <div
+                  className="rounded-md border px-3 py-2 max-w-[80%] text-sm"
+                  style={{
+                    background: "var(--bg-secondary)",
+                    borderLeft: `3px solid ${accent}`,
+                    borderColor: "var(--border)",
+                    color: "var(--text-primary)",
+                  }}
+                >
+                  <div
+                    className="flex items-center gap-2 text-xs font-mono mb-1"
+                    style={{ color: "var(--text-secondary)" }}
+                  >
+                    <span style={{ color: accent }}>●</span>
+                    <span>agent: {sc.agentName}</span>
+                    <span className="text-[10px]">({sc.id})</span>
+                    <span className="ml-auto" style={{ color: accent }}>
+                      {statusLine}
+                    </span>
+                  </div>
+                  {sc.result && (
+                    <pre
+                      className="text-xs whitespace-pre-wrap break-words font-mono opacity-90"
+                      style={{ color: "var(--text-primary)" }}
+                    >
+                      {sc.result}
+                    </pre>
+                  )}
+                </div>
+              </div>
+            );
+          }
           // Tool calls render as a thin one-line indicator (▸ running,
           // ✓ done) rather than a full bubble — the chat tab is for
           // the user↔assistant conversation; raw tool output lives on
@@ -793,10 +982,18 @@ export function ChatView({ active, modalOpen }: Props) {
           const isAssistant = msg.role === "assistant";
           const isSystem = msg.role === "system";
           const copied = copiedMessageIndex === i;
+          // Restored chat histories can be a wall of tool indicators
+          // between user turns; an extra blank line before each user
+          // message makes turn boundaries scannable. We apply it only
+          // when the previous message was something other than a
+          // user bubble — back-to-back user inputs (rare, but
+          // possible) keep the standard `space-y-3` spacing.
+          const needsTurnGap =
+            msg.role === "user" && i > 0 && messages[i - 1]?.role !== "user";
           return (
             <div
               key={i}
-              className={`flex ${msg.role === "user" ? "justify-end" : isSystem ? "justify-center" : "justify-start"}`}
+              className={`flex ${msg.role === "user" ? "justify-end" : isSystem ? "justify-center" : "justify-start"}${needsTurnGap ? " pt-4" : ""}`}
             >
               <div
                 className={`group relative max-w-[80%] rounded-lg py-2 pl-3 pr-9 text-sm ${isAssistant ? "" : "whitespace-pre-wrap"}`}

@@ -391,6 +391,49 @@ pub enum SlashCommand {
         name: String,
         title: String,
     },
+    /// `/schedule` — list schedules (same as `/schedule list`).
+    Schedule,
+    /// `/schedule show <id>` — pretty-print one schedule's record.
+    ScheduleShow(String),
+    /// `/schedule run <id>` — fire one schedule synchronously.
+    ScheduleRun(String),
+    /// `/schedule status` — daemon health + recent fires summary.
+    ScheduleStatus,
+    /// `/schedule pause <id>` — flip `enabled` to false.
+    SchedulePause(String),
+    /// `/schedule resume <id>` — flip `enabled` to true.
+    ScheduleResume(String),
+    /// `/schedule rm <id>` — remove a schedule from the store.
+    ScheduleRm(String),
+    /// `/schedule add` — open the schedule-add modal in GUI surfaces;
+    /// in the CLI REPL, print a help blurb pointing at the
+    /// `thclaws schedule add` shell subcommand (multi-line prompt +
+    /// many flags don't fit a REPL line cleanly, so we don't try
+    /// to parse the form inline).
+    ScheduleAdd,
+    /// `/schedule install` — install the scheduler daemon (launchd
+    /// plist on macOS, systemd-user unit on Linux). Same effect as
+    /// `thclaws schedule install` from the shell.
+    ScheduleInstall,
+    /// `/schedule uninstall` — stop and remove the daemon's
+    /// supervisor entry.
+    ScheduleUninstall,
+    /// `/agent <name> <prompt>` — spawn a user-driven side-channel
+    /// agent that runs concurrently with main. Result lands as a
+    /// chat-side bubble (GUI) or a one-line ANSI marker (CLI) when
+    /// done; doesn't touch main agent's history. Independent cancel —
+    /// main's Cmd-C does NOT kill it. See `crate::side_channel`.
+    Agent {
+        name: String,
+        prompt: String,
+    },
+    /// `/agents` — list active side-channel agents with id, name,
+    /// elapsed time. Both surfaces render the same compact table.
+    AgentsList,
+    /// `/agent cancel <id>` — fire the cancel token of the named
+    /// side channel. The agent's `cancelled().await` wakes and the
+    /// spawn task emits `SideChannelError { error: "cancelled" }`.
+    AgentCancel(String),
     Unknown(String),
 }
 
@@ -504,6 +547,64 @@ fn parse_plugin_subcommand(cmd: &str, args: &str) -> SlashCommand {
         },
         other => SlashCommand::Unknown(format!(
             "unknown plugin subcommand: '{other}' (try: /plugin, /plugin install, /plugin remove, /plugin enable, /plugin disable, /plugin show, /plugin gc, /plugin marketplace, /plugin search, /plugin info)"
+        )),
+    }
+}
+
+/// Parse `/schedule [list|show|run|status|pause|resume|rm ...]`.
+///
+/// Bare `/schedule` lists. `add` is intentionally not supported as a
+/// slash command — multi-line prompt + cron + flags doesn't fit a
+/// REPL line cleanly; users go to `thclaws schedule add` for that.
+fn parse_schedule_subcommand(args: &str) -> SlashCommand {
+    let args = args.trim();
+    if args.is_empty() || args == "list" || args == "ls" {
+        return SlashCommand::Schedule;
+    }
+    let (sub, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+    let rest = rest.trim();
+    match sub {
+        "show" => {
+            if rest.is_empty() {
+                SlashCommand::Unknown("usage: /schedule show <id>".into())
+            } else {
+                SlashCommand::ScheduleShow(rest.to_string())
+            }
+        }
+        "run" => {
+            if rest.is_empty() {
+                SlashCommand::Unknown("usage: /schedule run <id>".into())
+            } else {
+                SlashCommand::ScheduleRun(rest.to_string())
+            }
+        }
+        "status" => SlashCommand::ScheduleStatus,
+        "pause" => {
+            if rest.is_empty() {
+                SlashCommand::Unknown("usage: /schedule pause <id>".into())
+            } else {
+                SlashCommand::SchedulePause(rest.to_string())
+            }
+        }
+        "resume" => {
+            if rest.is_empty() {
+                SlashCommand::Unknown("usage: /schedule resume <id>".into())
+            } else {
+                SlashCommand::ScheduleResume(rest.to_string())
+            }
+        }
+        "rm" | "remove" | "delete" => {
+            if rest.is_empty() {
+                SlashCommand::Unknown("usage: /schedule rm <id>".into())
+            } else {
+                SlashCommand::ScheduleRm(rest.to_string())
+            }
+        }
+        "install" => SlashCommand::ScheduleInstall,
+        "uninstall" => SlashCommand::ScheduleUninstall,
+        "add" | "new" | "create" => SlashCommand::ScheduleAdd,
+        other => SlashCommand::Unknown(format!(
+            "unknown schedule subcommand: '{other}' (try: /schedule, /schedule add, /schedule show, /schedule run, /schedule status, /schedule pause, /schedule resume, /schedule rm, /schedule install, /schedule uninstall)"
         )),
     }
 }
@@ -840,8 +941,47 @@ pub fn parse_slash(input: &str) -> Option<SlashCommand> {
         "kms" => parse_kms_subcommand(args),
         "loop" => parse_loop_subcommand(args),
         "goal" => parse_goal_subcommand(args),
+        "schedule" | "sched" => parse_schedule_subcommand(args),
+        "agent" => parse_agent_subcommand(args),
+        "agents" => SlashCommand::AgentsList,
         _ => SlashCommand::Unknown(cmd.to_string()),
     })
+}
+
+/// Parse `/agent <name> <prompt>` and `/agent cancel <id>`. Bare
+/// `/agent` returns Unknown with a usage hint. Empty name (only
+/// whitespace after the slash) → Unknown.
+fn parse_agent_subcommand(args: &str) -> SlashCommand {
+    let args = args.trim();
+    if args.is_empty() {
+        return SlashCommand::Unknown(
+            "usage: /agent <name> <prompt>   (or /agent cancel <id>)".into(),
+        );
+    }
+    // Recognize `cancel <id>` first — `cancel` would otherwise be
+    // treated as an agent name.
+    if let Some(rest) = args.strip_prefix("cancel") {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return SlashCommand::Unknown(
+                "usage: /agent cancel <id>   (try /agents to see active ids)".into(),
+            );
+        }
+        return SlashCommand::AgentCancel(rest.to_string());
+    }
+    let (name, prompt) = match args.split_once(char::is_whitespace) {
+        Some((n, p)) => (n.trim(), p.trim()),
+        None => (args, ""),
+    };
+    if prompt.is_empty() {
+        return SlashCommand::Unknown(format!(
+            "usage: /agent {name} <prompt>   (prompt cannot be empty)"
+        ));
+    }
+    SlashCommand::Agent {
+        name: name.to_string(),
+        prompt: prompt.to_string(),
+    }
 }
 
 /// M6.27: detect the `# <name>:<body>` memory shortcut.
@@ -1833,6 +1973,18 @@ pub fn built_in_commands() -> &'static [BuiltInCommand] {
     ]
 }
 
+/// Helper for `/schedule pause` and `/schedule resume` — flips the
+/// `enabled` flag on a single schedule and persists. Errors on
+/// missing id, store load failure, or save failure.
+fn toggle_schedule_enabled(id: &str, enabled: bool) -> crate::error::Result<()> {
+    let mut store = crate::schedule::ScheduleStore::load()?;
+    let entry = store
+        .get_mut(id)
+        .ok_or_else(|| crate::error::Error::Config(format!("no schedule with id '{id}'")))?;
+    entry.enabled = enabled;
+    store.save()
+}
+
 pub fn render_help() -> &'static str {
     "Shell escape:\n  \
      !<command>        Run <command> in a subshell — sandbox-restricted to \n  \
@@ -1898,7 +2050,23 @@ pub fn render_help() -> &'static str {
      /kms ingest KMS FILE [as ALIAS] [--force]\n  \
      \x20                 Copy a working-dir file into KMS/pages/ and\n  \
      \x20                 add it to the index. Allowed: .md .markdown\n  \
-     \x20                 .txt .rst .log .json\n\n  \
+     \x20                 .txt .rst .log .json\n  \
+     /schedule         List scheduled jobs (use `thclaws schedule add` from\n  \
+     \x20                 the shell to create one — multi-line prompts don't\n  \
+     \x20                 fit a REPL line)\n  \
+     /schedule show ID    Print one schedule as JSON\n  \
+     /schedule run ID     Fire a schedule once, synchronously\n  \
+     /schedule status     Daemon status + recent fires\n  \
+     /schedule pause ID   Disable without removing\n  \
+     /schedule resume ID  Re-enable a paused schedule\n  \
+     /schedule rm ID      Remove a schedule from the store\n  \
+     /schedule install    Install scheduler daemon (launchd / systemd-user)\n  \
+     /schedule uninstall  Stop daemon + remove supervisor entry\n  \
+     /agent NAME PROMPT   Spawn background subagent (GUI-only).\n  \
+     \x20                   Runs concurrently with main, doesn't touch\n  \
+     \x20                   main's history. Result lands as a side bubble.\n  \
+     /agents              List active background agents (id, name, elapsed)\n  \
+     /agent cancel ID     Cancel a running background agent by id\n\n  \
      ! <command>       Run a shell command directly (e.g. ! git status)"
 }
 
@@ -6004,6 +6172,318 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         println!("{COLOR_DIM}loop auto-stopped{COLOR_RESET}");
                     }
                 }
+                SlashCommand::Schedule => match crate::schedule::ScheduleStore::load() {
+                    Ok(store) if store.schedules.is_empty() => {
+                        println!(
+                            "{COLOR_DIM}no schedules — add one with: \
+                             thclaws schedule add <id> --cron \"...\" --prompt \"...\"{COLOR_RESET}"
+                        );
+                    }
+                    Ok(store) => {
+                        for s in &store.schedules {
+                            let status = if s.enabled { "on " } else { "off" };
+                            let watch = if s.watch_workspace { "+watch" } else { "      " };
+                            let last = s.last_run.as_deref().unwrap_or("never");
+                            let exit = match s.last_exit {
+                                Some(0) => "ok ",
+                                Some(_) => "err",
+                                None => "—  ",
+                            };
+                            println!(
+                                "{COLOR_DIM}{status} {exit} {watch}  {:24}  {:20}  {}{COLOR_RESET}",
+                                s.id, s.cron, last,
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        println!("{COLOR_YELLOW}/schedule: {e}{COLOR_RESET}");
+                    }
+                },
+                SlashCommand::ScheduleShow(id) => match crate::schedule::ScheduleStore::load() {
+                    Ok(store) => match store.get(&id) {
+                        Some(s) => match serde_json::to_string_pretty(s) {
+                            Ok(json) => println!("{json}"),
+                            Err(e) => {
+                                println!("{COLOR_YELLOW}/schedule show: serialize: {e}{COLOR_RESET}")
+                            }
+                        },
+                        None => {
+                            println!(
+                                "{COLOR_YELLOW}/schedule show: no schedule with id '{id}'{COLOR_RESET}"
+                            )
+                        }
+                    },
+                    Err(e) => {
+                        println!("{COLOR_YELLOW}/schedule show: {e}{COLOR_RESET}");
+                    }
+                },
+                SlashCommand::ScheduleRun(id) => {
+                    // Fire on the blocking pool so the REPL stays
+                    // responsive to Ctrl-C while the child runs. The
+                    // run can be long (multi-minute), and blocking
+                    // the readline thread would freeze input.
+                    let binary = match std::env::current_exe() {
+                        Ok(p) => p,
+                        Err(e) => {
+                            println!(
+                                "{COLOR_YELLOW}/schedule run: cannot resolve current_exe: {e}{COLOR_RESET}"
+                            );
+                            continue;
+                        }
+                    };
+                    let id_for_print = id.clone();
+                    println!("{COLOR_DIM}/schedule run '{id_for_print}': firing…{COLOR_RESET}");
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::schedule::run_once(&id, &binary)
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(outcome)) => {
+                            let exit = outcome
+                                .exit_code
+                                .map(|c| c.to_string())
+                                .unwrap_or_else(|| "(timeout)".into());
+                            println!(
+                                "{COLOR_DIM}/schedule run '{id_for_print}': exit={exit} \
+                                 duration={}.{:03}s log={}{COLOR_RESET}",
+                                outcome.duration.as_secs(),
+                                outcome.duration.subsec_millis(),
+                                outcome.log_path.display(),
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            println!(
+                                "{COLOR_YELLOW}/schedule run '{id_for_print}': {e}{COLOR_RESET}"
+                            );
+                        }
+                        Err(e) => {
+                            println!(
+                                "{COLOR_YELLOW}/schedule run '{id_for_print}': join error: {e}{COLOR_RESET}"
+                            );
+                        }
+                    }
+                }
+                SlashCommand::ScheduleStatus => {
+                    let status = crate::schedule::daemon_status();
+                    match status {
+                        crate::schedule::DaemonStatus::Running(pid) => {
+                            println!("{COLOR_DIM}daemon: running (pid {pid}){COLOR_RESET}");
+                        }
+                        crate::schedule::DaemonStatus::Stale(pid) => {
+                            println!(
+                                "{COLOR_YELLOW}daemon: stale PID file (last pid {pid} not alive){COLOR_RESET}"
+                            );
+                        }
+                        crate::schedule::DaemonStatus::NotRunning => {
+                            println!(
+                                "{COLOR_DIM}daemon: not running (`thclaws schedule install` to enable){COLOR_RESET}"
+                            );
+                        }
+                    }
+                    if let Ok(store) = crate::schedule::ScheduleStore::load() {
+                        if !store.schedules.is_empty() {
+                            println!("{COLOR_DIM}recent fires:{COLOR_RESET}");
+                            for s in &store.schedules {
+                                let last = s.last_run.as_deref().unwrap_or("never");
+                                let exit = match s.last_exit {
+                                    Some(0) => "ok ",
+                                    Some(_) => "err",
+                                    None => "—  ",
+                                };
+                                println!(
+                                    "{COLOR_DIM}  {exit}  {:24}  {}{COLOR_RESET}",
+                                    s.id, last
+                                );
+                            }
+                        }
+                    }
+                }
+                SlashCommand::SchedulePause(id) => {
+                    if let Err(e) = toggle_schedule_enabled(&id, false) {
+                        println!("{COLOR_YELLOW}/schedule pause '{id}': {e}{COLOR_RESET}");
+                    } else {
+                        println!("{COLOR_DIM}/schedule pause '{id}': paused{COLOR_RESET}");
+                    }
+                }
+                SlashCommand::ScheduleResume(id) => {
+                    if let Err(e) = toggle_schedule_enabled(&id, true) {
+                        println!("{COLOR_YELLOW}/schedule resume '{id}': {e}{COLOR_RESET}");
+                    } else {
+                        println!("{COLOR_DIM}/schedule resume '{id}': resumed{COLOR_RESET}");
+                    }
+                }
+                SlashCommand::ScheduleAdd => {
+                    // CLI: print a help blurb. The GUI Chat tab opens
+                    // a real modal via shell_dispatch.rs's handler;
+                    // this REPL path is for terminal users who'd be
+                    // typing the shell subcommand anyway.
+                    println!(
+                        "{COLOR_DIM}/schedule add isn't editable in the terminal — \
+                         use the shell subcommand:{COLOR_RESET}"
+                    );
+                    println!(
+                        "{COLOR_DIM}  $ thclaws schedule add <id> --cron \"30 8 * * MON-FRI\" \\\
+                         {COLOR_RESET}"
+                    );
+                    println!(
+                        "{COLOR_DIM}      --cwd ~/projects/foo \\\
+                         {COLOR_RESET}"
+                    );
+                    println!(
+                        "{COLOR_DIM}      --prompt \"summarize commits to /tmp/brief.md\" \\\
+                         {COLOR_RESET}"
+                    );
+                    println!(
+                        "{COLOR_DIM}      [--model gpt-4o] [--max-iterations 30] \
+                         [--timeout 600] [--disabled]{COLOR_RESET}"
+                    );
+                    println!(
+                        "{COLOR_DIM}cron is standard 5-field POSIX (`* * * * *`); \
+                         see Chapter 19 of the user manual for examples.{COLOR_RESET}"
+                    );
+                }
+                SlashCommand::ScheduleRm(id) => match crate::schedule::ScheduleStore::load() {
+                    Ok(mut store) => {
+                        if !store.remove(&id) {
+                            println!(
+                                "{COLOR_YELLOW}/schedule rm '{id}': no such schedule{COLOR_RESET}"
+                            );
+                        } else if let Err(e) = store.save() {
+                            println!("{COLOR_YELLOW}/schedule rm '{id}': save: {e}{COLOR_RESET}");
+                        } else {
+                            println!("{COLOR_DIM}/schedule rm '{id}': removed{COLOR_RESET}");
+                        }
+                    }
+                    Err(e) => {
+                        println!("{COLOR_YELLOW}/schedule rm '{id}': {e}{COLOR_RESET}");
+                    }
+                },
+                SlashCommand::ScheduleInstall => {
+                    // Spawn on the blocking pool: install_daemon shells
+                    // out to `launchctl bootstrap` (macOS) which can
+                    // take a beat. Keeps the REPL responsive.
+                    let result =
+                        tokio::task::spawn_blocking(crate::schedule::install_daemon).await;
+                    match result {
+                        Ok(Ok(report)) => {
+                            println!(
+                                "{COLOR_DIM}/schedule install: wrote {}{COLOR_RESET}",
+                                report.supervisor_path.display()
+                            );
+                            if report.next_steps.is_empty() {
+                                println!(
+                                    "{COLOR_DIM}/schedule install: daemon bootstrapped — try /schedule status{COLOR_RESET}"
+                                );
+                            } else {
+                                println!("{COLOR_DIM}/schedule install: next steps:{COLOR_RESET}");
+                                for step in &report.next_steps {
+                                    println!("{COLOR_DIM}  $ {step}{COLOR_RESET}");
+                                }
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            println!("{COLOR_YELLOW}/schedule install: {e}{COLOR_RESET}");
+                        }
+                        Err(e) => {
+                            println!(
+                                "{COLOR_YELLOW}/schedule install: join error: {e}{COLOR_RESET}"
+                            );
+                        }
+                    }
+                }
+                SlashCommand::ScheduleUninstall => {
+                    let result =
+                        tokio::task::spawn_blocking(crate::schedule::uninstall_daemon).await;
+                    match result {
+                        Ok(Ok(path)) => {
+                            if path.exists() {
+                                println!(
+                                    "{COLOR_YELLOW}/schedule uninstall: warning — supervisor file {} still exists{COLOR_RESET}",
+                                    path.display()
+                                );
+                            } else {
+                                println!(
+                                    "{COLOR_DIM}/schedule uninstall: daemon uninstalled{COLOR_RESET}"
+                                );
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            println!("{COLOR_YELLOW}/schedule uninstall: {e}{COLOR_RESET}");
+                        }
+                        Err(e) => {
+                            println!(
+                                "{COLOR_YELLOW}/schedule uninstall: join error: {e}{COLOR_RESET}"
+                            );
+                        }
+                    }
+                }
+                SlashCommand::Agent { name, prompt } => {
+                    #[cfg(feature = "gui")]
+                    {
+                        // Side-channel spawn requires the worker's
+                        // events_tx, which exists in `--gui` and
+                        // `--serve` modes. CLI REPL has no broadcast
+                        // surface — fall through to the not-available
+                        // message even when gui feature compiles in.
+                        // For now: tell user this is GUI-only.
+                        let _ = (&name, &prompt);
+                        println!(
+                            "{COLOR_YELLOW}/agent is only available in GUI mode \
+                             (thclaws or thclaws --serve). For terminal use, \
+                             call the Task tool from the model directly.{COLOR_RESET}"
+                        );
+                    }
+                    #[cfg(not(feature = "gui"))]
+                    {
+                        let _ = (&name, &prompt);
+                        println!(
+                            "{COLOR_YELLOW}/agent is not available in thclaws-cli \
+                             (rebuild with --features gui or use thclaws --gui).{COLOR_RESET}"
+                        );
+                    }
+                }
+                SlashCommand::AgentsList => {
+                    #[cfg(feature = "gui")]
+                    {
+                        let active = crate::side_channel::list_side_channels();
+                        if active.is_empty() {
+                            println!(
+                                "{COLOR_DIM}no active background agents{COLOR_RESET}"
+                            );
+                        } else {
+                            for (id, name, elapsed) in active {
+                                println!(
+                                    "{COLOR_DIM}  {id}  {name:24}  {elapsed:.1}s elapsed{COLOR_RESET}"
+                                );
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "gui"))]
+                    {
+                        println!(
+                            "{COLOR_YELLOW}/agents not available in thclaws-cli.{COLOR_RESET}"
+                        );
+                    }
+                }
+                SlashCommand::AgentCancel(id) => {
+                    #[cfg(feature = "gui")]
+                    {
+                        if crate::side_channel::cancel_side_channel(&id) {
+                            println!("{COLOR_DIM}/agent cancel '{id}': signal sent{COLOR_RESET}");
+                        } else {
+                            println!(
+                                "{COLOR_YELLOW}/agent cancel '{id}': no such active agent (try /agents){COLOR_RESET}"
+                            );
+                        }
+                    }
+                    #[cfg(not(feature = "gui"))]
+                    {
+                        let _ = id;
+                        println!(
+                            "{COLOR_YELLOW}/agent cancel not available in thclaws-cli.{COLOR_RESET}"
+                        );
+                    }
+                }
                 SlashCommand::Unknown(what) => {
                     println!("{COLOR_YELLOW}unknown command: {what}{COLOR_RESET}");
                 }
@@ -6991,6 +7471,199 @@ mod tests {
         }
         match parse_slash("/goal start --budget-tokens 100") {
             Some(SlashCommand::Unknown(_)) => {}
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_slash_schedule_basics() {
+        // Bare /schedule and explicit list both → Schedule.
+        assert_eq!(parse_slash("/schedule"), Some(SlashCommand::Schedule));
+        assert_eq!(parse_slash("/schedule list"), Some(SlashCommand::Schedule));
+        assert_eq!(parse_slash("/schedule ls"), Some(SlashCommand::Schedule));
+        // The /sched alias.
+        assert_eq!(parse_slash("/sched"), Some(SlashCommand::Schedule));
+        assert_eq!(parse_slash("/sched list"), Some(SlashCommand::Schedule));
+    }
+
+    #[test]
+    fn parse_slash_schedule_show_run() {
+        assert_eq!(
+            parse_slash("/schedule show morning-brief"),
+            Some(SlashCommand::ScheduleShow("morning-brief".into())),
+        );
+        assert_eq!(
+            parse_slash("/schedule run morning-brief"),
+            Some(SlashCommand::ScheduleRun("morning-brief".into())),
+        );
+    }
+
+    #[test]
+    fn parse_slash_schedule_status() {
+        assert_eq!(
+            parse_slash("/schedule status"),
+            Some(SlashCommand::ScheduleStatus),
+        );
+    }
+
+    #[test]
+    fn parse_slash_schedule_pause_resume() {
+        assert_eq!(
+            parse_slash("/schedule pause foo"),
+            Some(SlashCommand::SchedulePause("foo".into())),
+        );
+        assert_eq!(
+            parse_slash("/schedule resume foo"),
+            Some(SlashCommand::ScheduleResume("foo".into())),
+        );
+    }
+
+    #[test]
+    fn parse_slash_schedule_rm_aliases() {
+        // rm / remove / delete all map to ScheduleRm.
+        assert_eq!(
+            parse_slash("/schedule rm foo"),
+            Some(SlashCommand::ScheduleRm("foo".into())),
+        );
+        assert_eq!(
+            parse_slash("/schedule remove foo"),
+            Some(SlashCommand::ScheduleRm("foo".into())),
+        );
+        assert_eq!(
+            parse_slash("/schedule delete foo"),
+            Some(SlashCommand::ScheduleRm("foo".into())),
+        );
+    }
+
+    #[test]
+    fn parse_slash_schedule_missing_id_errors() {
+        for input in [
+            "/schedule show",
+            "/schedule run",
+            "/schedule pause",
+            "/schedule resume",
+            "/schedule rm",
+        ] {
+            match parse_slash(input) {
+                Some(SlashCommand::Unknown(_)) => {}
+                other => panic!("expected Unknown for '{input}', got {other:?}"),
+            }
+        }
+    }
+
+    /// `/schedule add` returns the ScheduleAdd variant — the GUI Chat
+    /// dispatch turns it into an open-modal event; the REPL handler
+    /// prints help text. Aliases `new` / `create` map to the same.
+    #[test]
+    fn parse_slash_schedule_add_returns_variant() {
+        assert_eq!(
+            parse_slash("/schedule add"),
+            Some(SlashCommand::ScheduleAdd)
+        );
+        assert_eq!(
+            parse_slash("/schedule new"),
+            Some(SlashCommand::ScheduleAdd)
+        );
+        assert_eq!(
+            parse_slash("/schedule create"),
+            Some(SlashCommand::ScheduleAdd),
+        );
+        // Trailing junk is ignored (the modal builds its own form);
+        // /sched alias also routes here.
+        assert_eq!(
+            parse_slash("/schedule add foo --cron \"* * * * *\""),
+            Some(SlashCommand::ScheduleAdd),
+        );
+        assert_eq!(parse_slash("/sched add"), Some(SlashCommand::ScheduleAdd));
+    }
+
+    #[test]
+    fn parse_slash_schedule_unknown_subcommand_errors() {
+        match parse_slash("/schedule wat") {
+            Some(SlashCommand::Unknown(msg)) => {
+                assert!(
+                    msg.contains("unknown schedule subcommand"),
+                    "expected helpful error, got: {msg}"
+                );
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_slash_schedule_install_uninstall() {
+        assert_eq!(
+            parse_slash("/schedule install"),
+            Some(SlashCommand::ScheduleInstall),
+        );
+        assert_eq!(
+            parse_slash("/schedule uninstall"),
+            Some(SlashCommand::ScheduleUninstall),
+        );
+        // /sched alias works for these too.
+        assert_eq!(
+            parse_slash("/sched install"),
+            Some(SlashCommand::ScheduleInstall),
+        );
+    }
+
+    #[test]
+    fn parse_slash_agent_basic() {
+        assert_eq!(
+            parse_slash("/agent translator แปลไฟล์ x"),
+            Some(SlashCommand::Agent {
+                name: "translator".into(),
+                prompt: "แปลไฟล์ x".into(),
+            }),
+        );
+        assert_eq!(
+            parse_slash("/agent researcher  multi-word  prompt  here"),
+            Some(SlashCommand::Agent {
+                name: "researcher".into(),
+                prompt: "multi-word  prompt  here".into(),
+            }),
+        );
+    }
+
+    #[test]
+    fn parse_slash_agent_no_prompt_errors() {
+        match parse_slash("/agent translator") {
+            Some(SlashCommand::Unknown(msg)) => {
+                assert!(msg.contains("prompt cannot be empty"), "got: {msg}");
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_slash_agent_bare_errors() {
+        match parse_slash("/agent") {
+            Some(SlashCommand::Unknown(msg)) => {
+                assert!(msg.contains("usage: /agent"), "got: {msg}");
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_slash_agents_list() {
+        assert_eq!(parse_slash("/agents"), Some(SlashCommand::AgentsList));
+    }
+
+    #[test]
+    fn parse_slash_agent_cancel() {
+        assert_eq!(
+            parse_slash("/agent cancel side-abc123"),
+            Some(SlashCommand::AgentCancel("side-abc123".into())),
+        );
+    }
+
+    #[test]
+    fn parse_slash_agent_cancel_no_id_errors() {
+        match parse_slash("/agent cancel") {
+            Some(SlashCommand::Unknown(msg)) => {
+                assert!(msg.contains("usage: /agent cancel"), "got: {msg}");
+            }
             other => panic!("expected Unknown, got {other:?}"),
         }
     }

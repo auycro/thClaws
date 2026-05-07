@@ -155,6 +155,185 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
             ctx.shared.request_cancel();
         }
 
+        // Schedule-add modal cron preview. Frontend debounces field
+        // changes and asks the backend to validate + project the
+        // next N fires so users see exactly when their schedule will
+        // trigger before saving. Cheap: pure parser call, no I/O.
+        "schedule_cron_preview" => {
+            let cron = msg
+                .get("cron")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if cron.is_empty() {
+                (ctx.dispatch)(
+                    serde_json::json!({
+                        "type": "schedule_cron_preview_result",
+                        "cron": cron,
+                        "ok": false,
+                        "error": "cron is empty",
+                    })
+                    .to_string(),
+                );
+                return true;
+            }
+            match crate::schedule::validate_cron(&cron) {
+                Ok(()) => {
+                    let now = chrono::Utc::now();
+                    let fires: Vec<String> = crate::schedule::compute_next_n_fires(&cron, now, 3)
+                        .into_iter()
+                        .map(|t| t.to_rfc3339())
+                        .collect();
+                    (ctx.dispatch)(
+                        serde_json::json!({
+                            "type": "schedule_cron_preview_result",
+                            "cron": cron,
+                            "ok": true,
+                            "fires": fires,
+                        })
+                        .to_string(),
+                    );
+                }
+                Err(e) => {
+                    (ctx.dispatch)(
+                        serde_json::json!({
+                            "type": "schedule_cron_preview_result",
+                            "cron": cron,
+                            "ok": false,
+                            "error": format!("{e}"),
+                        })
+                        .to_string(),
+                    );
+                }
+            }
+        }
+
+        // Schedule-add modal submit. Frontend posts the form fields;
+        // we validate, persist, and dispatch `schedule_add_result` so
+        // the modal can show success or surface an error inline.
+        "schedule_add_submit" => {
+            let id = msg
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            let cron = msg
+                .get("cron")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            let prompt = msg
+                .get("prompt")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let cwd = msg
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+
+            let mut errors: Vec<String> = Vec::new();
+            if id.is_empty() {
+                errors.push("id is required".into());
+            }
+            if cron.is_empty() {
+                errors.push("cron is required".into());
+            }
+            if prompt.trim().is_empty() {
+                errors.push("prompt is required".into());
+            }
+            if cwd.is_empty() {
+                errors.push("cwd is required".into());
+            }
+            if errors.is_empty() {
+                if let Err(e) = crate::schedule::validate_cron(&cron) {
+                    errors.push(format!("{e}"));
+                }
+                let cwd_path = std::path::PathBuf::from(&cwd);
+                if !cwd_path.exists() {
+                    errors.push(format!("cwd does not exist: {cwd}"));
+                }
+            }
+
+            if !errors.is_empty() {
+                (ctx.dispatch)(
+                    serde_json::json!({
+                        "type": "schedule_add_result",
+                        "ok": false,
+                        "error": errors.join("; "),
+                    })
+                    .to_string(),
+                );
+                return true;
+            }
+
+            let model = msg
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            let max_iterations = msg
+                .get("maxIterations")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+            let timeout_secs = msg
+                .get("timeoutSecs")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0);
+            let enabled = !msg
+                .get("disabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let watch_workspace = msg
+                .get("watchWorkspace")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let entry = crate::schedule::Schedule {
+                id: id.clone(),
+                cron,
+                cwd: std::path::PathBuf::from(cwd),
+                prompt,
+                model,
+                max_iterations,
+                timeout_secs,
+                enabled,
+                watch_workspace,
+                last_run: None,
+                last_exit: None,
+            };
+            let result = (|| -> crate::error::Result<()> {
+                let mut store = crate::schedule::ScheduleStore::load()?;
+                store.add(entry)?;
+                store.save()
+            })();
+            match result {
+                Ok(()) => {
+                    (ctx.dispatch)(
+                        serde_json::json!({
+                            "type": "schedule_add_result",
+                            "ok": true,
+                            "id": id,
+                        })
+                        .to_string(),
+                    );
+                }
+                Err(e) => {
+                    (ctx.dispatch)(
+                        serde_json::json!({
+                            "type": "schedule_add_result",
+                            "ok": false,
+                            "error": format!("{e}"),
+                        })
+                        .to_string(),
+                    );
+                }
+            }
+        }
+
         "new_session" => {
             let _ = ctx.shared.input_tx.send(ShellInput::NewSession);
             // Mirror gui.rs's prior behavior — frontend expects an
@@ -590,6 +769,26 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            // Echo the reply into the Terminal tab so the cyan
+            // "assistant asks" banner is paired with a visible answer.
+            // Format mirrors how `UserPrompt` renders elsewhere:
+            // dim `> ` marker on the first line, two-space indent on
+            // continuations. The Chat tab already pushes its own
+            // local user bubble (ChatView.handleSubmit), so this
+            // dispatch only affects the terminal subscriber.
+            if !text.trim().is_empty() {
+                let mut lines = text.split('\n');
+                let mut body = String::from("\r\n\x1b[2m> \x1b[0m");
+                if let Some(first) = lines.next() {
+                    body.push_str(first);
+                }
+                for line in lines {
+                    body.push_str("\r\n  ");
+                    body.push_str(line);
+                }
+                body.push_str("\r\n");
+                (ctx.dispatch)(crate::event_render::terminal_data_envelope(&body));
+            }
             let responder = ctx
                 .pending_asks
                 .lock()
@@ -1390,6 +1589,315 @@ mod tests {
             quit_fired.load(Ordering::SeqCst),
             "app_close should fire on_quit"
         );
+    }
+
+    /// schedule_add_submit's validator branches: rejects empty fields
+    /// and bad cron without ever calling ScheduleStore::save() (so
+    /// the test can't pollute the real ~/.config/thclaws). Captures
+    /// dispatched payloads via a Mutex<Vec<String>> and asserts the
+    /// `ok: false` envelope shape.
+    /// schedule_cron_preview validates a cron expression and returns
+    /// the next 3 fires when valid, or an inline error when not.
+    /// Used by the schedule-add modal's live preview.
+    #[test]
+    fn schedule_cron_preview_valid() {
+        let shared = Arc::new(crate::shared_session::spawn());
+        let (approver, _rx) = crate::permissions::GuiApprover::new();
+        let pending_asks: PendingAsks = Arc::new(Mutex::new(HashMap::new()));
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        let ctx = IpcContext {
+            shared,
+            approver,
+            pending_asks,
+            dispatch: Arc::new(move |payload| {
+                captured_clone.lock().unwrap().push(payload);
+            }),
+            on_quit: Arc::new(|| {}),
+            on_send_initial_state: Arc::new(|| {}),
+            on_zoom: Arc::new(|_| {}),
+        };
+        let handled = handle_ipc(
+            serde_json::json!({
+                "type": "schedule_cron_preview",
+                "cron": "0 9 * * *",
+            }),
+            &ctx,
+        );
+        assert!(handled);
+        let payloads = captured.lock().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
+        assert_eq!(parsed["type"], "schedule_cron_preview_result");
+        assert_eq!(parsed["ok"], true);
+        let fires = parsed["fires"].as_array().unwrap();
+        assert_eq!(fires.len(), 3);
+        assert_eq!(parsed["cron"], "0 9 * * *");
+    }
+
+    #[test]
+    fn schedule_cron_preview_invalid() {
+        let shared = Arc::new(crate::shared_session::spawn());
+        let (approver, _rx) = crate::permissions::GuiApprover::new();
+        let pending_asks: PendingAsks = Arc::new(Mutex::new(HashMap::new()));
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        let ctx = IpcContext {
+            shared,
+            approver,
+            pending_asks,
+            dispatch: Arc::new(move |payload| {
+                captured_clone.lock().unwrap().push(payload);
+            }),
+            on_quit: Arc::new(|| {}),
+            on_send_initial_state: Arc::new(|| {}),
+            on_zoom: Arc::new(|_| {}),
+        };
+        handle_ipc(
+            serde_json::json!({
+                "type": "schedule_cron_preview",
+                "cron": "definitely not cron",
+            }),
+            &ctx,
+        );
+        let payloads = captured.lock().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
+        assert_eq!(parsed["ok"], false);
+        let err = parsed["error"].as_str().unwrap();
+        assert!(err.contains("invalid cron"), "got: {err}");
+    }
+
+    #[test]
+    fn schedule_cron_preview_empty() {
+        let shared = Arc::new(crate::shared_session::spawn());
+        let (approver, _rx) = crate::permissions::GuiApprover::new();
+        let pending_asks: PendingAsks = Arc::new(Mutex::new(HashMap::new()));
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        let ctx = IpcContext {
+            shared,
+            approver,
+            pending_asks,
+            dispatch: Arc::new(move |payload| {
+                captured_clone.lock().unwrap().push(payload);
+            }),
+            on_quit: Arc::new(|| {}),
+            on_send_initial_state: Arc::new(|| {}),
+            on_zoom: Arc::new(|_| {}),
+        };
+        handle_ipc(
+            serde_json::json!({
+                "type": "schedule_cron_preview",
+                "cron": "  ",
+            }),
+            &ctx,
+        );
+        let payloads = captured.lock().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
+        assert_eq!(parsed["ok"], false);
+        assert_eq!(parsed["error"], "cron is empty");
+    }
+
+    /// `ask_user_response` must echo the user's typed answer into the
+    /// Terminal tab so the cyan "assistant asks" banner pairs with a
+    /// visible reply. The Chat tab is unaffected (it pushes the user
+    /// bubble locally on submit).
+    #[test]
+    fn ask_user_response_echoes_to_terminal() {
+        let shared = Arc::new(crate::shared_session::spawn());
+        let (approver, _rx) = crate::permissions::GuiApprover::new();
+        let pending_asks: PendingAsks = Arc::new(Mutex::new(HashMap::new()));
+        // Pre-register a pending oneshot so resolve doesn't drop on
+        // the floor — exercises the full path.
+        let (tx, _rx) = tokio::sync::oneshot::channel::<String>();
+        pending_asks.lock().unwrap().insert(42, tx);
+
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        let ctx = IpcContext {
+            shared,
+            approver,
+            pending_asks,
+            dispatch: Arc::new(move |payload| {
+                captured_clone.lock().expect("lock").push(payload);
+            }),
+            on_quit: Arc::new(|| {}),
+            on_send_initial_state: Arc::new(|| {}),
+            on_zoom: Arc::new(|_| {}),
+        };
+        let handled = handle_ipc(
+            serde_json::json!({
+                "type": "ask_user_response",
+                "id": 42,
+                "text": "Try Hacker News",
+            }),
+            &ctx,
+        );
+        assert!(handled, "ask_user_response should be handled");
+        let payloads = captured.lock().unwrap();
+        assert_eq!(
+            payloads.len(),
+            1,
+            "expected exactly 1 terminal_data dispatch"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
+        assert_eq!(parsed["type"], "terminal_data");
+        let b64 = parsed["data"].as_str().unwrap();
+        let bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).unwrap();
+        let decoded = String::from_utf8(bytes).unwrap();
+        assert!(
+            decoded.contains("Try Hacker News"),
+            "reply text missing: {decoded}"
+        );
+        assert!(
+            decoded.contains("> "),
+            "user-prompt marker missing: {decoded}"
+        );
+    }
+
+    /// Empty / whitespace-only ask replies should NOT generate a
+    /// stray terminal_data dispatch (otherwise an accidental enter on
+    /// the chat input would emit a blank `> ` line).
+    #[test]
+    fn ask_user_response_empty_does_not_echo() {
+        let shared = Arc::new(crate::shared_session::spawn());
+        let (approver, _rx) = crate::permissions::GuiApprover::new();
+        let pending_asks: PendingAsks = Arc::new(Mutex::new(HashMap::new()));
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        let ctx = IpcContext {
+            shared,
+            approver,
+            pending_asks,
+            dispatch: Arc::new(move |payload| {
+                captured_clone.lock().expect("lock").push(payload);
+            }),
+            on_quit: Arc::new(|| {}),
+            on_send_initial_state: Arc::new(|| {}),
+            on_zoom: Arc::new(|_| {}),
+        };
+        handle_ipc(
+            serde_json::json!({
+                "type": "ask_user_response",
+                "id": 1,
+                "text": "   \n   ",
+            }),
+            &ctx,
+        );
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "whitespace-only reply must not produce terminal output"
+        );
+    }
+
+    #[test]
+    fn schedule_add_submit_rejects_missing_fields() {
+        let shared = Arc::new(crate::shared_session::spawn());
+        let (approver, _rx) = crate::permissions::GuiApprover::new();
+        let pending_asks: PendingAsks = Arc::new(Mutex::new(HashMap::new()));
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        let ctx = IpcContext {
+            shared,
+            approver,
+            pending_asks,
+            dispatch: Arc::new(move |payload| {
+                captured_clone.lock().expect("lock").push(payload);
+            }),
+            on_quit: Arc::new(|| {}),
+            on_send_initial_state: Arc::new(|| {}),
+            on_zoom: Arc::new(|_| {}),
+        };
+
+        // Empty form → must error before any save.
+        let handled = handle_ipc(serde_json::json!({"type": "schedule_add_submit"}), &ctx);
+        assert!(handled, "schedule_add_submit is a migrated arm");
+        let payloads = captured.lock().unwrap();
+        assert_eq!(payloads.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
+        assert_eq!(parsed["type"], "schedule_add_result");
+        assert_eq!(parsed["ok"], false);
+        let err = parsed["error"].as_str().unwrap();
+        assert!(err.contains("id is required"), "got: {err}");
+        assert!(err.contains("cron is required"), "got: {err}");
+        assert!(err.contains("prompt is required"), "got: {err}");
+        assert!(err.contains("cwd is required"), "got: {err}");
+    }
+
+    #[test]
+    fn schedule_add_submit_rejects_bad_cron() {
+        let shared = Arc::new(crate::shared_session::spawn());
+        let (approver, _rx) = crate::permissions::GuiApprover::new();
+        let pending_asks: PendingAsks = Arc::new(Mutex::new(HashMap::new()));
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        let ctx = IpcContext {
+            shared,
+            approver,
+            pending_asks,
+            dispatch: Arc::new(move |payload| {
+                captured_clone.lock().expect("lock").push(payload);
+            }),
+            on_quit: Arc::new(|| {}),
+            on_send_initial_state: Arc::new(|| {}),
+            on_zoom: Arc::new(|_| {}),
+        };
+
+        // Use a tempdir so the cwd-exists check passes; cron is bad.
+        let tmp = tempfile::tempdir().unwrap();
+        let handled = handle_ipc(
+            serde_json::json!({
+                "type": "schedule_add_submit",
+                "id": "test-bad-cron",
+                "cron": "definitely not cron",
+                "prompt": "hi",
+                "cwd": tmp.path().to_string_lossy(),
+            }),
+            &ctx,
+        );
+        assert!(handled);
+        let payloads = captured.lock().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
+        assert_eq!(parsed["ok"], false);
+        let err = parsed["error"].as_str().unwrap();
+        assert!(err.contains("invalid cron"), "got: {err}");
+    }
+
+    #[test]
+    fn schedule_add_submit_rejects_missing_cwd() {
+        let shared = Arc::new(crate::shared_session::spawn());
+        let (approver, _rx) = crate::permissions::GuiApprover::new();
+        let pending_asks: PendingAsks = Arc::new(Mutex::new(HashMap::new()));
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        let ctx = IpcContext {
+            shared,
+            approver,
+            pending_asks,
+            dispatch: Arc::new(move |payload| {
+                captured_clone.lock().expect("lock").push(payload);
+            }),
+            on_quit: Arc::new(|| {}),
+            on_send_initial_state: Arc::new(|| {}),
+            on_zoom: Arc::new(|_| {}),
+        };
+
+        let handled = handle_ipc(
+            serde_json::json!({
+                "type": "schedule_add_submit",
+                "id": "test-no-cwd",
+                "cron": "* * * * *",
+                "prompt": "hi",
+                "cwd": "/this/path/does/not/exist/anywhere/abc123xyz",
+            }),
+            &ctx,
+        );
+        assert!(handled);
+        let payloads = captured.lock().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
+        assert_eq!(parsed["ok"], false);
+        let err = parsed["error"].as_str().unwrap();
+        assert!(err.contains("cwd does not exist"), "got: {err}");
     }
 
     #[test]

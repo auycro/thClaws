@@ -359,6 +359,36 @@ impl ProjectConfig {
         Ok(())
     }
 
+    /// First-run bootstrap: when neither `.thclaws/settings.json` nor a
+    /// Claude Code fallback (`.claude/settings.json`) exists in the
+    /// project, write `.thclaws/settings.json` with the project-launch
+    /// defaults. Returns whether a file was written. Silent on I/O
+    /// errors — bootstrap is best-effort and shouldn't kill startup.
+    pub fn ensure_default_exists() -> bool {
+        let path = Self::path();
+        if path.exists() {
+            return false;
+        }
+        let claude_path = std::env::current_dir()
+            .ok()
+            .map(|p| p.join(".claude/settings.json"));
+        if let Some(p) = claude_path {
+            if p.exists() {
+                return false;
+            }
+        }
+        // Hand-rolled minimal JSON instead of serializing the full
+        // ProjectConfig so the on-disk file shows only the two fields
+        // we set — easier for the user to extend than a wall of nulls.
+        let body = "{\n  \"model\": \"gpt-4.1\",\n  \"permissions\": \"auto\"\n}\n";
+        if let Some(parent) = path.parent() {
+            if std::fs::create_dir_all(parent).is_err() {
+                return false;
+            }
+        }
+        std::fs::write(&path, body).is_ok()
+    }
+
     /// Replace the active-KMS list in `.thclaws/settings.json` and
     /// write it back. Preserves every other field that was already
     /// there. Creates the file if it doesn't exist yet.

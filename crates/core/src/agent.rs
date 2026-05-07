@@ -694,6 +694,14 @@ pub struct Agent {
     /// configured hooks. `None` keeps tests and standalone consumers
     /// hook-free.
     pub(crate) hooks: Option<std::sync::Arc<crate::hooks::HooksConfig>>,
+    /// Identity of this agent for permission-request attribution.
+    /// Default `Main` for the user's primary agent; side-channel
+    /// spawns set `SideChannel { id, agent_name }` so the approver
+    /// modal can render "translator (side) wants to run Bash" vs
+    /// "Main wants to run Bash" when concurrent agents request
+    /// permissions. The factory chain (ProductionAgentFactory) and
+    /// the side-channel spawner set this at construction time.
+    pub(crate) origin: crate::permissions::AgentOrigin,
 }
 
 impl Agent {
@@ -725,7 +733,17 @@ impl Agent {
             history: Arc::new(Mutex::new(Vec::new())),
             cancel: None,
             hooks: None,
+            origin: crate::permissions::AgentOrigin::Main,
         }
+    }
+
+    /// Set the agent's origin (Main / SideChannel / Subagent). Drives
+    /// the `originator` field on every approval request the agent
+    /// fires; the GUI uses it to render which agent is asking when
+    /// multiple are running concurrently. Default is `Main`.
+    pub fn with_origin(mut self, origin: crate::permissions::AgentOrigin) -> Self {
+        self.origin = origin;
+        self
     }
 
     /// Wire in a cancel token so retry sleeps and (future) long awaits
@@ -843,6 +861,7 @@ impl Agent {
         let history = self.history.clone();
         let cancel = self.cancel.clone();
         let hooks = self.hooks.clone();
+        let origin = self.origin.clone();
 
         try_stream! {
             {
@@ -1292,6 +1311,14 @@ impl Agent {
                             tool_name: name.clone(),
                             input: input.clone(),
                             summary: None,
+                            // The agent's origin (Main / SideChannel /
+                            // Subagent) flows through every approval
+                            // request so the GUI modal can attribute
+                            // concurrent permission asks to the right
+                            // agent. Set via `Agent::with_origin` at
+                            // construction (factory + side-channel
+                            // spawner do this).
+                            originator: origin.clone(),
                         };
                         let decision = approver.approve(&req).await;
                         if matches!(decision, ApprovalDecision::Deny) {

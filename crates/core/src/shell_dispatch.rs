@@ -2202,10 +2202,263 @@ pub async fn dispatch(
             }
         }
 
+        SlashCommand::Schedule => match crate::schedule::ScheduleStore::load() {
+            Ok(store) if store.schedules.is_empty() => {
+                emit(
+                    events_tx,
+                    "no schedules — add one with: thclaws schedule add <id> --cron \"...\" --prompt \"...\"".into(),
+                );
+            }
+            Ok(store) => {
+                let mut out = String::new();
+                for s in &store.schedules {
+                    let status = if s.enabled { "on " } else { "off" };
+                    let watch = if s.watch_workspace {
+                        "+watch"
+                    } else {
+                        "      "
+                    };
+                    let last = s.last_run.as_deref().unwrap_or("never");
+                    let exit = match s.last_exit {
+                        Some(0) => "ok ",
+                        Some(_) => "err",
+                        None => "—  ",
+                    };
+                    out.push_str(&format!(
+                        "{status} {exit} {watch}  {:24}  {:20}  {}\n",
+                        s.id, s.cron, last,
+                    ));
+                }
+                emit(events_tx, out.trim_end().to_string());
+            }
+            Err(e) => emit(events_tx, format!("/schedule: {e}")),
+        },
+        SlashCommand::ScheduleShow(id) => match crate::schedule::ScheduleStore::load() {
+            Ok(store) => match store.get(&id) {
+                Some(s) => match serde_json::to_string_pretty(s) {
+                    Ok(json) => emit(events_tx, json),
+                    Err(e) => emit(events_tx, format!("/schedule show: serialize: {e}")),
+                },
+                None => emit(
+                    events_tx,
+                    format!("/schedule show: no schedule with id '{id}'"),
+                ),
+            },
+            Err(e) => emit(events_tx, format!("/schedule show: {e}")),
+        },
+        SlashCommand::ScheduleRun(id) => {
+            let binary = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(e) => {
+                    emit(
+                        events_tx,
+                        format!("/schedule run: cannot resolve current_exe: {e}"),
+                    );
+                    return;
+                }
+            };
+            emit(events_tx, format!("/schedule run '{id}': firing…"));
+            let id_for_task = id.clone();
+            let id_for_msg = id.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                crate::schedule::run_once(&id_for_task, &binary)
+            })
+            .await;
+            match result {
+                Ok(Ok(outcome)) => {
+                    let exit = outcome
+                        .exit_code
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "(timeout)".into());
+                    emit(
+                        events_tx,
+                        format!(
+                            "/schedule run '{id_for_msg}': exit={exit} duration={}.{:03}s log={}",
+                            outcome.duration.as_secs(),
+                            outcome.duration.subsec_millis(),
+                            outcome.log_path.display(),
+                        ),
+                    );
+                }
+                Ok(Err(e)) => emit(events_tx, format!("/schedule run '{id_for_msg}': {e}")),
+                Err(e) => emit(
+                    events_tx,
+                    format!("/schedule run '{id_for_msg}': join error: {e}"),
+                ),
+            }
+        }
+        SlashCommand::ScheduleStatus => {
+            let mut out = String::new();
+            match crate::schedule::daemon_status() {
+                crate::schedule::DaemonStatus::Running(pid) => {
+                    out.push_str(&format!("daemon: running (pid {pid})\n"));
+                }
+                crate::schedule::DaemonStatus::Stale(pid) => {
+                    out.push_str(&format!(
+                        "daemon: stale PID file (last pid {pid} not alive)\n"
+                    ));
+                }
+                crate::schedule::DaemonStatus::NotRunning => {
+                    out.push_str("daemon: not running (`thclaws schedule install` to enable)\n");
+                }
+            }
+            if let Ok(store) = crate::schedule::ScheduleStore::load() {
+                if !store.schedules.is_empty() {
+                    out.push_str("recent fires:\n");
+                    for s in &store.schedules {
+                        let last = s.last_run.as_deref().unwrap_or("never");
+                        let exit = match s.last_exit {
+                            Some(0) => "ok ",
+                            Some(_) => "err",
+                            None => "—  ",
+                        };
+                        out.push_str(&format!("  {exit}  {:24}  {}\n", s.id, last));
+                    }
+                }
+            }
+            emit(events_tx, out.trim_end().to_string());
+        }
+        SlashCommand::SchedulePause(id) => match toggle_schedule_enabled_dispatch(&id, false) {
+            Ok(()) => emit(events_tx, format!("/schedule pause '{id}': paused")),
+            Err(e) => emit(events_tx, format!("/schedule pause '{id}': {e}")),
+        },
+        SlashCommand::ScheduleResume(id) => match toggle_schedule_enabled_dispatch(&id, true) {
+            Ok(()) => emit(events_tx, format!("/schedule resume '{id}': resumed")),
+            Err(e) => emit(events_tx, format!("/schedule resume '{id}': {e}")),
+        },
+        SlashCommand::ScheduleAdd => {
+            // Pre-fill the modal with sensible defaults. `cwd` is the
+            // process cwd so a fresh schedule lands in the project the
+            // user is already in; timeoutSecs mirrors the CLI default
+            // (10 min); cron is a Mon-Fri 08:30 example.
+            let cwd_default = std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let payload = serde_json::json!({
+                "type": "schedule_add_open",
+                "defaults": {
+                    "cwd": cwd_default,
+                    "timeoutSecs": 600,
+                    "cron": "30 8 * * MON-FRI",
+                },
+            });
+            let _ = events_tx.send(ViewEvent::ScheduleAddOpen(payload.to_string()));
+        }
+        SlashCommand::ScheduleRm(id) => match crate::schedule::ScheduleStore::load() {
+            Ok(mut store) => {
+                if !store.remove(&id) {
+                    emit(events_tx, format!("/schedule rm '{id}': no such schedule"));
+                } else if let Err(e) = store.save() {
+                    emit(events_tx, format!("/schedule rm '{id}': save: {e}"));
+                } else {
+                    emit(events_tx, format!("/schedule rm '{id}': removed"));
+                }
+            }
+            Err(e) => emit(events_tx, format!("/schedule rm '{id}': {e}")),
+        },
+        SlashCommand::ScheduleInstall => {
+            let result = tokio::task::spawn_blocking(crate::schedule::install_daemon).await;
+            match result {
+                Ok(Ok(report)) => {
+                    let mut out = format!(
+                        "/schedule install: wrote {}\n",
+                        report.supervisor_path.display()
+                    );
+                    if report.next_steps.is_empty() {
+                        out.push_str(
+                            "/schedule install: daemon bootstrapped — try /schedule status",
+                        );
+                    } else {
+                        out.push_str("/schedule install: next steps:\n");
+                        for step in &report.next_steps {
+                            out.push_str(&format!("  $ {step}\n"));
+                        }
+                    }
+                    emit(events_tx, out.trim_end().to_string());
+                }
+                Ok(Err(e)) => emit(events_tx, format!("/schedule install: {e}")),
+                Err(e) => emit(events_tx, format!("/schedule install: join error: {e}")),
+            }
+        }
+        SlashCommand::ScheduleUninstall => {
+            let result = tokio::task::spawn_blocking(crate::schedule::uninstall_daemon).await;
+            match result {
+                Ok(Ok(path)) => {
+                    if path.exists() {
+                        emit(
+                            events_tx,
+                            format!(
+                                "/schedule uninstall: warning — supervisor file {} still exists",
+                                path.display()
+                            ),
+                        );
+                    } else {
+                        emit(events_tx, "/schedule uninstall: daemon uninstalled".into());
+                    }
+                }
+                Ok(Err(e)) => emit(events_tx, format!("/schedule uninstall: {e}")),
+                Err(e) => emit(events_tx, format!("/schedule uninstall: join error: {e}")),
+            }
+        }
+        SlashCommand::Agent { name, prompt } => {
+            // Spawn user-driven side channel. Returns immediately
+            // with the assigned id; the agent runs concurrently on
+            // its own tokio task and streams `chat_side_channel_*`
+            // events back to the chat surface.
+            match crate::side_channel::spawn_side_channel(
+                name.clone(),
+                prompt,
+                state.agent_factory.clone(),
+                state.agent_defs.clone(),
+                events_tx.clone(),
+            )
+            .await
+            {
+                Ok(id) => emit(
+                    events_tx,
+                    format!("✓ spawned background agent '{name}' (id: {id})"),
+                ),
+                Err(e) => emit(events_tx, format!("/agent: {e}")),
+            }
+        }
+        SlashCommand::AgentsList => {
+            let active = crate::side_channel::list_side_channels();
+            if active.is_empty() {
+                emit(events_tx, "no active background agents".into());
+            } else {
+                let mut out = String::new();
+                for (id, name, elapsed) in active {
+                    out.push_str(&format!("  {id}  {name:24}  {elapsed:.1}s elapsed\n"));
+                }
+                emit(events_tx, out.trim_end().to_string());
+            }
+        }
+        SlashCommand::AgentCancel(id) => {
+            if crate::side_channel::cancel_side_channel(&id) {
+                emit(events_tx, format!("/agent cancel '{id}': signal sent"));
+            } else {
+                emit(
+                    events_tx,
+                    format!("/agent cancel '{id}': no such active agent (try /agents)"),
+                );
+            }
+        }
         SlashCommand::Unknown(detail) => {
             emit(events_tx, format!("unknown command: {detail}"));
         }
     }
+}
+
+/// Local copy of the toggle helper for the GUI chat dispatch path —
+/// repl.rs has its own at module scope. Both are short enough that
+/// duplicating beats threading visibility.
+fn toggle_schedule_enabled_dispatch(id: &str, enabled: bool) -> crate::error::Result<()> {
+    let mut store = crate::schedule::ScheduleStore::load()?;
+    let entry = store
+        .get_mut(id)
+        .ok_or_else(|| crate::error::Error::Config(format!("no schedule with id '{id}'")))?;
+    entry.enabled = enabled;
+    store.save()
 }
 
 /// Switch to a new model. If the provider supports listing, validate
