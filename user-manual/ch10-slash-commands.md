@@ -93,8 +93,9 @@ tried first.
 | `/kms use NAME` | Attach a KMS to this project's chats |
 | `/kms off NAME` | Detach a KMS |
 | `/kms show NAME` | Print the KMS's `index.md` |
+| `/dream [FOCUS]` | Consolidate the project's KMS by mining recent sessions (GUI-only, dispatches a built-in side-channel agent) |
 
-See [Chapter 9](ch09-knowledge-bases-kms.md) for the full KMS concept + workflow.
+See [Chapter 9](ch09-knowledge-bases-kms.md) for the full KMS concept + workflow, including the `/dream` consolidation flow.
 
 ### Agent behaviour
 
@@ -104,6 +105,10 @@ See [Chapter 9](ch09-knowledge-bases-kms.md) for the full KMS concept + workflow
 | `/thinking BUDGET` | Extended-thinking token budget (0 = off, only for Anthropic) |
 | `/tasks` | List tasks / todos the agent has created |
 | `/config key=val` | Override a config value for this session only |
+| `/agent NAME PROMPT` | Spawn a user-driven side-channel subagent (GUI-only, runs concurrently with main) |
+| `/agents` | List active background side-channel agents (id, name, elapsed) |
+| `/agent cancel ID` | Cancel a running side-channel agent |
+| `/dream [FOCUS]` | Dispatch the built-in dream agent to consolidate KMS (GUI-only) — see [Chapter 9](ch09-knowledge-bases-kms.md) |
 | `/team` | Attach to the team tmux session (or show team status) |
 | `/doctor` | Run diagnostic checks |
 | `/usage` | Token usage by provider and model |

@@ -1103,6 +1103,43 @@ pub fn append_to_page(kref: &KmsRef, page_name: &str, chunk: &str) -> Result<Pat
     Ok(path)
 }
 
+/// Delete a KMS page. Validates the name via `writable_page_path`
+/// (same path-safety carve-out as write/append), removes the file,
+/// strips the matching bullet from `index.md`, and appends a
+/// `## [YYYY-MM-DD] deleted | <stem>` entry to `log.md`.
+pub fn delete_page(kref: &KmsRef, page_name: &str) -> Result<PathBuf> {
+    let path = writable_page_path(kref, page_name)?;
+    if !path.exists() {
+        return Err(Error::Tool(format!("page not found: {}", path.display())));
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("page")
+        .to_string();
+    std::fs::remove_file(&path)
+        .map_err(|e| Error::Tool(format!("remove {}: {e}", path.display())))?;
+    remove_index_bullet(kref, &stem)?;
+    append_log_header(kref, "deleted", &stem)?;
+    Ok(path)
+}
+
+fn remove_index_bullet(kref: &KmsRef, stem: &str) -> Result<()> {
+    let path = kref.index_path();
+    let Ok(existing) = std::fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let needle = format!("(pages/{stem}.md)");
+    let filtered: Vec<&str> = existing.lines().filter(|l| !l.contains(&needle)).collect();
+    let mut new_body = filtered.join("\n");
+    if !new_body.ends_with('\n') && !new_body.is_empty() {
+        new_body.push('\n');
+    }
+    std::fs::write(&path, new_body.as_bytes())
+        .map_err(|e| Error::Tool(format!("write {}: {e}", path.display())))?;
+    Ok(())
+}
+
 /// Update index.md to reflect a write. Adds a fresh bullet (or
 /// replaces an existing one for the same page). Categorization is a
 /// hint — the actual rendering for the system prompt is built from

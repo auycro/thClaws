@@ -7,6 +7,7 @@ import { TeamView } from "./components/TeamView";
 import { Sidebar } from "./components/Sidebar";
 import { PlanSidebar } from "./components/PlanSidebar";
 import { GoalSidebar } from "./components/GoalSidebar";
+import { TodoSidebar } from "./components/TodoSidebar";
 import { SettingsModal } from "./components/SettingsModal";
 import { SettingsMenu } from "./components/SettingsMenu";
 import { InstructionsEditorModal } from "./components/InstructionsEditorModal";
@@ -497,6 +498,13 @@ export default function App() {
             when no /goal is active. Independent from plan-state — a
             session can carry both, one, or neither. */}
         <GoalSidebar />
+        {/* Todo-list sidebar. Mirrors PlanSidebar's right-edge layout
+            but displays the `TodoWrite` scratchpad — display-only, no
+            action buttons. Hidden until the first `chat_todo_update`
+            envelope lands; the worker hydrates from
+            `.thclaws/todos.md` at boot so reopening a project shows
+            the prior list immediately. */}
+        <TodoSidebar />
         {/* Plan-mode sidebar (M1). Renders nothing when no plan is
             active — plan_state's broadcaster fires `chat_plan_update`
             with `null` to clear it on `/new` / `/load` of a plan-less

@@ -1620,6 +1620,9 @@ pub async fn dispatch(
                 state
                     .tool_registry
                     .register(std::sync::Arc::new(crate::tools::KmsAppendTool));
+                state
+                    .tool_registry
+                    .register(std::sync::Arc::new(crate::tools::KmsDeleteTool));
                 state.rebuild_system_prompt();
                 if let Err(e) = state.rebuild_agent(true) {
                     emit(events_tx, format!("rebuild failed: {e}"));
@@ -2441,6 +2444,33 @@ pub async fn dispatch(
                     events_tx,
                     format!("/agent cancel '{id}': no such active agent (try /agents)"),
                 );
+            }
+        }
+        SlashCommand::Dream { focus } => {
+            // `/dream` dispatches the built-in `dream` AgentDef as a
+            // side channel. Built-in def is seeded into the registry
+            // by `AgentDefsConfig::seed_builtins`, so the existing
+            // side-channel pipeline handles the rest. Empty focus
+            // falls back to a default consolidate-everything prompt
+            // so the agent has something to chew on.
+            let prompt = if focus.trim().is_empty() {
+                "Consolidate the active KMS by mining recent sessions. \
+                 Follow your standard four-pass procedure."
+                    .to_string()
+            } else {
+                focus
+            };
+            match crate::side_channel::spawn_side_channel(
+                "dream".to_string(),
+                prompt,
+                state.agent_factory.clone(),
+                state.agent_defs.clone(),
+                events_tx.clone(),
+            )
+            .await
+            {
+                Ok(id) => emit(events_tx, format!("✓ dreaming (id: {id})")),
+                Err(e) => emit(events_tx, format!("/dream: {e}")),
             }
         }
         SlashCommand::Unknown(detail) => {

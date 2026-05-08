@@ -26,11 +26,15 @@ impl Tool for XlsxCreateTool {
 
     fn description(&self) -> &'static str {
         "Render tabular data to an Excel (.xlsx) file. `data` accepts \
-         either a CSV string (first row is headers when `headers: true`, \
-         the default) or a JSON 2D array of typed cells (numbers stay \
-         numbers, booleans stay booleans). Single sheet for v1; \
-         multi-sheet workbooks land in a follow-up. Numbers in CSV cells \
-         are auto-detected and written as numeric cells."
+         three input shapes: (1) a CSV string — single sheet, first row \
+         is headers when `headers: true` (default); (2) a JSON 2D array \
+         of typed cells — single sheet, types preserved (numbers stay \
+         numbers, booleans stay booleans); (3) a JSON array of \
+         `{sheet: \"Name\", rows: [[...]]}` or `{sheet: \"Name\", data: \
+         \"csv string\"}` objects — multi-sheet workbook with one tab \
+         per object. Numbers in CSV cells are auto-detected and written \
+         as numeric cells. Sheet names must be ≤31 chars (Excel limit) \
+         and unique within the workbook."
     }
 
     fn input_schema(&self) -> Value {
@@ -38,10 +42,10 @@ impl Tool for XlsxCreateTool {
             "type": "object",
             "properties": {
                 "path":       {"type": "string", "description": "Output .xlsx path. Parent directories are created if missing."},
-                "data":       {"description": "CSV string or JSON 2D array of cells."},
-                "sheet_name": {"type": "string", "description": "Sheet name. Default \"Sheet1\". Max 31 chars (Excel limit)."},
-                "headers":    {"type": "boolean", "description": "Treat the first row as headers (bold + bottom border). Default true."},
-                "auto_width": {"type": "boolean", "description": "Auto-size columns to fit content. Default true."}
+                "data":       {"description": "Single sheet: CSV string OR JSON 2D array. Multi-sheet: JSON array of {sheet, rows} or {sheet, data} objects."},
+                "sheet_name": {"type": "string", "description": "Sheet name (single-sheet inputs only — ignored for the multi-sheet shape, which carries names per object). Default \"Sheet1\". Max 31 chars."},
+                "headers":    {"type": "boolean", "description": "Treat the first row as headers (bold + bottom border). Applied to every sheet for the multi-sheet shape. Default true."},
+                "auto_width": {"type": "boolean", "description": "Auto-size columns to fit content. Applied to every sheet for the multi-sheet shape. Default true."}
             },
             "required": ["path", "data"]
         })
@@ -60,7 +64,7 @@ impl Tool for XlsxCreateTool {
             .ok_or_else(|| Error::Tool("missing field: data".into()))?
             .clone();
 
-        let sheet_name = input
+        let default_sheet_name = input
             .get("sheet_name")
             .and_then(|v| v.as_str())
             .unwrap_or("Sheet1")
@@ -74,7 +78,7 @@ impl Tool for XlsxCreateTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
-        let rows = parse_data(&data)?;
+        let sheets = parse_sheets(&data, &default_sheet_name)?;
 
         if let Some(parent) = Path::new(&*validated.to_string_lossy()).parent() {
             if !parent.as_os_str().is_empty() {
@@ -84,21 +88,27 @@ impl Tool for XlsxCreateTool {
         }
 
         let path_clone = validated.clone();
-
-        let (rows_written, cols_written) =
-            tokio::task::spawn_blocking(move || -> Result<(usize, usize)> {
-                render_xlsx(&path_clone, &rows, &sheet_name, with_headers, auto_width)
-            })
-            .await
-            .map_err(|e| Error::Tool(format!("XLSX worker join failed: {e}")))??;
+        let summary = tokio::task::spawn_blocking(move || -> Result<String> {
+            render_xlsx(&path_clone, &sheets, with_headers, auto_width)
+        })
+        .await
+        .map_err(|e| Error::Tool(format!("XLSX worker join failed: {e}")))??;
 
         Ok(format!(
-            "Wrote XLSX to {} ({} rows × {} cols)",
+            "Wrote XLSX to {} — {}",
             validated.display(),
-            rows_written,
-            cols_written
+            summary
         ))
     }
+}
+
+/// One sheet's worth of data — name plus typed rows. Multi-sheet input
+/// shapes parse to a `Vec<Sheet>`; the legacy single-sheet shapes
+/// (CSV string, 2D array) parse to a 1-element vec carrying the
+/// caller's `sheet_name` argument.
+struct Sheet {
+    name: String,
+    rows: Vec<Vec<Cell>>,
 }
 
 /// In-memory cell representation. We keep this typed instead of just
@@ -112,33 +122,141 @@ enum Cell {
     Bool(bool),
 }
 
-fn parse_data(data: &Value) -> Result<Vec<Vec<Cell>>> {
-    if let Some(arr) = data.as_array() {
-        // JSON 2D array: each inner element is a row.
-        let mut rows = Vec::with_capacity(arr.len());
-        for (ridx, row) in arr.iter().enumerate() {
-            let cells = row
-                .as_array()
-                .ok_or_else(|| Error::Tool(format!("row {ridx} is not an array")))?;
-            rows.push(cells.iter().map(value_to_cell).collect());
+/// Detect the input shape and return one or more sheets. Three shapes:
+/// 1. CSV string → single sheet with `default_name`.
+/// 2. JSON 2D array (each inner element is itself an array of cells)
+///    → single sheet with `default_name`.
+/// 3. JSON array of objects with at least a `sheet` key plus either
+///    `rows` (2D array) or `data` (CSV string) → multi-sheet workbook.
+///
+/// The shape is decided by inspecting the FIRST element of the array:
+/// if it's an object, treat the whole array as the multi-sheet shape;
+/// otherwise treat it as a 2D array. A mixed array of objects + raw
+/// row arrays is rejected (ambiguous).
+fn parse_sheets(data: &Value, default_name: &str) -> Result<Vec<Sheet>> {
+    if let Some(s) = data.as_str() {
+        // Shape 1: CSV string.
+        return Ok(vec![Sheet {
+            name: default_name.to_string(),
+            rows: parse_csv_rows(s)?,
+        }]);
+    }
+    let arr = match data.as_array() {
+        Some(a) => a,
+        None => {
+            return Err(Error::Tool(
+                "data must be a CSV string, a JSON 2D array, or a JSON array of \
+                 {sheet, rows} / {sheet, data} objects"
+                    .into(),
+            ))
         }
-        Ok(rows)
-    } else if let Some(s) = data.as_str() {
-        // CSV string.
-        let mut rdr = csv::ReaderBuilder::new()
-            .has_headers(false) // we'll handle the header bolding ourselves
-            .flexible(true)
-            .from_reader(s.as_bytes());
-        let mut rows = Vec::new();
-        for rec in rdr.records() {
-            let rec = rec.map_err(|e| Error::Tool(format!("CSV parse: {e}")))?;
-            rows.push(rec.iter().map(string_to_cell).collect());
+    };
+    if arr.is_empty() {
+        return Ok(vec![Sheet {
+            name: default_name.to_string(),
+            rows: Vec::new(),
+        }]);
+    }
+    // Discriminate by first element shape.
+    if arr[0].is_object() {
+        // Shape 3: multi-sheet array.
+        let mut sheets = Vec::with_capacity(arr.len());
+        let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (idx, entry) in arr.iter().enumerate() {
+            let obj = entry.as_object().ok_or_else(|| {
+                Error::Tool(format!(
+                    "data[{idx}] must be a {{sheet, rows}} or {{sheet, data}} object \
+                     (mixed array elements not allowed)"
+                ))
+            })?;
+            let name = obj
+                .get("sheet")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| Error::Tool(format!("data[{idx}] missing required `sheet` key")))?
+                .to_string();
+            if name.chars().count() > 31 {
+                return Err(Error::Tool(format!(
+                    "data[{idx}] sheet name is {} chars (Excel limit is 31): {name:?}",
+                    name.chars().count()
+                )));
+            }
+            if !seen_names.insert(name.clone()) {
+                return Err(Error::Tool(format!(
+                    "data[{idx}] duplicate sheet name {name:?} — every sheet must have a unique name"
+                )));
+            }
+            // Accept either `rows` (2D array) or `data` (CSV string).
+            let rows = match (obj.get("rows"), obj.get("data")) {
+                (Some(rows_val), _) => parse_2d_array(rows_val, idx)?,
+                (None, Some(data_val)) => match data_val.as_str() {
+                    Some(s) => parse_csv_rows(s)?,
+                    None => {
+                        return Err(Error::Tool(format!(
+                            "data[{idx}].data must be a CSV string"
+                        )))
+                    }
+                },
+                (None, None) => {
+                    return Err(Error::Tool(format!(
+                        "data[{idx}] needs either `rows` (2D array) or `data` (CSV string)"
+                    )))
+                }
+            };
+            sheets.push(Sheet { name, rows });
         }
-        Ok(rows)
+        Ok(sheets)
     } else {
-        Err(Error::Tool(
-            "data must be a CSV string or a JSON 2D array".into(),
+        // Shape 2: legacy 2D array.
+        Ok(vec![Sheet {
+            name: default_name.to_string(),
+            rows: parse_2d_array(data, 0)?,
+        }])
+    }
+}
+
+/// Parse a CSV body into typed rows. Same posture as the prior single-
+/// sheet path — flexible (uneven row widths allowed), no header
+/// special-casing here (header bolding is applied at render time).
+fn parse_csv_rows(s: &str) -> Result<Vec<Vec<Cell>>> {
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .from_reader(s.as_bytes());
+    let mut rows = Vec::new();
+    for rec in rdr.records() {
+        let rec = rec.map_err(|e| Error::Tool(format!("CSV parse: {e}")))?;
+        rows.push(rec.iter().map(string_to_cell).collect());
+    }
+    Ok(rows)
+}
+
+/// Parse a JSON 2D array (each inner element is a row of cells).
+/// `sheet_idx` is used purely for the error message context.
+fn parse_2d_array(data: &Value, sheet_idx: usize) -> Result<Vec<Vec<Cell>>> {
+    let arr = data.as_array().ok_or_else(|| {
+        Error::Tool(format!(
+            "data[{sheet_idx}] rows must be a 2D array (got {})",
+            value_kind(data)
         ))
+    })?;
+    let mut rows = Vec::with_capacity(arr.len());
+    for (ridx, row) in arr.iter().enumerate() {
+        let cells = row
+            .as_array()
+            .ok_or_else(|| Error::Tool(format!("data[{sheet_idx}] row {ridx} is not an array")))?;
+        rows.push(cells.iter().map(value_to_cell).collect());
+    }
+    Ok(rows)
+}
+
+fn value_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -191,52 +309,73 @@ fn string_to_cell(s: &str) -> Cell {
 
 fn render_xlsx(
     path: &Path,
-    rows: &[Vec<Cell>],
-    sheet_name: &str,
+    sheets: &[Sheet],
     with_headers: bool,
     auto_width: bool,
-) -> Result<(usize, usize)> {
+) -> Result<String> {
     let mut workbook = Workbook::new();
-    let worksheet = workbook.add_worksheet();
-    worksheet
-        .set_name(sheet_name)
-        .map_err(|e| Error::Tool(format!("set sheet name: {e}")))?;
 
     let header_format = Format::new()
         .set_bold()
         .set_border_bottom(FormatBorder::Thin);
 
-    let mut max_cols = 0usize;
-    for (r, row) in rows.iter().enumerate() {
-        max_cols = max_cols.max(row.len());
-        for (c, cell) in row.iter().enumerate() {
-            let r32 = u32::try_from(r).map_err(|_| Error::Tool("row index overflow".into()))?;
-            let c16 = u16::try_from(c).map_err(|_| Error::Tool("col index overflow".into()))?;
-            let is_header = with_headers && r == 0;
-            write_cell(
-                worksheet,
-                r32,
-                c16,
-                cell,
-                is_header.then_some(&header_format),
-            )?;
-        }
-    }
+    let mut summary_parts: Vec<String> = Vec::with_capacity(sheets.len());
 
-    if auto_width {
-        worksheet.autofit();
-    }
-    if with_headers && !rows.is_empty() {
-        // Freeze the top row so headers stay visible during scroll —
-        // standard expectation for tabular data.
-        let _ = worksheet.set_freeze_panes(1, 0);
+    for sheet in sheets {
+        let worksheet = workbook.add_worksheet();
+        worksheet
+            .set_name(&sheet.name)
+            .map_err(|e| Error::Tool(format!("set sheet name {:?}: {e}", sheet.name)))?;
+
+        let mut max_cols = 0usize;
+        for (r, row) in sheet.rows.iter().enumerate() {
+            max_cols = max_cols.max(row.len());
+            for (c, cell) in row.iter().enumerate() {
+                let r32 = u32::try_from(r).map_err(|_| Error::Tool("row index overflow".into()))?;
+                let c16 = u16::try_from(c).map_err(|_| Error::Tool("col index overflow".into()))?;
+                let is_header = with_headers && r == 0;
+                write_cell(
+                    worksheet,
+                    r32,
+                    c16,
+                    cell,
+                    is_header.then_some(&header_format),
+                )?;
+            }
+        }
+
+        if auto_width {
+            worksheet.autofit();
+        }
+        if with_headers && !sheet.rows.is_empty() {
+            // Freeze the top row so headers stay visible during
+            // scroll — standard expectation for tabular data.
+            let _ = worksheet.set_freeze_panes(1, 0);
+        }
+
+        summary_parts.push(format!(
+            "{:?} ({} rows × {} cols)",
+            sheet.name,
+            sheet.rows.len(),
+            max_cols
+        ));
     }
 
     workbook
         .save(path)
         .map_err(|e| Error::Tool(format!("save XLSX: {e}")))?;
 
-    Ok((rows.len(), max_cols))
+    if sheets.len() == 1 {
+        // Preserve the legacy "(N rows × M cols)" message shape so
+        // existing user-facing call sites that grep it still work.
+        Ok(summary_parts.into_iter().next().unwrap_or_default())
+    } else {
+        Ok(format!(
+            "{} sheets — {}",
+            sheets.len(),
+            summary_parts.join("; ")
+        ))
+    }
 }
 
 fn write_cell(
@@ -310,6 +449,103 @@ mod tests {
         assert!(matches!(string_to_cell("True"), Cell::Bool(true)));
         assert!(matches!(string_to_cell("false"), Cell::Bool(false)));
         assert!(matches!(string_to_cell(""), Cell::Empty));
+    }
+
+    #[tokio::test]
+    async fn writes_multi_sheet_workbook() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("multi.xlsx");
+        let msg = XlsxCreateTool
+            .call(json!({
+                "path": path.to_string_lossy(),
+                "data": [
+                    {"sheet": "Summary", "rows": [["Total"], [100]]},
+                    {"sheet": "Detail", "rows": [["Name", "Amount"], ["Alice", 50], ["Bob", 50]]}
+                ]
+            }))
+            .await
+            .unwrap();
+        assert!(msg.contains("2 sheets"), "msg: {msg}");
+        assert!(msg.contains("Summary"), "msg: {msg}");
+        assert!(msg.contains("Detail"), "msg: {msg}");
+        // File exists + is non-trivially sized.
+        assert!(std::fs::metadata(&path).unwrap().len() > 1500);
+    }
+
+    #[tokio::test]
+    async fn multi_sheet_accepts_csv_per_sheet() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mixed.xlsx");
+        let _ = XlsxCreateTool
+            .call(json!({
+                "path": path.to_string_lossy(),
+                "data": [
+                    {"sheet": "Q1", "data": "name,amount\nAlice,100\nBob,200"},
+                    {"sheet": "Q2", "rows": [["name", "amount"], ["Alice", 150], ["Bob", 250]]}
+                ]
+            }))
+            .await
+            .unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > 1500);
+    }
+
+    #[tokio::test]
+    async fn multi_sheet_rejects_duplicate_names() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("dup.xlsx");
+        let err = XlsxCreateTool
+            .call(json!({
+                "path": path.to_string_lossy(),
+                "data": [
+                    {"sheet": "Foo", "rows": [["a"]]},
+                    {"sheet": "Foo", "rows": [["b"]]}
+                ]
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("duplicate sheet name"),
+            "err: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_sheet_rejects_too_long_name() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("long.xlsx");
+        let too_long = "a".repeat(32);
+        let err = XlsxCreateTool
+            .call(json!({
+                "path": path.to_string_lossy(),
+                "data": [
+                    {"sheet": too_long, "rows": [["a"]]}
+                ]
+            }))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("31"), "err: {err}");
+    }
+
+    /// Backward compat: the existing single-sheet 2D-array shape still
+    /// works untouched. The shape detector branches on the first
+    /// element of the array — a row-array → legacy path; an object →
+    /// new multi-sheet path.
+    #[tokio::test]
+    async fn single_sheet_2d_array_still_works() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.xlsx");
+        let _ = XlsxCreateTool
+            .call(json!({
+                "path": path.to_string_lossy(),
+                "data": [
+                    ["name", "score"],
+                    ["Alice", 95.5]
+                ],
+                "sheet_name": "Custom"
+            }))
+            .await
+            .unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > 1000);
     }
 
     /// M6.23 BUG XT1: byte-identical round-trip for number coercion.

@@ -94,8 +94,9 @@ Slash commands คือ control plane ของ thClaws พิมพ์ `/` ต
 | `/kms use NAME` | ผูก KMS เข้ากับการสนทนาของโปรเจกต์นี้ |
 | `/kms off NAME` | ถอด KMS ออก |
 | `/kms show NAME` | พิมพ์ `index.md` ของ KMS ออกมา |
+| `/dream [FOCUS]` | Consolidate KMS ของโปรเจกต์โดย mine session ล่าสุด (GUI-only, dispatch built-in side-channel agent) |
 
-แนวคิดและเวิร์กโฟลว์ KMS ฉบับเต็มอยู่ใน [บทที่ 9](ch09-knowledge-bases-kms.md)
+แนวคิดและเวิร์กโฟลว์ KMS ฉบับเต็มอยู่ใน [บทที่ 9](ch09-knowledge-bases-kms.md) รวมถึง flow ของ `/dream`
 
 ### พฤติกรรม Agent
 
@@ -105,6 +106,10 @@ Slash commands คือ control plane ของ thClaws พิมพ์ `/` ต
 | `/thinking BUDGET` | กำหนด budget token สำหรับ extended-thinking (0 = ปิด ใช้ได้เฉพาะ Anthropic) |
 | `/tasks` | แสดง task / todo ที่ agent สร้างไว้ |
 | `/config key=val` | เขียนทับค่า config เฉพาะ session นี้ |
+| `/agent NAME PROMPT` | Spawn user-driven side-channel subagent (GUI-only รันขนานกับ main) |
+| `/agents` | ลิสต์ side-channel agent ที่กำลังทำงาน (id, name, elapsed) |
+| `/agent cancel ID` | ยกเลิก side-channel agent ที่กำลังรัน |
+| `/dream [FOCUS]` | Dispatch built-in dream agent เพื่อ consolidate KMS (GUI-only) — ดู [บทที่ 9](ch09-knowledge-bases-kms.md) |
 | `/team` | เข้าร่วม tmux session ของทีม (หรือแสดงสถานะทีม) |
 | `/doctor` | รันการตรวจสอบวินิจฉัย |
 | `/usage` | แสดงการใช้ token แยกตาม provider และ model |

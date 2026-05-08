@@ -67,6 +67,12 @@ pub struct ProductionAgentFactory {
     pub system: String,
     pub max_iterations: usize,
     pub max_depth: usize,
+    /// Per-request output token budget propagated from `AppConfig::max_tokens`.
+    /// Subagents inherit the parent's value so a project's `settings.json`
+    /// `maxTokens` override applies uniformly. Issue #72: pre-fix subagents
+    /// hit the hardcoded `Agent::new` default of 8192 even when the parent
+    /// was correctly configured.
+    pub max_tokens: u32,
     pub agent_defs: AgentDefsConfig,
     pub approver: Arc<dyn ApprovalSink>,
     pub permission_mode: PermissionMode,
@@ -151,6 +157,7 @@ impl AgentFactory for ProductionAgentFactory {
                 system: self.system.clone(),
                 max_iterations: self.max_iterations,
                 max_depth: self.max_depth,
+                max_tokens: self.max_tokens,
                 agent_defs: self.agent_defs.clone(),
                 approver: self.approver.clone(),
                 permission_mode: self.permission_mode,
@@ -171,6 +178,7 @@ impl AgentFactory for ProductionAgentFactory {
         // so retry-backoff sleeps + collect_agent_turn observe ctrl-C.
         let mut agent = Agent::new(self.provider.clone(), tools, model, &system)
             .with_max_iterations(max_iter)
+            .with_max_tokens(self.max_tokens)
             .with_approver(self.approver.clone())
             .with_permission_mode(self.permission_mode);
         if let Some(c) = self.cancel.clone() {
@@ -479,6 +487,7 @@ mod tests {
             system: String::new(),
             max_iterations: 1,
             max_depth: 3,
+            max_tokens: 8192,
             agent_defs: AgentDefsConfig::default(),
             approver: Arc::new(crate::permissions::DenyApprover),
             permission_mode: PermissionMode::Auto,
@@ -512,6 +521,7 @@ mod tests {
             system: String::new(),
             max_iterations: 1,
             max_depth: 3,
+            max_tokens: 8192,
             agent_defs: AgentDefsConfig::default(),
             approver: Arc::new(crate::permissions::DenyApprover),
             permission_mode: PermissionMode::Auto,

@@ -139,6 +139,28 @@ pub fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
             });
             vec![payload.to_string()]
         }
+        ViewEvent::TodoUpdate(todos) => {
+            // TodoSidebar consumes this to render the live checklist.
+            // Empty `todos` is meaningful (collapses the sidebar to a
+            // chevron tab); the frontend distinguishes "no todos yet"
+            // from "todos cleared explicitly" by tracking whether any
+            // update has been received.
+            let payload = serde_json::json!({
+                "type": "chat_todo_update",
+                "todos": todos,
+            });
+            vec![payload.to_string()]
+        }
+        ViewEvent::SkillModelNote(text) => {
+            // ChatView renders this inline as a muted system note so
+            // the user sees model-swap decisions in context without
+            // a popup or sidebar.
+            let payload = serde_json::json!({
+                "type": "chat_skill_model_note",
+                "text": text,
+            });
+            vec![payload.to_string()]
+        }
         ViewEvent::GoalUpdate(goal) => {
             // Phase A: sidebar refresh whenever /goal mutates. Goal is
             // serialized as the full GoalState shape — frontend reads
@@ -420,6 +442,8 @@ pub fn render_terminal_ansi(state: &mut TerminalRenderState, ev: &ViewEvent) -> 
         ViewEvent::McpAppCallToolResult { .. } => None,
         ViewEvent::QuitRequested => None,
         ViewEvent::PlanUpdate(_) => None,
+        ViewEvent::TodoUpdate(_) => None,
+        ViewEvent::SkillModelNote(text) => Some(format!("\r\n\x1b[2;3m{text}\x1b[0m\r\n")),
         ViewEvent::GoalUpdate(_) => None,
         ViewEvent::PermissionModeChanged(_) => None,
         ViewEvent::PlanStalled { .. } => None,

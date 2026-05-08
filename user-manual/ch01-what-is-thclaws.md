@@ -9,7 +9,7 @@ one binary. You tell it what you want in natural language; it reads
 your files, runs commands, uses tools, and talks back to you while it
 works.
 
-Three interfaces ship as one binary:
+Four surfaces ship as one binary, sharing a single `Agent` loop, `Session`, and tool registry:
 
 - **Desktop GUI** (`thclaws` with no flags) — a native window with a
   Terminal tab running the same interactive REPL as `--cli` mode, a
@@ -18,15 +18,24 @@ Three interfaces ship as one binary:
   SSH sessions, headless servers, or when you want zero GUI overhead.
 - **Non-interactive mode** (`thclaws -p "prompt"`, long form `--print`)
   — runs a single turn and exits. Handy for scripts, CI pipelines, and
-  shell one-liners.
+  shell one-liners. Add `-v` / `--verbose` to see per-turn token usage
+  on stderr without polluting stdout.
+- **Webapp** (`thclaws --serve --port 7878`) — same engine over
+  WebSocket/HTTP, served from your laptop. Reach it remotely via SSH
+  tunnel for "thClaws anywhere" without opening a port.
 
 ## What makes it different
 
-- **Multi-provider.** Anthropic, OpenAI, Gemini, Alibaba DashScope, OpenRouter, Ollama (local
-  and Anthropic-compatible), and Agentic Press, 
-  auto-detected by model name prefix. Switch models mid-session with
-  `/model` (validated against the provider's catalogue) or swap the
-  whole provider with `/provider`.
+- **Multi-provider.** Anthropic (native + Claude Agent SDK via Claude
+  Code auth), OpenAI (Chat Completions + Responses/Codex), Google
+  Gemini & Gemma, Alibaba DashScope (Qwen), DeepSeek, Z.ai (GLM Coding
+  Plan), NVIDIA NIM, NSTDA Thai LLM (OpenThaiGPT, Typhoon, Pathumma,
+  THaLLE), OpenRouter, Agentic Press, Azure AI Foundry, Ollama (local,
+  local Anthropic-compatible, and Ollama Cloud), LMStudio, plus a
+  generic **OpenAI-compatible** slot (`oai/*`) for LiteLLM / Portkey /
+  Helicone / vLLM / internal proxies — auto-detected by model name
+  prefix. Switch models mid-session with `/model` (validated against
+  the provider's catalogue) or swap the whole provider with `/provider`.
 - **Any knowledge worker, not just engineers.** The Chat tab is a
   streaming conversation panel anyone can drive — researchers,
   analysts, PMs, ops, legal, marketing, finance. Ask in natural
@@ -86,31 +95,79 @@ Three interfaces ship as one binary:
   can search and read on demand. Drop markdown pages under
   `.thclaws/kms/<name>/pages/`, give each a one-line entry in
   `index.md`, tick the box in the sidebar, and the agent gets a
-  table of contents every turn plus `KmsRead` / `KmsSearch` tools to
-  pull in specific pages. No embeddings — grep + read, following
-  Andrej Karpathy's LLM-wiki pattern.
-- **Agent orchestration.** Two levels. For narrow subtasks, delegate
-  to an isolated sub-agent via the `Task` tool — each gets its own
-  tool registry and can recurse up to 3 levels deep. For real
-  parallelism, spin up an **Agent Team**: multiple thClaws processes
-  coordinating through a shared mailbox and task queue, each
-  teammate in its own tmux pane and optional git worktree so
-  backend + frontend work doesn't collide. The lead calls
-  `TeamMerge` when everyone's done.
+  table of contents every turn plus a full mutation surface
+  (`KmsRead` / `KmsSearch` / `KmsWrite` / `KmsAppend` / `KmsDelete`)
+  for active wiki maintenance. No embeddings — grep + read, following
+  Andrej Karpathy's LLM-wiki pattern. Run `/dream` and a built-in
+  side-channel agent mines the 10 most recent sessions, dedupes pages,
+  surfaces new insights, and writes a dated audit-trail page — review
+  with `git diff`.
+- **Three tiers of agent orchestration.**
+  - **`Task` tool** — model-driven subagents that block the parent's
+    turn. Each gets its own tool registry, recurses up to 3 levels
+    deep. Right when the parent's reasoning should decide whether and
+    when to delegate.
+  - **`/agent <name> <prompt>`** — user-driven concurrent
+    side-channels. Spawned on a fresh tokio task, runs in parallel with
+    main, never enters main's history, has its own cancel token. Right
+    when *you* know exactly what you want a specialist to do
+    (`/agent translator แปลไฟล์ x` while you keep coding).
+  - **Agent Teams** — multiple thClaws processes coordinating through
+    a shared mailbox and task queue, each teammate in its own tmux
+    pane and optional git worktree. One agent writes your backend
+    while a teammate builds the frontend in parallel; lead calls
+    `TeamMerge` when both are done.
+- **Plan mode.** For multi-step work, the agent can `EnterPlanMode`,
+  propose an ordered list of steps, and let *you* review and approve
+  before execution. Each step runs sequentially with its own retry
+  budget; failures stop the chain so you can decide. Same UX in GUI
+  (sidebar with Approve / Cancel / Skip / Retry per step) and REPL
+  (`/plan` slash command).
+- **Schedule recurring jobs.** `/schedule add` runs an agent on cron
+  (`0 9 * * MON-FRI`), at fixed intervals, or whenever a watched
+  directory changes (`watchWorkspace`). Three composable layers:
+  manual `/schedule run`, in-process scheduler (lives as long as your
+  REPL), and a native daemon (`launchd` on macOS / `systemd-user` on
+  Linux) that survives reboots. Per-job working directory, optional
+  model override, full output capture.
+- **Long-running loops & overnight builds.** `/loop` for
+  fixed-interval iteration. `/goal` for audit-driven completion (the
+  agent works toward a goal until an audit prompt confirms "done" or
+  hits the budget). Compose them: `/goal --auto` is a Ralph-style
+  overnight builder that keeps going until the goal is satisfied or
+  you wake up.
+- **Document workflow.** Native PDF, DOCX, PPTX, XLSX read + edit +
+  create tools, plus image rendering. The agent can ingest a 50-page
+  PDF, summarize it into KMS, and produce a follow-up PowerPoint deck
+  — all in one conversation, no separate file-conversion step.
+- **Hooks.** Run shell scripts on agent lifecycle events:
+  `pre_tool_use`, `post_tool_use`, `permission_denied`, `session_start`,
+  `pre_compact`, etc. Audit every Bash invocation, gate `Edit`/`Write`
+  through your linter, fire a Slack notification when long sessions
+  end. Eight events × per-event environment variables × timeout-with-
+  SIGKILL guarantees.
 - **Settings.** Every runtime knob — permission mode, thinking budget,
-  allowed/disallowed tools, provider endpoints, KMS attachments — is
-  one JSON file: `.thclaws/settings.json` (project, commit it with
-  the repo) or `~/.config/thclaws/settings.json` (user-global).
+  allowed/disallowed tools, provider endpoints, KMS attachments,
+  max output tokens — is one JSON file: `.thclaws/settings.json`
+  (project, commit it with the repo) or
+  `~/.config/thclaws/settings.json` (user-global).
   `~/.claude/settings.json` is read as a fallback location. API
   keys go in the OS keychain by default (Windows Credential Manager
   / macOS Keychain / Linux Secret Service) with `.env` fallback for
   CI and headless servers. The gear icon in the desktop GUI is a
   visual editor for keys, global/folder `AGENTS.md`, and the secrets
   backend choice.
+- **Session resume.** `thclaws --resume last` picks up where you left
+  off; `thclaws --resume <id>` jumps to a specific session. Sessions
+  live as JSONL under `.thclaws/sessions/` — git-friendly,
+  grep-friendly, never opaque.
 - **Safety first.** A filesystem sandbox scopes file tools to the
   working directory. Destructive shell commands are flagged before
   execution. You approve every mutating tool call unless you've opted
-  into auto-approve.
+  into auto-approve. Permission requests label which agent is asking
+  when multiple are running concurrently (main vs. side-channel vs.
+  subagent), so you don't approve a translator's `Bash` thinking it's
+  main's.
 - **Offline-capable.** Ollama (native and Anthropic-compat) lets you run
   entirely against a local model.
 - **Deploy what you build.** thClaws doesn't stop at authoring —
@@ -129,9 +186,10 @@ Three interfaces ship as one binary:
 
 - A supported OS: macOS (arm64 or x86_64), Linux (arm64 or x86_64), or
   Windows (arm64 or x86_64).
-- At least one LLM API key — Anthropic, OpenAI, Gemini, Agentic Press,
-  OpenRouter, or DashScope. (Or a local Ollama install if you'd rather
-  stay offline.)
+- At least one LLM API key — Anthropic, OpenAI, Gemini, OpenRouter,
+  Agentic Press, DashScope, DeepSeek, Z.ai, NVIDIA NIM, NSTDA Thai LLM,
+  or Azure AI Foundry. (Or a local Ollama / LMStudio install if you'd
+  rather stay offline.)
 
 [Chapter 2](ch02-installation.md) walks through installation and first
 launch. [Chapter 6](ch06-providers-models-api-keys.md) covers where
@@ -139,13 +197,17 @@ and how to paste keys.
 
 ## How this manual is organised
 
-**Part I** (chapters 2–14) is reference material: how to install it,
+**Part I** (chapters 2–19) is reference material: how to install it,
 and then every user-facing feature explained once with the commands
-and configuration you need.
+and configuration you need — sessions, memory, KMS, tools, skills,
+hooks, MCP, subagents, plugins, teams, plan mode, and scheduling.
 
-**Part II** (chapters 15–21) is walkthroughs: real projects from
-scratch — a static landing page, a reservation site, a news agent —
-ending in deployments to Agentic Press Hosting. Each is independent.
+**Part II** — walkthroughs of real projects from scratch (static
+landing page, reservation site, news-aggregation agent, ending with
+deploys to Agentic Press Hosting) — is planned for a future revision.
 
 If you're new, read chapter 2 next. If you're migrating from Claude
-Code, skip to chapters 6, 7, 11, and 13.
+Code, skip to chapters 6, 7, 11, and 13. If you're already familiar
+with the basics and want what's new, the recent additions live in
+chapter 9 (`/dream`), chapter 15 (`/agent` side-channels), chapter 18
+(plan mode), and chapter 19 (scheduling).

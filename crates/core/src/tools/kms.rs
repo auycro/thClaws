@@ -248,6 +248,53 @@ impl Tool for KmsAppendTool {
     }
 }
 
+/// Delete a single page from a KMS. Removes the file, strips its
+/// bullet from `index.md`, and appends a `deleted | <stem>` log line.
+/// Used during consolidation (`/dream`) to retire duplicates or stale
+/// entries — gated on approval since it's destructive.
+pub struct KmsDeleteTool;
+
+#[async_trait]
+impl Tool for KmsDeleteTool {
+    fn name(&self) -> &'static str {
+        "KmsDelete"
+    }
+
+    fn description(&self) -> &'static str {
+        "Delete a single page from an attached knowledge base. \
+         Removes the file, prunes the index.md bullet, and logs the \
+         removal. Use during consolidation to retire duplicates or \
+         stale entries — never as a casual cleanup."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "kms":  {"type": "string", "description": "KMS name (from the active list)"},
+                "page": {"type": "string", "description": "Page name (with or without .md). No path separators."}
+            },
+            "required": ["kms", "page"]
+        })
+    }
+
+    fn requires_approval(&self, _input: &Value) -> bool {
+        true
+    }
+
+    async fn call(&self, input: Value) -> Result<String> {
+        let kms_name = req_str(&input, "kms")?;
+        let page = req_str(&input, "page")?;
+        let Some(kref) = crate::kms::resolve(kms_name) else {
+            return Err(Error::Tool(format!(
+                "no KMS named '{kms_name}' (check /kms list)"
+            )));
+        };
+        let path = crate::kms::delete_page(&kref, page)?;
+        Ok(format!("deleted {}", path.display()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,5 +478,61 @@ mod tests {
         // require approval (they mutate disk) — same posture as Write.
         assert!(KmsWriteTool.requires_approval(&json!({})));
         assert!(KmsAppendTool.requires_approval(&json!({})));
+        assert!(KmsDeleteTool.requires_approval(&json!({})));
+    }
+
+    #[tokio::test]
+    async fn delete_removes_page_and_index_bullet() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        KmsWriteTool
+            .call(json!({
+                "kms": "nb",
+                "page": "doomed",
+                "content": "to be deleted\n"
+            }))
+            .await
+            .unwrap();
+        let page_path = k.pages_dir().join("doomed.md");
+        assert!(page_path.exists());
+        let index_before = std::fs::read_to_string(k.index_path()).unwrap();
+        assert!(index_before.contains("(pages/doomed.md)"));
+        let out = KmsDeleteTool
+            .call(json!({"kms": "nb", "page": "doomed"}))
+            .await
+            .unwrap();
+        assert!(out.starts_with("deleted"));
+        assert!(!page_path.exists());
+        let index_after = std::fs::read_to_string(k.index_path()).unwrap();
+        assert!(!index_after.contains("(pages/doomed.md)"));
+        let log = std::fs::read_to_string(k.log_path()).unwrap();
+        assert!(log.contains("deleted | doomed"));
+    }
+
+    #[tokio::test]
+    async fn delete_missing_page_errors() {
+        let _home = scoped_home();
+        let _ = create("nb", KmsScope::Project).unwrap();
+        let err = KmsDeleteTool
+            .call(json!({"kms": "nb", "page": "ghost"}))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn delete_rejects_reserved_names() {
+        let _home = scoped_home();
+        let _ = create("nb", KmsScope::Project).unwrap();
+        // Same path-safety carve-out: index/log/SCHEMA cannot be deleted
+        // through the tool.
+        assert!(KmsDeleteTool
+            .call(json!({"kms": "nb", "page": "index"}))
+            .await
+            .is_err());
+        assert!(KmsDeleteTool
+            .call(json!({"kms": "nb", "page": "log"}))
+            .await
+            .is_err());
     }
 }

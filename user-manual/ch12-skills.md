@@ -200,10 +200,56 @@ Frontmatter fields:
 | `name` | yes | Unique skill id (matches the filename by default) |
 | `description` | recommended | Short one-liner shown in `/skills` |
 | `whenToUse` | recommended | Trigger hint the model uses to decide on invocation |
+| `model` | optional | Recommended default model — applied automatically when the user has the relevant API key. Single string or array; see below |
 
 `{skill_dir}` in the body is substituted with the absolute path to the
 skill directory at load time, so script paths always resolve regardless
 of where the user launched thClaws.
+
+### `model:` — recommend a default
+
+Some skills assume capabilities not every model has — vision (read a
+namecard photo, parse a receipt image), long context (summarise a 200-
+page PDF), structured output (XLSX cell formulas). Adding a `model:`
+field lets the skill author encode the recommendation so non-expert
+users get a known-good default automatically.
+
+Single recommendation:
+
+```yaml
+---
+name: namecard-to-excel
+description: Extract namecard info from a photo into Excel
+whenToUse: When user shares a namecard photo to add to contacts
+model: claude-sonnet-4-6
+---
+```
+
+Priority list (first one the user has a key for wins):
+
+```yaml
+---
+model: [claude-sonnet-4-6, gpt-4o, gemini-2.5-pro]
+---
+```
+
+Behavior when the skill is invoked:
+
+- **User has a key for the recommended model** — silent auto-switch
+  for the duration of the turn. Chat shows
+  `[model → claude-sonnet-4-6 (skill recommendation, reverts at end of turn)]`
+  when the swap takes effect, and `[model → <baseline> (skill ended)]`
+  when the turn finishes. The user's previously-active model is
+  restored automatically.
+- **User has no key for any candidate** — chat shows
+  `[skill recommends claude-sonnet-4-6; you don't have a key for that
+  provider — using current model]` and the skill proceeds with the
+  current model. Add a key in Settings if results look poor.
+
+The override is **per-turn only** — `/model` switches the user makes
+explicitly are unaffected, and the next user prompt starts from the
+baseline again. This keeps the swap unobtrusive: it helps the skill
+without taking over the session.
 
 ## Writing your own skill
 

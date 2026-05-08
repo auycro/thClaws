@@ -1,6 +1,6 @@
 [package]
 name = "thclaws-core"
-version = "0.8.3"
+version = "0.8.4"
 edition = "2021"
 description = "thClaws — native Rust AI agent workspace with CLI and desktop GUI."
 license = "MIT OR Apache-2.0"
@@ -41,7 +41,7 @@ arboard = "3"
 # Thai TTFs (resources/fonts/) ship Thai-native glyphs without a system-font
 # dependency. printpdf 0.7's font API takes any `Read` — we feed `&[u8]`
 # from `include_bytes!`.
-printpdf = "0.7"
+printpdf = { version = "0.7", features = ["embedded_images"] }
 # Markdown parser used by PdfCreate to walk paragraphs, headings, lists,
 # emphasis, and code blocks before laying them out in the PDF. No HTML
 # features needed — we render directly to printpdf primitives.
@@ -111,6 +111,19 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 # mismatch that two notify majors in the dep tree would cause.
 notify-debouncer-mini = "0.4"
 
+# Promoted from dev-dependencies for runtime use by `PdfRead` (renders
+# scanned-PDF pages to PNG in a tempdir for the vision-OCR fallback)
+# and any future tool that needs a sandboxed scratch directory.
+tempfile = "3"
+
+# `PdfCreate` decodes user-supplied images (PNG/JPEG/etc.) to a
+# `DynamicImage` before embedding into the PDF via printpdf's
+# `Image::from_dynamic_image`. Pin to printpdf's transitive image
+# version (0.24) so DynamicImage is the same struct on both sides —
+# 0.25 produces a different `image::DynamicImage` type that printpdf
+# rejects.
+image = "0.24"
+
 [features]
 default = []
 gui = ["dep:tao", "dep:wry", "dep:comrak", "dep:rfd", "dep:native-dialog"]
@@ -138,7 +151,6 @@ name = "thclaws-policy-tool"
 path = "src/bin/policy_tool.rs"
 
 [dev-dependencies]
-tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 wiremock = "0.6"
 # M6.36 SERVE7: WS client for the --serve integration test. Spins up

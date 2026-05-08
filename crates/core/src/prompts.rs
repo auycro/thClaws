@@ -184,7 +184,8 @@ mod tests {
             "anti-reflex guidance missing — model must not auto-enter plan mode on every \"plan\" mention",
         );
         assert!(
-            s.contains("Small job") && s.contains("TodoWrite"),
+            (s.contains("Small job") || s.contains("Small or medium job"))
+                && s.contains("TodoWrite"),
             "small-job → TodoWrite branch missing",
         );
         assert!(

@@ -54,8 +54,8 @@ struct Cli {
     #[arg(long)]
     system_prompt: Option<String>,
 
-    /// Show verbose output (token counts, timing)
-    #[arg(long)]
+    /// Show per-turn token usage + timing on stderr (only takes effect with -p / --print)
+    #[arg(long, short = 'v')]
     verbose: bool,
 
     /// Resume a previous session by ID (or "last" for most recent)
@@ -392,7 +392,7 @@ async fn main() {
             eprintln!("\x1b[31m--print requires a prompt argument\x1b[0m");
             std::process::exit(1);
         }
-        if let Err(e) = run_print_mode(config, &prompt).await {
+        if let Err(e) = run_print_mode(config, &prompt, cli.verbose).await {
             eprintln!("\n\x1b[31merror: {e}\x1b[0m");
             std::process::exit(1);
         }

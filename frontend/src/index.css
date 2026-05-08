@@ -43,6 +43,16 @@
 
 * { box-sizing: border-box; }
 
+/* Default <button> elements to a pointer cursor — without this,
+   wry on macOS shows the regular text/arrow cursor, leaving users
+   unsure whether something is clickable (especially inside modals
+   where the affordance matters most). Inline `cursor: ...` styles
+   on individual buttons (e.g. ModelPickerModal, SettingsModal)
+   still win via specificity. Disabled buttons get `not-allowed`
+   so the visual + interactive states stay in sync. */
+button:not(:disabled) { cursor: pointer; }
+button:disabled { cursor: not-allowed; }
+
 html, body, #root {
   margin: 0;
   padding: 0;

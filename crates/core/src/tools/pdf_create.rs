@@ -14,9 +14,10 @@ use super::{req_str, Tool};
 use crate::error::{Error, Result};
 use async_trait::async_trait;
 use printpdf::{
-    IndirectFontRef, Mm, PdfDocument, PdfDocumentReference, PdfLayerIndex, PdfPageIndex,
+    Image, ImageTransform, IndirectFontRef, Mm, PdfDocument, PdfDocumentReference, PdfLayerIndex,
+    PdfPageIndex, Px,
 };
-use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use serde_json::{json, Value};
 use std::io::BufWriter;
 use std::path::Path;
@@ -42,7 +43,11 @@ impl Tool for PdfCreateTool {
         "Render a markdown string to a PDF file. Embedded Noto Sans + Noto \
          Sans Thai fonts so Thai text renders without a system-font \
          dependency. Supports headings (H1–H4), paragraphs, bullet lists, \
-         and fenced code blocks. Page size A4 (default), Letter, or Legal."
+         fenced code blocks, **GFM pipe tables** (rendered as plain-text \
+         rows joined by ` | ` for v1 — no borders; for richer table \
+         formatting use DocxCreate), and **inline images** via \
+         `![alt](path)` (PNG/JPEG, capped at 5 MB; auto-scaled to fit \
+         page width). Page size A4 (default), Letter, or Legal."
     }
 
     fn input_schema(&self) -> Value {
@@ -291,15 +296,77 @@ impl PdfRenderer {
     fn vertical_gap(&mut self, mm: f32) {
         self.cursor_y_mm += mm;
     }
+
+    /// Embed a `DynamicImage` at the current cursor. Scales to fit
+    /// the printable width (page width minus 2× margin) while
+    /// preserving aspect ratio. If the resulting image is taller than
+    /// the available space on the current page, it triggers a new
+    /// page first. Cursor advances by the rendered height.
+    fn render_image(&mut self, dyn_img: &image::DynamicImage) {
+        const MAX_W_MM: f32 = 170.0; // ≈ A4 minus 20mm margins
+        let printable_w_mm = (self.page_w_mm - 2.0 * MARGIN_MM).min(MAX_W_MM);
+
+        let img_w_px = dyn_img.width() as f32;
+        let img_h_px = dyn_img.height() as f32;
+        if img_w_px == 0.0 || img_h_px == 0.0 {
+            return;
+        }
+        // 96 DPI → 1 px = 0.2646 mm. Scale to fit printable width
+        // when the source is wider; preserve aspect ratio.
+        let natural_w_mm = img_w_px * 0.2646;
+        let natural_h_mm = img_h_px * 0.2646;
+        let (target_w_mm, target_h_mm) = if natural_w_mm > printable_w_mm {
+            let scale = printable_w_mm / natural_w_mm;
+            (printable_w_mm, natural_h_mm * scale)
+        } else {
+            (natural_w_mm, natural_h_mm)
+        };
+        // Page-break before placement if it doesn't fit.
+        self.ensure_room(target_h_mm + PARAGRAPH_GAP_MM);
+
+        let image = Image::from_dynamic_image(dyn_img);
+        let layer = self
+            .doc
+            .get_page(self.current_page)
+            .get_layer(self.current_layer);
+        // printpdf's ImageTransform places the IMAGE'S BOTTOM-LEFT at
+        // the given coordinates. We want the image's TOP-LEFT at
+        // (MARGIN_MM, cursor_y_mm-from-top). Convert.
+        let baseline_from_bottom_mm = self.page_h_mm - self.cursor_y_mm - target_h_mm;
+        let scale_x = target_w_mm / natural_w_mm;
+        let scale_y = target_h_mm / natural_h_mm;
+        image.add_to_layer(
+            layer,
+            ImageTransform {
+                translate_x: Some(Mm(MARGIN_MM)),
+                translate_y: Some(Mm(baseline_from_bottom_mm)),
+                scale_x: Some(scale_x),
+                scale_y: Some(scale_y),
+                ..Default::default()
+            },
+        );
+        self.cursor_y_mm += target_h_mm + PARAGRAPH_GAP_MM;
+        // Px import keeps printpdf happy if we extend later — silence unused.
+        let _ = Px(0);
+    }
 }
 
 fn render_markdown(r: &mut PdfRenderer, content: &str) {
-    let parser = Parser::new(content);
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_TABLES);
+    let parser = Parser::new_ext(content, opts);
 
     let mut buf = String::new();
     let mut current_pt = r.body_pt;
     let mut indent_mm = 0.0_f32;
     let mut code_block = false;
+    // Table assembly state (basic v1: render each row as a single
+    // line of " | "-joined cells; no grid borders). Mirror of the
+    // DocxCreate state machine.
+    let mut in_table = false;
+    let mut current_cell = String::new();
+    let mut current_row: Vec<String> = Vec::new();
+    let mut accumulated_rows: Vec<Vec<String>> = Vec::new();
 
     let flush = |r: &mut PdfRenderer, buf: &mut String, pt: f32, indent_mm: f32| {
         if buf.is_empty() {
@@ -360,7 +427,9 @@ fn render_markdown(r: &mut PdfRenderer, content: &str) {
                 r.vertical_gap(PARAGRAPH_GAP_MM);
             }
             Event::Text(s) => {
-                if code_block {
+                if in_table {
+                    current_cell.push_str(&s);
+                } else if code_block {
                     // Code blocks: render each newline as its own line so
                     // formatting is preserved (no greedy wrap inside code).
                     for line in s.split('\n') {
@@ -376,6 +445,54 @@ fn render_markdown(r: &mut PdfRenderer, content: &str) {
             Event::SoftBreak => buf.push(' '),
             Event::HardBreak => {
                 flush(r, &mut buf, current_pt, indent_mm);
+            }
+            // Tables (v1: " | "-joined plain-text rows; no borders).
+            Event::Start(Tag::Table(_)) => {
+                flush(r, &mut buf, current_pt, indent_mm);
+                in_table = true;
+                accumulated_rows.clear();
+            }
+            Event::Start(Tag::TableHead) | Event::Start(Tag::TableRow) => {
+                current_row.clear();
+            }
+            Event::Start(Tag::TableCell) => {
+                current_cell.clear();
+            }
+            Event::End(TagEnd::TableCell) => {
+                current_row.push(std::mem::take(&mut current_cell));
+            }
+            Event::End(TagEnd::TableRow) | Event::End(TagEnd::TableHead) => {
+                accumulated_rows.push(std::mem::take(&mut current_row));
+            }
+            Event::End(TagEnd::Table) => {
+                in_table = false;
+                for row in &accumulated_rows {
+                    let line = row.join(" | ");
+                    r.wrap_and_render(&line, current_pt, indent_mm);
+                }
+                accumulated_rows.clear();
+                r.vertical_gap(PARAGRAPH_GAP_MM);
+            }
+            // Inline image: `![alt](path)`. Read the file, decode via
+            // the `image` crate, embed via printpdf at full printable
+            // width (scaled-down if the source is wider than the
+            // page). Paragraph-level placement; users who want
+            // text-flow around an image can compose with markdown
+            // in DocxCreate which handles inline placement properly.
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                flush(r, &mut buf, current_pt, indent_mm);
+                if let Ok(path) = crate::sandbox::Sandbox::check(&*dest_url) {
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        if !bytes.is_empty() && bytes.len() <= 5 * 1024 * 1024 {
+                            if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+                                r.render_image(&dyn_img);
+                            }
+                        }
+                    }
+                }
+            }
+            Event::End(TagEnd::Image) => {
+                buf.clear();
             }
             _ => {}
         }
@@ -464,6 +581,39 @@ mod tests {
             .await
             .unwrap();
         assert!(std::fs::metadata(&thai).unwrap().len() > 1000);
+    }
+
+    /// Pipe-table renders to PDF (basic v1: " | "-joined rows; no
+    /// borders). Re-read via PdfRead and assert each header / cell
+    /// text is in the extracted body.
+    #[tokio::test]
+    async fn writes_pdf_with_pipe_table() {
+        if !std::process::Command::new("pdftotext")
+            .arg("-v")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            eprintln!("skipping: pdftotext not in PATH");
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let pdf = dir.path().join("table.pdf");
+        PdfCreateTool
+            .call(json!({
+                "path": pdf.to_string_lossy(),
+                "content": "# Expense\n\n| Item | Qty | Price |\n|---|---|---|\n| Coffee | 2 | $7 |\n"
+            }))
+            .await
+            .unwrap();
+        let extracted = crate::tools::PdfReadTool
+            .call(json!({"path": pdf.to_string_lossy()}))
+            .await
+            .unwrap();
+        assert!(extracted.contains("Item"), "header missing: {extracted}");
+        assert!(extracted.contains("Coffee"), "row missing: {extracted}");
     }
 
     #[test]

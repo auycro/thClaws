@@ -211,6 +211,22 @@ impl ProviderKind {
         }
     }
 
+    /// True when the user has a usable API key for this provider —
+    /// either via the OS keychain (`secrets::get`) or the relevant
+    /// env var (set directly or loaded from `.env`). Providers with
+    /// no auth requirement (Ollama, LMStudio, AgentSdk) always
+    /// return true. Used by the skill-recommended-model resolver to
+    /// pick the first candidate the user can actually call.
+    pub fn has_key_available(&self) -> bool {
+        let Some(env_var) = self.api_key_env() else {
+            return true; // No auth required (local runtimes, AgentSdk).
+        };
+        if std::env::var(env_var).is_ok_and(|v| !v.is_empty()) {
+            return true;
+        }
+        crate::secrets::get(self.name()).is_some_and(|v| !v.is_empty())
+    }
+
     /// Env var holding the API key, if any. Ollama has no auth.
     pub fn api_key_env(&self) -> Option<&'static str> {
         match self {

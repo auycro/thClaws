@@ -434,6 +434,15 @@ pub enum SlashCommand {
     /// side channel. The agent's `cancelled().await` wakes and the
     /// spawn task emits `SideChannelError { error: "cancelled" }`.
     AgentCancel(String),
+    /// `/dream [focus]` — dispatch the built-in `dream` agent as a
+    /// side channel to consolidate the project's KMS by mining recent
+    /// sessions. `focus` is optional free-text passed as the user
+    /// message (e.g. `/dream auth`); empty falls back to a default
+    /// "consolidate everything" prompt. GUI-only — REPL prints a
+    /// hint pointing at the desktop tab.
+    Dream {
+        focus: String,
+    },
     Unknown(String),
 }
 
@@ -944,6 +953,9 @@ pub fn parse_slash(input: &str) -> Option<SlashCommand> {
         "schedule" | "sched" => parse_schedule_subcommand(args),
         "agent" => parse_agent_subcommand(args),
         "agents" => SlashCommand::AgentsList,
+        "dream" => SlashCommand::Dream {
+            focus: args.to_string(),
+        },
         _ => SlashCommand::Unknown(cmd.to_string()),
     })
 }
@@ -2066,7 +2078,10 @@ pub fn render_help() -> &'static str {
      \x20                   Runs concurrently with main, doesn't touch\n  \
      \x20                   main's history. Result lands as a side bubble.\n  \
      /agents              List active background agents (id, name, elapsed)\n  \
-     /agent cancel ID     Cancel a running background agent by id\n\n  \
+     /agent cancel ID     Cancel a running background agent by id\n  \
+     /dream [FOCUS]       Consolidate KMS by mining recent sessions (GUI-only)\n  \
+     \x20                   Built-in side-channel agent. Optional FOCUS biases\n  \
+     \x20                   the consolidation toward a topic (e.g. /dream auth).\n\n  \
      ! <command>       Run a shell command directly (e.g. ! git status)"
 }
 
@@ -2479,7 +2494,7 @@ async fn load_mcp_servers(
 
 /// Non-interactive mode: run a single prompt and print the result to stdout.
 /// Matches the Python `--print` flag behavior.
-pub async fn run_print_mode(config: AppConfig, prompt: &str) -> Result<()> {
+pub async fn run_print_mode(config: AppConfig, prompt: &str, verbose: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let ctx = ProjectContext::discover(&cwd)?;
     let memory_store = MemoryStore::default_path().map(MemoryStore::new);
@@ -2509,6 +2524,7 @@ pub async fn run_print_mode(config: AppConfig, prompt: &str) -> Result<()> {
         // M6.25 BUG #1: write tools alongside read tools.
         tool_registry.register(Arc::new(crate::tools::KmsWriteTool));
         tool_registry.register(Arc::new(crate::tools::KmsAppendTool));
+        tool_registry.register(Arc::new(crate::tools::KmsDeleteTool));
     }
     // M6.26 BUG #1: Memory tools always-on (model can create first entry).
     tool_registry.register(Arc::new(crate::tools::MemoryReadTool));
@@ -2525,8 +2541,10 @@ pub async fn run_print_mode(config: AppConfig, prompt: &str) -> Result<()> {
     };
     let agent = Agent::new(provider, tool_registry, config.model.clone(), system)
         .with_max_iterations(config.max_iterations)
+        .with_max_tokens(config.max_tokens)
         .with_permission_mode(perm_mode);
 
+    let turn_start = std::time::Instant::now();
     let mut stream = Box::pin(agent.run_turn(prompt.to_string()));
     let mut last_was_thinking = false;
     while let Some(ev) = stream.next().await {
@@ -2549,8 +2567,28 @@ pub async fn run_print_mode(config: AppConfig, prompt: &str) -> Result<()> {
                 last_was_thinking = true;
                 let _ = std::io::stdout().flush();
             }
-            Ok(AgentEvent::Done { .. }) => {
+            Ok(AgentEvent::Done { usage, .. }) => {
                 println!();
+                // Issue #69: --verbose surfaces the same per-turn token
+                // line the REPL prints, but to stderr so piped consumers
+                // (`thclaws -p ... | jq`) get clean stdout. Default off
+                // — print mode stays scriptable as before.
+                if verbose {
+                    let cache_info = match (
+                        usage.cache_creation_input_tokens,
+                        usage.cache_read_input_tokens,
+                    ) {
+                        (Some(c), Some(r)) if c > 0 || r > 0 => {
+                            format!(" · cache: +{}w/{}r", c, r)
+                        }
+                        _ => String::new(),
+                    };
+                    let elapsed = format_duration(turn_start.elapsed());
+                    eprintln!(
+                        "[tokens: {}in/{}out{} · {}]",
+                        usage.input_tokens, usage.output_tokens, cache_info, elapsed
+                    );
+                }
             }
             Err(e) => {
                 eprintln!("\nerror: {e}");
@@ -2611,6 +2649,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
         // M6.25 BUG #1: write tools alongside read tools.
         tool_registry.register(Arc::new(crate::tools::KmsWriteTool));
         tool_registry.register(Arc::new(crate::tools::KmsAppendTool));
+        tool_registry.register(Arc::new(crate::tools::KmsDeleteTool));
     }
     // M6.26 BUG #1: Memory tools always-on (model can create first entry).
     tool_registry.register(Arc::new(crate::tools::MemoryReadTool));
@@ -2882,6 +2921,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
             system: system.clone(),
             max_iterations: config.max_iterations,
             max_depth: crate::subagent::DEFAULT_MAX_DEPTH,
+            max_tokens: config.max_tokens,
             agent_defs: agent_defs.clone(),
             approver: approver.clone(),
             permission_mode: perm_mode,
@@ -2932,6 +2972,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
         system.clone(),
     )
     .with_max_iterations(config.max_iterations)
+    .with_max_tokens(config.max_tokens)
     .with_permission_mode(perm_mode)
     .with_approver(approver.clone())
     .with_hooks(hooks_arc.clone());
@@ -3782,6 +3823,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         system.clone(),
                     )
                     .with_max_iterations(config.max_iterations)
+                    .with_max_tokens(config.max_tokens)
                     .with_permission_mode(perm_mode)
                     .with_approver(approver.clone())
                     .with_hooks(std::sync::Arc::new(config.hooks.clone()));
@@ -3858,6 +3900,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         system.clone(),
                     )
                     .with_max_iterations(config.max_iterations)
+                    .with_max_tokens(config.max_tokens)
                     .with_permission_mode(perm_mode)
                     .with_approver(approver.clone())
                     .with_hooks(std::sync::Arc::new(config.hooks.clone()));
@@ -4816,6 +4859,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                                     system.clone(),
                                 )
                                 .with_max_iterations(config.max_iterations)
+                                .with_max_tokens(config.max_tokens)
                                 .with_permission_mode(perm_mode)
                                 .with_approver(approver.clone())
                                 .with_hooks(std::sync::Arc::new(config.hooks.clone()));
@@ -6484,6 +6528,24 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         );
                     }
                 }
+                SlashCommand::Dream { focus } => {
+                    let _ = focus;
+                    #[cfg(feature = "gui")]
+                    {
+                        println!(
+                            "{COLOR_YELLOW}/dream is only available in GUI mode \
+                             (thclaws or thclaws --serve). It dispatches the \
+                             built-in dream agent as a side channel.{COLOR_RESET}"
+                        );
+                    }
+                    #[cfg(not(feature = "gui"))]
+                    {
+                        println!(
+                            "{COLOR_YELLOW}/dream is not available in thclaws-cli \
+                             (rebuild with --features gui or use thclaws --gui).{COLOR_RESET}"
+                        );
+                    }
+                }
                 SlashCommand::Unknown(what) => {
                     println!("{COLOR_YELLOW}unknown command: {what}{COLOR_RESET}");
                 }
@@ -7659,6 +7721,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_slash_dream_with_focus() {
+        assert_eq!(
+            parse_slash("/dream auth"),
+            Some(SlashCommand::Dream {
+                focus: "auth".into(),
+            }),
+        );
+        assert_eq!(
+            parse_slash("/dream consolidate the marketplace KMS"),
+            Some(SlashCommand::Dream {
+                focus: "consolidate the marketplace KMS".into(),
+            }),
+        );
+    }
+
+    #[test]
+    fn parse_slash_dream_bare() {
+        // Bare /dream is valid — the dispatch fills in a default
+        // "consolidate everything" prompt.
+        assert_eq!(
+            parse_slash("/dream"),
+            Some(SlashCommand::Dream {
+                focus: String::new(),
+            }),
+        );
+    }
+
+    #[test]
     fn parse_slash_agent_cancel_no_id_errors() {
         match parse_slash("/agent cancel") {
             Some(SlashCommand::Unknown(msg)) => {
@@ -7957,6 +8047,7 @@ mod tests {
             system: String::new(),
             max_iterations: 1,
             max_depth: 3,
+            max_tokens: 8192,
             agent_defs: crate::agent_defs::AgentDefsConfig::default(),
             approver: approver.clone(),
             permission_mode: PermissionMode::Ask,

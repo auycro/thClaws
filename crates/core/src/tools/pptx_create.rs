@@ -45,7 +45,15 @@ impl Tool for PptxCreateTool {
          `# Heading` starts a new slide (heading is the title); bullet \
          items become bullet body text. Per-run cs typeface set to Noto \
          Sans Thai so Thai content renders without a system-font \
-         dependency on the user's machine."
+         dependency on the user's machine.\n\n\
+         \
+         Native image embedding (`![alt](path)` → `<p:pic>`) is a v2 \
+         enhancement — for now the image source surfaces as a bullet \
+         text placeholder so the caller can see where the image was \
+         intended to go. For decks that need real embedded images, \
+         render to DOCX (full inline-image support) and convert via \
+         the user's slide tool, OR insert images manually in \
+         PowerPoint after generation."
     }
 
     fn input_schema(&self) -> Value {
@@ -160,6 +168,23 @@ fn parse_markdown_slides(content: &str) -> Vec<Slide> {
             Event::SoftBreak => {
                 if in_heading || in_item {
                     text_buf.push(' ');
+                }
+            }
+            // Inline image placeholder. Real `<p:pic>` embedding via
+            // OOXML manipulation is significantly more involved than
+            // DOCX (slide layout / master / rels chain across 4-5 zip
+            // entries per image) and lands in a follow-up. For v1 we
+            // surface the image source as a bullet so the caller sees
+            // where the image was supposed to go and the slide isn't
+            // silently empty.
+            Event::Start(Tag::Image {
+                dest_url, title, ..
+            }) => {
+                if in_heading || in_item {
+                    text_buf.push_str(&format!(
+                        "[image: {} — embed via DocxCreate or PdfCreate; pptx native image support coming]",
+                        if !title.is_empty() { &*title } else { &*dest_url }
+                    ));
                 }
             }
             _ => {}

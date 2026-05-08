@@ -97,6 +97,12 @@ impl AgentDefsConfig {
     pub fn load_with_extra(extra: &[PathBuf]) -> Self {
         let mut config = Self::default();
 
+        // 0. Built-in agent defs compiled into the binary. Seeded first
+        // so every other source (legacy JSON, user/project md dirs)
+        // overrides by name. Surface area is intentionally small —
+        // built-ins ship for first-class operations like `/dream`.
+        config.seed_builtins();
+
         // 1. Legacy JSON config.
         let json_path = Self::default_json_path();
         if json_path.exists() {
@@ -190,17 +196,41 @@ impl AgentDefsConfig {
         }
     }
 
+    /// Seed the config with built-in agent defs compiled into the
+    /// binary. Each entry pairs a fallback name (used if the markdown
+    /// has no `name:` frontmatter) with the embedded source. Built-ins
+    /// land at the lowest priority so any user/project agent def with
+    /// the same name will override them.
+    fn seed_builtins(&mut self) {
+        const BUILTINS: &[(&str, &str)] = &[("dream", include_str!("default_prompts/dream.md"))];
+        for (fallback_name, raw) in BUILTINS {
+            if let Some(agent) = Self::parse_agent_md_str(raw, fallback_name) {
+                self.agents.push(agent);
+            }
+        }
+    }
+
     /// Parse an agent .md file with YAML frontmatter.
     fn parse_agent_md(path: &Path) -> Option<AgentDef> {
         let raw = std::fs::read_to_string(path).ok()?;
-        let (frontmatter, body) = crate::memory::parse_frontmatter(&raw);
+        let fallback = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+        Self::parse_agent_md_str(&raw, fallback)
+    }
 
-        let name = frontmatter.get("name").cloned().unwrap_or_else(|| {
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_string()
-        });
+    /// Parse an agent .md body (frontmatter + instructions) from an
+    /// in-memory string. `fallback_name` is used when the frontmatter
+    /// has no `name:` key — for disk loads this is the file stem; for
+    /// embedded built-ins it's a hard-coded name.
+    fn parse_agent_md_str(raw: &str, fallback_name: &str) -> Option<AgentDef> {
+        let (frontmatter, body) = crate::memory::parse_frontmatter(raw);
+
+        let name = frontmatter
+            .get("name")
+            .cloned()
+            .unwrap_or_else(|| fallback_name.to_string());
 
         let description = frontmatter.get("description").cloned().unwrap_or_default();
         let model = frontmatter.get("model").cloned();
@@ -422,6 +452,46 @@ plugin-only reviewer
             config.get("reviewer").unwrap().instructions,
             "plugin-only reviewer"
         );
+    }
+
+    #[test]
+    fn seed_builtins_includes_dream() {
+        let mut config = AgentDefsConfig::default();
+        config.seed_builtins();
+        let dream = config
+            .get("dream")
+            .expect("built-in dream agent should be seeded");
+        assert_eq!(dream.name, "dream");
+        assert!(!dream.instructions.is_empty());
+        // Tool whitelist must be wired up so the dream agent can mutate
+        // KMS — bare-bones smoke check.
+        assert!(dream.tools.iter().any(|t| t == "KmsDelete"));
+    }
+
+    #[test]
+    fn user_dream_md_overrides_builtin() {
+        let dir = tempdir().unwrap();
+        let mut config = AgentDefsConfig::default();
+        config.seed_builtins();
+        let builtin_instructions = config.get("dream").unwrap().instructions.clone();
+
+        let md_dir = dir.path().join("agents");
+        std::fs::create_dir_all(&md_dir).unwrap();
+        std::fs::write(
+            md_dir.join("dream.md"),
+            "\
+---
+name: dream
+---
+custom user dream prompt
+",
+        )
+        .unwrap();
+
+        config.load_md_dir(&md_dir);
+        let dream = config.get("dream").unwrap();
+        assert_eq!(dream.instructions, "custom user dream prompt");
+        assert_ne!(dream.instructions, builtin_instructions);
     }
 
     #[test]

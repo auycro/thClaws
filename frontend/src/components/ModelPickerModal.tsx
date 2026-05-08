@@ -87,6 +87,13 @@ export function ModelPickerModal({ provider, current, models, onClose }: Props) 
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder={`Search ${models.length} model${models.length === 1 ? "" : "s"}…`}
+            // Disable autocorrect / autocapitalize / spellcheck so model
+            // names like "gpt-4.1-nano" or "claude-sonnet-4-6" aren't
+            // silently rewritten by the browser's IME helpers.
+            autoCorrect="off"
+            autoCapitalize="off"
+            autoComplete="off"
+            spellCheck={false}
             className="w-full px-3 py-2 rounded text-sm outline-none"
             style={{
               background: "var(--bg-tertiary)",

@@ -173,6 +173,70 @@ auth-flow:12:Bearer tokens expire after 15 minutes
 api-conventions:34:Always include "Authorization: Bearer <token>"
 ```
 
+### `KmsWrite`, `KmsAppend`, `KmsDelete`
+
+The mutation surface used by the agent (and by the `/dream` consolidator below). All three require approval by default.
+
+- `KmsWrite(kms, page, content)` — create-or-replace a page. Preserves YAML frontmatter, bumps `updated:`, refreshes the `index.md` bullet, appends a `wrote | <page>` entry to `log.md`.
+- `KmsAppend(kms, page, content)` — extend a page in place. Faster than `KmsWrite` for incremental updates (logs, journal entries, accumulated notes). Bumps `updated:` if the page has frontmatter.
+- `KmsDelete(kms, page)` — remove a page, prune its `index.md` bullet, append `deleted | <page>` to `log.md`. Used during consolidation to retire duplicates or stale entries.
+
+Page names are validated path-segments — no separators, no traversal, and the reserved names `index`, `log`, `SCHEMA` cannot be used as a page name (they're managed by the KMS itself).
+
+## Consolidation: the `/dream` workflow
+
+After a few weeks of work, your KMS accumulates duplicates: two pages on the same topic that drifted apart, an old entry contradicted by something you said yesterday, insights from sessions that never made it into a page. **`/dream`** is the slash command that fixes that — it dispatches a built-in `dream` agent as a side channel (Chapter 15) that consolidates the project's KMS in the background while you keep working.
+
+```
+/dream                 # consolidate everything
+/dream auth            # bias the consolidation toward "auth"
+/agents                # see the active dream + when it started
+/agent cancel <id>     # stop a dream that's wandering
+```
+
+`/dream` is GUI-only (it needs the chat surface to render the side bubble). The dream agent runs concurrently with main, so you can keep prompting your main agent while it works.
+
+### What it does
+
+The dream agent runs four passes:
+
+1. **Survey** — reads the active KMS list (from its system prompt) and the `index.md` of each KMS to enumerate existing pages.
+2. **Read sessions** — `Glob`s the 10 most recently modified files under `.thclaws/sessions/*.jsonl` and reads them. Each session is a JSONL of message events; the agent skims for stable facts the user worked through that aren't already in KMS.
+3. **Consolidate** — for each insight, it `KmsSearch`es the relevant KMS first; if a page covers the topic, it `KmsAppend`s rather than creating a new page. If two pages overlap heavily, it merges via `KmsWrite` and `KmsDelete`s the duplicate.
+4. **Summarize** — writes a `dream-YYYY-MM-DD.md` page in the project KMS listing every change (pages added, updated, deleted, plus skipped insights and reasons). This is your audit trail.
+
+```
+❯ /dream
+✓ dreaming (id: side-9c4f1e)
+
+[dream] surveying 2 active KMS (project-knowledge, scratch)…
+[dream] reading 10 most recent sessions…
+[dream] consolidating project-knowledge:
+[dream]   appended 4 lines to auth-flow.md
+[dream]   merged old-deployment.md into deployment.md, deleted old-deployment.md
+[dream]   added 2 new pages: tracing-conventions.md, kafka-topics.md
+[dream] writing dream-2026-05-07.md…
+[dream] ✓ done in 3m12s. See dream-2026-05-07.md for the change log.
+```
+
+### Reviewing the changes
+
+The dream agent runs with `permission_mode: auto` — it edits and deletes pages without prompting you. **The review step is `git diff`.** If your project KMS lives under git (which it should — `.thclaws/kms/` is just markdown):
+
+```bash
+git diff .thclaws/kms/                        # see what changed
+git checkout -- .thclaws/kms/                 # discard the dream's work
+git add .thclaws/kms/ && git commit -m "..."  # accept it
+```
+
+The `dream-YYYY-MM-DD.md` summary page is the agent's own narration of what it did — read that first, then spot-check the diffs that matter. If the summary says "no new insights" and writes a stub page, that's a valid no-op outcome.
+
+### Customizing
+
+The built-in dream agent is shipped inside the binary (its system prompt + tool whitelist). You can override it project-wide by creating `.thclaws/agents/dream.md` with your own frontmatter and instructions — the disk version always wins over the built-in. Use this if your team has a specific KMS curation policy (e.g. "never delete pages tagged `archive: keep`").
+
+The default agent uses tools `KmsRead, KmsSearch, KmsWrite, KmsAppend, KmsDelete, Read, Glob, Grep, TodoWrite` — no `Bash`, no project-source `Edit`/`Write`, no `Memory*` tools. It can only modify the KMS.
+
 ## Writing pages: the ingest workflow
 
 You don't need a special tool to add content — the agent writes markdown like it writes any other file. A typical ingest turn looks like:

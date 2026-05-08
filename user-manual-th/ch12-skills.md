@@ -199,10 +199,53 @@ If any step fails, abort and report the failing step.
 | `name` | ใช่ | id ของ skill ที่ไม่ซ้ำกัน (ดีฟอลต์จะตรงกับชื่อไฟล์) |
 | `description` | แนะนำ | คำอธิบายสั้นบรรทัดเดียวที่จะแสดงใน `/skills` |
 | `whenToUse` | แนะนำ | คำใบ้ trigger ที่โมเดลใช้ตัดสินใจว่าจะเรียกเมื่อไหร่ |
+| `model` | ตัวเลือก | โมเดล default ที่แนะนำสำหรับ skill นี้ — auto-switch ให้ถ้าผู้ใช้มี API key ของ provider นั้น (string เดี่ยวหรือ array; ดูด้านล่าง) |
 
 `{skill_dir}` ในเนื้อหาจะถูกแทนด้วย absolute path ของไดเรกทอรี skill
 ตอนโหลด ดังนั้น path ของ script จึง resolve ได้เสมอ ไม่ว่าผู้ใช้จะ
 เปิด thClaws จากที่ใดก็ตาม
+
+### `model:` — แนะนำโมเดล default
+
+skill บางตัวต้องใช้ความสามารถที่ไม่ใช่ทุกโมเดลรองรับ — vision (อ่าน
+รูป namecard, parse ภาพใบเสร็จ), long context (สรุป PDF 200 หน้า),
+structured output (สูตร XLSX cell) ใส่ `model:` ให้ skill author
+encode คำแนะนำไว้ ผู้ใช้ที่ไม่ได้รู้ว่าโมเดลไหนรองรับอะไรจะได้ default
+ที่ใช้งานได้อัตโนมัติ
+
+แนะนำเดี่ยว:
+
+```yaml
+---
+name: namecard-to-excel
+description: Extract namecard info from a photo into Excel
+whenToUse: When user shares a namecard photo to add to contacts
+model: claude-sonnet-4-6
+---
+```
+
+priority list (ตัวแรกที่ผู้ใช้มี key จะถูกเลือก):
+
+```yaml
+---
+model: [claude-sonnet-4-6, gpt-4o, gemini-2.5-pro]
+---
+```
+
+พฤติกรรมเมื่อ skill ถูกเรียก:
+
+- **ผู้ใช้มี key ของโมเดลที่แนะนำ** — auto-switch แบบเงียบสำหรับ
+  turn นั้น chat แสดง `[model → claude-sonnet-4-6 (skill recommendation, reverts at end of turn)]`
+  ตอนสลับ และ `[model → <baseline> (skill ended)]` เมื่อ turn จบ
+  โมเดลเดิมของผู้ใช้กลับมาทำงานต่ออัตโนมัติ
+- **ผู้ใช้ไม่มี key ของ candidate ใดเลย** — chat แสดง
+  `[skill recommends claude-sonnet-4-6; you don't have a key for that
+  provider — using current model]` และ skill ทำงานต่อด้วยโมเดลปัจจุบัน
+  ถ้าผลลัพธ์ไม่ดี ค่อยเพิ่ม key ใน Settings
+
+override ใช้ได้แค่ **per-turn** — `/model` ที่ผู้ใช้สั่งเองไม่ได้
+รับผลกระทบ และ user prompt ถัดไปจะเริ่มจาก baseline เดิม วิธีนี้ทำให้
+swap ไม่รบกวน: ช่วย skill โดยไม่ครอบงำ session
 
 ## เขียน skill ของคุณเอง
 

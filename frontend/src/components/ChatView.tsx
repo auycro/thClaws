@@ -390,6 +390,17 @@ export function ChatView({ active, modalOpen }: Props) {
             { role: "system", content: msg.text as string },
           ]);
           break;
+        case "chat_skill_model_note":
+          // Skill-recommended-model swap or fallback. Renders as the
+          // same muted system bubble as slash output — terse, in-line
+          // with the conversation, no popup. The worker emits these
+          // around skill invocation: one when the swap takes effect,
+          // and a follow-up "[model → X (skill ended)]" at end of turn.
+          setMessages((prev) => [
+            ...prev,
+            { role: "system", content: msg.text as string },
+          ]);
+          break;
         case "chat_done":
           setStreaming(false);
           setAskPrompt(null);

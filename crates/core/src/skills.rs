@@ -86,12 +86,85 @@ impl Clone for SkillContent {
     }
 }
 
+/// Recommended model(s) for a skill. Skill authors set this in the
+/// `model:` frontmatter so users who don't know which models support
+/// vision (or other capabilities the skill assumes) get a sensible
+/// default applied automatically when they have the relevant API key.
+///
+/// YAML inputs accepted:
+/// - `model: claude-sonnet-4-6`              → Single
+/// - `model: [claude-sonnet-4-6, gpt-4o]`    → Priority (first one
+///   the user has a key for wins)
+///
+/// Empty / missing → no recommendation; the user's current model is
+/// used unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum SkillModelSpec {
+    Single(String),
+    Priority(Vec<String>),
+}
+
+impl SkillModelSpec {
+    /// View as a slice in priority order. `Single` returns a 1-element
+    /// slice; `Priority` returns its full Vec. Lets the model resolver
+    /// iterate uniformly without matching on the variant.
+    pub fn candidates(&self) -> &[String] {
+        match self {
+            Self::Single(s) => std::slice::from_ref(s),
+            Self::Priority(v) => v,
+        }
+    }
+}
+
+/// Parse a SKILL.md `model:` frontmatter value. Tolerant of inline-
+/// array syntax (`[a, b, c]`) since the simple line-based frontmatter
+/// parser hands us the raw value as a string. Each item is unquoted
+/// and trimmed; empty inputs produce `None`.
+pub fn parse_skill_model(raw: &str) -> Option<SkillModelSpec> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.starts_with('[') && raw.ends_with(']') {
+        let inner = &raw[1..raw.len() - 1];
+        let items: Vec<String> = inner
+            .split(',')
+            .map(|s| {
+                s.trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .trim()
+                    .to_string()
+            })
+            .filter(|s| !s.is_empty())
+            .collect();
+        match items.len() {
+            0 => None,
+            1 => Some(SkillModelSpec::Single(items.into_iter().next().unwrap())),
+            _ => Some(SkillModelSpec::Priority(items)),
+        }
+    } else {
+        Some(SkillModelSpec::Single(raw.to_string()))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillDef {
     pub name: String,
     pub description: String,
     #[serde(default)]
     pub when_to_use: String,
+    /// Optional default-model recommendation. When set and the user
+    /// has an API key for the relevant provider, the agent's
+    /// `model_override` is populated for the duration of the turn the
+    /// skill is invoked in. Falls back silently to the user's current
+    /// model with a warning chat line when no candidate has a key.
+    /// Issue: knowledge-worker skills (vision, long-context) need a
+    /// known-good default so non-experts don't have to know which
+    /// model supports what.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<SkillModelSpec>,
     pub dir: PathBuf,
     /// Body access goes through [`Self::content`]. Serialization
     /// always materializes to a string so cached SkillDef snapshots
@@ -154,6 +227,7 @@ impl SkillDef {
             name,
             description,
             when_to_use,
+            model: None,
             dir,
             content: SkillContent::Eager(content),
         }
@@ -290,6 +364,12 @@ impl SkillStore {
     /// "project highest priority" contract.
     pub fn discover_with_extra(extra: &[PathBuf]) -> Self {
         let mut store = Self::default();
+        // Built-in skills go FIRST so any disk-resident skill of the
+        // same name (user / plugin / project) overrides them. Same
+        // precedence pattern as `AgentDefsConfig::seed_builtins`
+        // for the `dream` built-in agent: ship a curated default,
+        // let users redefine if they want.
+        store.seed_builtins();
         for dir in Self::user_skill_dirs() {
             if dir.exists() {
                 store.load_dir(&dir);
@@ -306,6 +386,29 @@ impl SkillStore {
             }
         }
         store
+    }
+
+    /// Seed the store with skills compiled into the binary. Each entry
+    /// pairs a fallback name (used when the embedded markdown has no
+    /// `name:` frontmatter) with the embedded SKILL.md source. Pure-
+    /// prompt skills only — anything that needs a `scripts/` directory
+    /// can't go built-in because we don't ship script files in the
+    /// binary. The synthetic `dir` is `<builtin>/<name>`; this never
+    /// gets passed to `Sandbox::check`, so the path's non-existence is
+    /// harmless. `{skill_dir}` substitution still runs against this
+    /// path so any `{skill_dir}/...` reference in the body would
+    /// produce a clearly-broken path the user can spot — pure-prompt
+    /// skills don't reference `{skill_dir}` at all.
+    fn seed_builtins(&mut self) {
+        const BUILTINS: &[(&str, &str)] = &[(
+            "extract-and-save",
+            include_str!("default_prompts/skills/extract-and-save.md"),
+        )];
+        for (fallback_name, raw) in BUILTINS {
+            if let Some(skill) = parse_builtin_skill(fallback_name, raw) {
+                self.skills.insert(skill.name.clone(), skill);
+            }
+        }
     }
 
     fn user_skill_dirs() -> Vec<PathBuf> {
@@ -372,6 +475,9 @@ impl SkillStore {
             .or_else(|| frontmatter.get("when_to_use"))
             .cloned()
             .unwrap_or_default();
+        let model = frontmatter
+            .get("model")
+            .and_then(|raw| parse_skill_model(raw));
 
         // Canonicalize once at index time so the `{skill_dir}`
         // substitution inside the lazy body load doesn't have to —
@@ -389,6 +495,7 @@ impl SkillStore {
             name,
             description,
             when_to_use,
+            model,
             dir: abs_dir.clone(),
             // Body is read on demand by `SkillDef::content()`. Only
             // the path + abs_dir are captured at boot.
@@ -405,7 +512,44 @@ impl SkillStore {
         names.sort();
         names
     }
+}
 
+/// Parse a built-in skill from in-memory markdown (compiled in via
+/// `include_str!`). Same shape as `SkillStore::parse_skill` but skips
+/// the disk path canonicalization step — there's no real directory.
+/// Body content is materialized eagerly with `{skill_dir}` substituted
+/// to a synthetic `<builtin>/<name>` path. Returns `None` if the
+/// frontmatter parser can't find a name (defaults to `fallback_name`).
+fn parse_builtin_skill(fallback_name: &str, raw: &str) -> Option<SkillDef> {
+    let (frontmatter, body) = crate::memory::parse_frontmatter(raw);
+    let name = frontmatter
+        .get("name")
+        .cloned()
+        .unwrap_or_else(|| fallback_name.to_string());
+    let description = frontmatter.get("description").cloned().unwrap_or_default();
+    let when_to_use = frontmatter
+        .get("whenToUse")
+        .or_else(|| frontmatter.get("when_to_use"))
+        .cloned()
+        .unwrap_or_default();
+    let model = frontmatter
+        .get("model")
+        .and_then(|raw| parse_skill_model(raw));
+
+    let synthetic_dir = PathBuf::from(format!("<builtin>/{name}"));
+    let body_with_subst = body.replace("{skill_dir}", &synthetic_dir.to_string_lossy());
+
+    Some(SkillDef {
+        name,
+        description,
+        when_to_use,
+        model,
+        dir: synthetic_dir,
+        content: SkillContent::Eager(body_with_subst),
+    })
+}
+
+impl SkillStore {
     pub fn get(&self, name: &str) -> Option<&SkillDef> {
         self.skills.get(name)
     }
@@ -1197,6 +1341,26 @@ impl Tool for SkillTool {
         // already-installed deps is a no-op + cached.
         append_skill_runtime_hints(&mut result, &skill.dir);
 
+        // If the skill author specified a default model, ask the
+        // worker's resolver to apply it. The resolver writes into
+        // the agent's `model_override` slot so the very next
+        // provider.stream call uses the recommended model. Append a
+        // one-line note to the body so the model knows what
+        // happened (and can mention it to the user if relevant).
+        if let Some(spec) = skill.model.as_ref() {
+            let outcome = crate::skills_state::request_model(spec);
+            let note = match outcome {
+                crate::skills_state::SkillModelOutcome::Switched(picked) => format!(
+                    "\n\n_(Note: this skill recommends `{picked}`; the active model has been switched for this turn — your previous model returns when the turn ends.)_\n"
+                ),
+                crate::skills_state::SkillModelOutcome::KeptCurrent { recommended } => format!(
+                    "\n\n_(Note: this skill works best with `{recommended}` (vision / long-context). You don't have an API key for that provider — proceeding with your current model. Add the relevant key in Settings if results look poor.)_\n"
+                ),
+                crate::skills_state::SkillModelOutcome::NoResolver => String::new(),
+            };
+            result.push_str(&note);
+        }
+
         Ok(result)
     }
 }
@@ -1427,6 +1591,123 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// Single string form: the YAML scalar parses into Single.
+    #[test]
+    fn parse_skill_model_handles_single_string() {
+        let parsed = parse_skill_model("claude-sonnet-4-6").unwrap();
+        assert_eq!(parsed, SkillModelSpec::Single("claude-sonnet-4-6".into()));
+        assert_eq!(parsed.candidates(), &["claude-sonnet-4-6".to_string()]);
+    }
+
+    /// Inline-array form: the simple frontmatter parser hands us the
+    /// raw value `[a, b]` as a literal string. Auto-detect parses
+    /// into Priority. Whitespace + quotes around items are trimmed.
+    #[test]
+    fn parse_skill_model_handles_inline_array() {
+        let parsed = parse_skill_model("[claude-sonnet-4-6, gpt-4o, gemini-2.5-pro]").unwrap();
+        match &parsed {
+            SkillModelSpec::Priority(v) => {
+                assert_eq!(v.len(), 3);
+                assert_eq!(v[0], "claude-sonnet-4-6");
+                assert_eq!(v[1], "gpt-4o");
+                assert_eq!(v[2], "gemini-2.5-pro");
+            }
+            _ => panic!("expected Priority, got {parsed:?}"),
+        }
+    }
+
+    /// Quoted items in the inline array are unwrapped.
+    #[test]
+    fn parse_skill_model_strips_quotes_in_array() {
+        let parsed = parse_skill_model(r#"["claude-sonnet-4-6", 'gpt-4o']"#).unwrap();
+        let cands = parsed.candidates();
+        assert_eq!(cands.len(), 2);
+        assert_eq!(cands[0], "claude-sonnet-4-6");
+        assert_eq!(cands[1], "gpt-4o");
+    }
+
+    /// Single-element array collapses to Single — keeps Priority
+    /// reserved for genuine multi-candidate fallback chains.
+    #[test]
+    fn parse_skill_model_single_element_array_collapses_to_single() {
+        let parsed = parse_skill_model("[claude-sonnet-4-6]").unwrap();
+        assert_eq!(parsed, SkillModelSpec::Single("claude-sonnet-4-6".into()));
+    }
+
+    /// Empty / blank inputs produce None.
+    #[test]
+    fn parse_skill_model_empty_returns_none() {
+        assert!(parse_skill_model("").is_none());
+        assert!(parse_skill_model("   ").is_none());
+        assert!(parse_skill_model("[]").is_none());
+        assert!(parse_skill_model("[ , ]").is_none());
+    }
+
+    /// Round-trip through SKILL.md frontmatter: the discover path
+    /// must populate `SkillDef.model` from a `model:` key.
+    #[test]
+    fn parse_skill_picks_up_model_frontmatter_single() {
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("namecard");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\n\
+             name: namecard\n\
+             description: Extract namecard info\n\
+             whenToUse: When user shares a namecard photo\n\
+             model: claude-sonnet-4-6\n\
+             ---\n\
+             body content\n",
+        )
+        .unwrap();
+        let parsed = SkillStore::parse_skill(&skill_dir, &skill_dir.join("SKILL.md")).unwrap();
+        assert_eq!(
+            parsed.model,
+            Some(SkillModelSpec::Single("claude-sonnet-4-6".into()))
+        );
+    }
+
+    #[test]
+    fn parse_skill_picks_up_model_frontmatter_array() {
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("namecard");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\n\
+             name: namecard\n\
+             description: Extract namecard info\n\
+             model: [claude-sonnet-4-6, gpt-4o]\n\
+             ---\n\
+             body\n",
+        )
+        .unwrap();
+        let parsed = SkillStore::parse_skill(&skill_dir, &skill_dir.join("SKILL.md")).unwrap();
+        match parsed.model.as_ref().unwrap() {
+            SkillModelSpec::Priority(v) => assert_eq!(v.len(), 2),
+            other => panic!("expected Priority, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_skill_without_model_field_yields_none() {
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("plain");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\n\
+             name: plain\n\
+             description: No model recommendation\n\
+             ---\n\
+             body\n",
+        )
+        .unwrap();
+        let parsed = SkillStore::parse_skill(&skill_dir, &skill_dir.join("SKILL.md")).unwrap();
+        assert_eq!(parsed.model, None);
+    }
+
     fn create_skill(base: &Path, name: &str, content: &str, scripts: &[(&str, &str)]) {
         let skill_dir = base.join(name);
         std::fs::create_dir_all(&skill_dir).unwrap();
@@ -1473,6 +1754,71 @@ mod tests {
             .unwrap()
             .content()
             .contains("{skill_dir}"));
+    }
+
+    // ── built-in skills (seed_builtins) ──────────────────────────────
+
+    #[test]
+    fn seed_builtins_includes_extract_and_save() {
+        let mut store = SkillStore::default();
+        store.seed_builtins();
+        let skill = store
+            .get("extract-and-save")
+            .expect("extract-and-save should be seeded as a built-in");
+        assert_eq!(skill.name, "extract-and-save");
+        assert!(!skill.description.is_empty());
+        // Carries the model recommendation set in the frontmatter.
+        assert!(matches!(
+            skill.model,
+            Some(SkillModelSpec::Single(_)) | Some(SkillModelSpec::Priority(_))
+        ));
+        // Body is materialized eagerly (no on-disk file to lazy-load).
+        assert!(matches!(skill.content, SkillContent::Eager(_)));
+        // Body content is non-empty and recognizable.
+        assert!(skill.content().contains("Extract"));
+    }
+
+    #[test]
+    fn user_skill_overrides_builtin() {
+        // Disk-resident user/project skill of the same name wins —
+        // built-in seeds first, disk dirs run after via load_dir,
+        // HashMap::insert is last-wins.
+        let dir = tempdir().unwrap();
+        let mut store = SkillStore::default();
+        store.seed_builtins();
+        let builtin_desc = store
+            .get("extract-and-save")
+            .map(|s| s.description.clone())
+            .unwrap_or_default();
+
+        create_skill(
+            dir.path(),
+            "extract-and-save",
+            "---\nname: extract-and-save\ndescription: USER OVERRIDE\nwhenToUse: never\n---\nuser body",
+            &[],
+        );
+        store.load_dir(dir.path());
+
+        let after = store.get("extract-and-save").unwrap();
+        assert_eq!(after.description, "USER OVERRIDE");
+        assert_ne!(after.description, builtin_desc);
+        assert!(after.content().contains("user body"));
+    }
+
+    #[test]
+    fn parse_builtin_skill_substitutes_skill_dir_marker() {
+        // Synthetic dir is `<builtin>/<name>`. If the embedded body
+        // contains `{skill_dir}` (pure-prompt skills don't, but
+        // future built-ins might), it gets replaced with the
+        // synthetic path so the body has no literal placeholder.
+        let raw = "---\nname: synth\ndescription: x\n---\nRun {skill_dir}/scripts/foo.sh";
+        let skill = parse_builtin_skill("synth", raw).unwrap();
+        let body = match &skill.content {
+            SkillContent::Eager(s) => s.as_str(),
+            _ => panic!("built-in body should be Eager"),
+        };
+        assert!(!body.contains("{skill_dir}"));
+        assert!(body.contains("<builtin>/synth/scripts/foo.sh"));
     }
 
     // ── dev-plan/06 P1: lazy disk reads ──────────────────────────────

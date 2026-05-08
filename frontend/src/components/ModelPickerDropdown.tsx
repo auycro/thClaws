@@ -153,6 +153,15 @@ export function ModelPickerDropdown({ current, onClose }: Props) {
           placeholder={
             loading ? "Loading…" : `Search ${totalCount} model${totalCount === 1 ? "" : "s"}…`
           }
+          // Model names like "claude-sonnet-4-6" / "gpt-4.1-nano" /
+          // "qwen3-coder-plus" trip every browser autocorrect /
+          // autocapitalize / spellcheck heuristic — Chrome on macOS
+          // would silently rewrite "gpt" to "Gut" etc. Turn all of
+          // them off so what the user types is what the filter sees.
+          autoCorrect="off"
+          autoCapitalize="off"
+          autoComplete="off"
+          spellCheck={false}
           className="w-full px-2 py-1 rounded text-xs outline-none"
           style={{
             background: "var(--bg-tertiary)",

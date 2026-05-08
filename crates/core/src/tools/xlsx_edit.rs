@@ -32,23 +32,48 @@ impl Tool for XlsxEditTool {
 
     fn description(&self) -> &'static str {
         "Edit an Excel file (.xlsx) in place. Operations: `set_cell` \
-         (single A1-address), `set_cells` (2D-array bulk anchored at \
-         a top-left cell), `add_sheet`, `delete_sheet`. Format-preserving \
-         — styles / formulas / charts in unrelated regions are kept on \
-         round-trip."
+         (single A1-address; supports `value` OR `formula` plus an \
+         optional `format` block), `set_cells` (2D-array bulk anchored \
+         at a top-left cell), `add_sheet`, `delete_sheet`. Format-\
+         preserving — styles / formulas / charts in unrelated regions \
+         are kept on round-trip.\n\n\
+         \
+         Formula: `formula: \"=SUM(A1:A10)\"` (leading `=` optional) on \
+         `set_cell` writes a formula instead of a literal value. Cell \
+         display value updates the next time Excel / Numbers / \
+         LibreOffice opens the file.\n\n\
+         \
+         Format block (set_cell only for v1): `{bold, italic, \
+         font_color, fill_color, number_format}`. Colors are hex \
+         strings (`\"#RRGGBB\"` or `\"#AARRGGBB\"`); number_format \
+         accepts Excel format codes (`\"0.00\"`, `\"$#,##0.00\"`, \
+         `\"yyyy-mm-dd\"`, etc.). Existing cell style aspects not \
+         named in the block are preserved."
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "path":  {"type": "string", "description": "Path to the .xlsx to edit (overwritten in place)."},
-                "op":    {"type": "string", "enum": ["set_cell", "set_cells", "add_sheet", "delete_sheet"]},
-                "sheet": {"type": "string", "description": "Sheet name. Default: first sheet for set_cell/set_cells; required for add_sheet/delete_sheet."},
-                "cell":  {"type": "string", "description": "A1-style address (set_cell only)."},
-                "value": {"description": "New cell value — string, number, or boolean (set_cell only)."},
-                "anchor":{"type": "string", "description": "Top-left A1 anchor for the 2D array (set_cells only). Default A1."},
-                "data":  {"description": "JSON 2D-array of typed cells (set_cells only)."}
+                "path":    {"type": "string", "description": "Path to the .xlsx to edit (overwritten in place)."},
+                "op":      {"type": "string", "enum": ["set_cell", "set_cells", "add_sheet", "delete_sheet"]},
+                "sheet":   {"type": "string", "description": "Sheet name. Default: first sheet for set_cell/set_cells; required for add_sheet/delete_sheet."},
+                "cell":    {"type": "string", "description": "A1-style address (set_cell only)."},
+                "value":   {"description": "New cell value — string, number, or boolean (set_cell only). Ignored when `formula` is set."},
+                "formula": {"type": "string", "description": "Excel formula like `=SUM(A1:A10)` (set_cell only). Leading `=` optional. Takes precedence over `value`."},
+                "format":  {
+                    "type": "object",
+                    "description": "Optional formatting (set_cell only). All fields optional — only the named aspects are changed; existing style is preserved otherwise.",
+                    "properties": {
+                        "bold":          {"type": "boolean"},
+                        "italic":        {"type": "boolean"},
+                        "font_color":    {"type": "string", "description": "Hex `#RRGGBB` or `#AARRGGBB`."},
+                        "fill_color":    {"type": "string", "description": "Background fill hex `#RRGGBB` or `#AARRGGBB`."},
+                        "number_format": {"type": "string", "description": "Excel format code (`0.00`, `$#,##0.00`, `yyyy-mm-dd`, `0%`, etc.)."}
+                    }
+                },
+                "anchor":  {"type": "string", "description": "Top-left A1 anchor for the 2D array (set_cells only). Default A1."},
+                "data":    {"description": "JSON 2D-array of typed cells (set_cells only)."}
             },
             "required": ["path", "op"]
         })
@@ -70,13 +95,28 @@ impl Tool for XlsxEditTool {
         // Decode op-specific args eagerly so JSON errors surface before
         // we do the expensive read+write round-trip.
         let edit = match op.as_str() {
-            "set_cell" => Edit::SetCell {
-                cell: req_str(&input, "cell")?.to_string(),
-                value: input
-                    .get("value")
-                    .cloned()
-                    .ok_or_else(|| Error::Tool("missing field: value".into()))?,
-            },
+            "set_cell" => {
+                let formula = input
+                    .get("formula")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let value = input.get("value").cloned();
+                if formula.is_none() && value.is_none() {
+                    return Err(Error::Tool(
+                        "set_cell needs either `value` or `formula`".into(),
+                    ));
+                }
+                let format = input
+                    .get("format")
+                    .map(|f| parse_cell_format(f))
+                    .transpose()?;
+                Edit::SetCell {
+                    cell: req_str(&input, "cell")?.to_string(),
+                    value: value.unwrap_or(Value::Null),
+                    formula,
+                    format,
+                }
+            }
             "set_cells" => {
                 let data = input
                     .get("data")
@@ -108,10 +148,78 @@ impl Tool for XlsxEditTool {
 }
 
 enum Edit {
-    SetCell { cell: String, value: Value },
-    SetCells { anchor: String, data: Value },
+    SetCell {
+        cell: String,
+        value: Value,
+        formula: Option<String>,
+        format: Option<CellFormat>,
+    },
+    SetCells {
+        anchor: String,
+        data: Value,
+    },
     AddSheet,
     DeleteSheet,
+}
+
+/// Parsed view of the user-supplied `format` JSON object. Each field
+/// is optional — only the named aspects are applied at edit time, so
+/// existing style attributes (font face, font size, borders) survive
+/// when the user only wants to e.g. bold one cell.
+#[derive(Debug, Default)]
+struct CellFormat {
+    bold: Option<bool>,
+    italic: Option<bool>,
+    font_color: Option<String>,
+    fill_color: Option<String>,
+    number_format: Option<String>,
+}
+
+/// Parse the JSON `format` block. Validates each color string up front
+/// (must be `#RRGGBB` or `#AARRGGBB`) so a typo surfaces before we do
+/// the expensive read+write round-trip.
+fn parse_cell_format(v: &Value) -> Result<CellFormat> {
+    let obj = v
+        .as_object()
+        .ok_or_else(|| Error::Tool("format must be an object".into()))?;
+    let mut fmt = CellFormat::default();
+    if let Some(b) = obj.get("bold").and_then(|x| x.as_bool()) {
+        fmt.bold = Some(b);
+    }
+    if let Some(i) = obj.get("italic").and_then(|x| x.as_bool()) {
+        fmt.italic = Some(i);
+    }
+    if let Some(c) = obj.get("font_color").and_then(|x| x.as_str()) {
+        fmt.font_color = Some(normalize_argb(c, "font_color")?);
+    }
+    if let Some(c) = obj.get("fill_color").and_then(|x| x.as_str()) {
+        fmt.fill_color = Some(normalize_argb(c, "fill_color")?);
+    }
+    if let Some(n) = obj.get("number_format").and_then(|x| x.as_str()) {
+        fmt.number_format = Some(n.to_string());
+    }
+    Ok(fmt)
+}
+
+/// Normalise a user-supplied hex color into Excel's 8-char ARGB.
+/// Accepts `#RRGGBB` (alpha defaulted to FF) and `#AARRGGBB`. Case-
+/// insensitive on the hex digits.
+fn normalize_argb(raw: &str, field: &str) -> Result<String> {
+    let s = raw.trim();
+    let hex = s.strip_prefix('#').unwrap_or(s);
+    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(Error::Tool(format!(
+            "{field}: {raw:?} contains non-hex characters"
+        )));
+    }
+    let upper = hex.to_ascii_uppercase();
+    match upper.len() {
+        6 => Ok(format!("FF{upper}")),
+        8 => Ok(upper),
+        n => Err(Error::Tool(format!(
+            "{field}: {raw:?} has {n} hex digits; expected 6 (#RRGGBB) or 8 (#AARRGGBB)"
+        ))),
+    }
 }
 
 fn apply_edit(path: &std::path::Path, sheet: Option<&str>, edit: &Edit) -> Result<String> {
@@ -119,13 +227,38 @@ fn apply_edit(path: &std::path::Path, sheet: Option<&str>, edit: &Edit) -> Resul
         .map_err(|e| Error::Tool(format!("read {}: {:?}", path.display(), e)))?;
 
     let summary = match edit {
-        Edit::SetCell { cell, value } => {
+        Edit::SetCell {
+            cell,
+            value,
+            formula,
+            format,
+        } => {
             let sheet_name = resolve_sheet_name(&book, sheet)?;
             let ws = book
                 .get_sheet_by_name_mut(&sheet_name)
                 .ok_or_else(|| Error::Tool(format!("sheet {sheet_name:?} not found")))?;
-            apply_value(ws.get_cell_mut(cell.as_str()), value);
-            format!("Set {cell} on sheet {sheet_name:?} in {}", path.display())
+            let target = ws.get_cell_mut(cell.as_str());
+            if let Some(f) = formula {
+                // Strip leading `=` if present — umya's API takes the
+                // formula body without it.
+                let body = f.strip_prefix('=').unwrap_or(f);
+                target.set_formula(body);
+            } else {
+                apply_value(target, value);
+            }
+            if let Some(fmt) = format {
+                apply_format(target, fmt);
+            }
+            let what = if formula.is_some() {
+                "formula"
+            } else {
+                "value"
+            };
+            let fmt_note = if format.is_some() { " + format" } else { "" };
+            format!(
+                "Set {cell} {what}{fmt_note} on sheet {sheet_name:?} in {}",
+                path.display()
+            )
         }
         Edit::SetCells { anchor, data } => {
             let sheet_name = resolve_sheet_name(&book, sheet)?;
@@ -197,6 +330,40 @@ fn resolve_sheet_name(
         .ok_or_else(|| Error::Tool("workbook has no sheets".into()))
 }
 
+/// Apply per-cell formatting (bold / italic / colors / number format).
+/// Reads the cell's existing style and mutates only the named aspects,
+/// so unrelated style attributes (font face, font size, borders set by
+/// upstream code) are preserved.
+fn apply_format(cell: &mut umya_spreadsheet::Cell, fmt: &CellFormat) {
+    let style = cell.get_style_mut();
+    if let Some(b) = fmt.bold {
+        style.get_font_mut().set_bold(b);
+    }
+    if let Some(i) = fmt.italic {
+        style.get_font_mut().set_italic(i);
+    }
+    if let Some(argb) = &fmt.font_color {
+        let mut color = umya_spreadsheet::Color::default();
+        color.set_argb(argb);
+        style.get_font_mut().set_color(color);
+    }
+    if let Some(argb) = &fmt.fill_color {
+        let mut pattern = umya_spreadsheet::PatternFill::default();
+        pattern.set_pattern_type(umya_spreadsheet::PatternValues::Solid);
+        let mut fg = umya_spreadsheet::Color::default();
+        fg.set_argb(argb);
+        pattern.set_foreground_color(fg);
+        let mut fill = umya_spreadsheet::Fill::default();
+        fill.set_pattern_fill(pattern);
+        style.set_fill(fill);
+    }
+    if let Some(code) = &fmt.number_format {
+        let mut nf = umya_spreadsheet::NumberingFormat::default();
+        nf.set_format_code(code.clone());
+        style.set_numbering_format(nf);
+    }
+}
+
 fn apply_value(cell: &mut umya_spreadsheet::Cell, value: &Value) {
     match value {
         Value::Null => {
@@ -263,6 +430,146 @@ mod tests {
         assert_eq!(parse_a1("AA1").unwrap(), (27, 1));
         assert!(parse_a1("1A").is_err());
         assert!(parse_a1("A0").is_err());
+    }
+
+    #[test]
+    fn argb_normalisation() {
+        // 6-digit hex gets FF alpha prefixed.
+        assert_eq!(normalize_argb("#FF0000", "x").unwrap(), "FFFF0000");
+        assert_eq!(normalize_argb("ff0000", "x").unwrap(), "FFFF0000");
+        // 8-digit ARGB passed through (uppercased).
+        assert_eq!(normalize_argb("#80ff00ff", "x").unwrap(), "80FF00FF");
+        // Bad inputs surface a clear error naming the field.
+        assert!(normalize_argb("not-hex", "fill_color")
+            .unwrap_err()
+            .to_string()
+            .contains("fill_color"));
+        assert!(normalize_argb("#abc", "x")
+            .unwrap_err()
+            .to_string()
+            .contains("3 hex digits"));
+    }
+
+    /// Formula round-trip: write `=A1+10`, verify the cell carries a
+    /// formula on re-read. We can't check the computed result without
+    /// a calc engine, but the formula string survival is the contract.
+    #[tokio::test]
+    async fn round_trip_formula_survives() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("f.xlsx");
+
+        crate::tools::XlsxCreateTool
+            .call(json!({
+                "path": path.to_string_lossy(),
+                "data": [["a", "b"], [10, 20]],
+                "headers": false
+            }))
+            .await
+            .unwrap();
+
+        // C1 = A1 + B1 (literal value: blank rows above; just exercise
+        // the formula path on a cell adjacent to existing data).
+        let r = XlsxEditTool
+            .call(json!({
+                "path": path.to_string_lossy(),
+                "op": "set_cell",
+                "cell": "C1",
+                "formula": "=A1+B1"
+            }))
+            .await
+            .unwrap();
+        assert!(r.contains("formula"), "msg should mention formula: {r}");
+
+        // Re-read via umya and inspect the cell's formula attribute
+        // directly. The sheet read tool flattens to text so it can't
+        // round-trip the formula; this asserts the OOXML preserved it.
+        let book = umya_spreadsheet::reader::xlsx::read(&path).unwrap();
+        let ws = book.get_sheet(&0).unwrap();
+        let cell = ws.get_cell("C1").unwrap();
+        assert!(
+            cell.get_formula().contains("A1+B1"),
+            "C1 should carry the formula; got: {:?}",
+            cell.get_formula()
+        );
+    }
+
+    /// Format application: bold + fill_color + number_format land in
+    /// the cell's style block. Use umya's reader to inspect the
+    /// resulting Style after round-trip.
+    #[tokio::test]
+    async fn round_trip_format_lands_in_style() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("fmt.xlsx");
+
+        crate::tools::XlsxCreateTool
+            .call(json!({
+                "path": path.to_string_lossy(),
+                "data": [["amount"], [1234.5]]
+            }))
+            .await
+            .unwrap();
+
+        XlsxEditTool
+            .call(json!({
+                "path": path.to_string_lossy(),
+                "op": "set_cell",
+                "cell": "A2",
+                "value": 1234.5,
+                "format": {
+                    "bold": true,
+                    "fill_color": "#FFFF00",
+                    "number_format": "$#,##0.00"
+                }
+            }))
+            .await
+            .unwrap();
+
+        // Inspect the cell's style after re-read.
+        let book = umya_spreadsheet::reader::xlsx::read(&path).unwrap();
+        let ws = book.get_sheet(&0).unwrap();
+        let cell = ws.get_cell("A2").unwrap();
+        let style = cell.get_style();
+        assert!(
+            style.get_font().is_some_and(|f| *f.get_bold()),
+            "A2 should be bold; style: {:?}",
+            style
+        );
+        // The format code we set should round-trip in the style block.
+        let nf_code = style
+            .get_number_format()
+            .map(|nf| nf.get_format_code().to_string())
+            .unwrap_or_default();
+        assert!(
+            nf_code.contains("$") || nf_code.contains("#"),
+            "number format should carry the dollar/hash code; got: {nf_code:?}"
+        );
+    }
+
+    /// set_cell without value AND without formula errors clearly
+    /// instead of writing an empty cell silently.
+    #[tokio::test]
+    async fn set_cell_requires_value_or_formula() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("e.xlsx");
+        crate::tools::XlsxCreateTool
+            .call(json!({
+                "path": path.to_string_lossy(),
+                "data": [["a"], [1]]
+            }))
+            .await
+            .unwrap();
+        let err = XlsxEditTool
+            .call(json!({
+                "path": path.to_string_lossy(),
+                "op": "set_cell",
+                "cell": "B1"
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("value` or `formula"),
+            "err: {err}"
+        );
     }
 
     #[tokio::test]

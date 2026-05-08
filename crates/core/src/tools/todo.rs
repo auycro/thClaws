@@ -310,6 +310,11 @@ impl Tool for TodoWriteTool {
         std::fs::write(&path, &md)
             .map_err(|e| Error::Tool(format!("failed to write todos.md: {e}")))?;
 
+        // Broadcast the new list to the GUI sidebar (no-op in CLI —
+        // the worker only registers a broadcaster when running with
+        // the GUI / serve surface).
+        super::todo_state::fire(todos.clone());
+
         let completed = todos.iter().filter(|t| t.status == "completed").count();
         let in_progress = todos.iter().filter(|t| t.status == "in_progress").count();
         let pending = todos.iter().filter(|t| t.status == "pending").count();
@@ -322,6 +327,51 @@ impl Tool for TodoWriteTool {
             completed,
         ))
     }
+}
+
+/// Parse `.thclaws/todos.md` back into a `Vec<TodoItem>` so the GUI
+/// worker can hydrate the sidebar at session boot. Mirror of the
+/// `to_markdown()` writer — recognizes `[x]` / `[-]` / `[ ]` and
+/// `(id: <id>)` at end of line. Ignores blank lines, headings, and
+/// the empty-state placeholder. Returns an empty vec on any I/O or
+/// parse trouble (the sidebar simply shows nothing — better than
+/// crashing the worker).
+pub fn read_todos_from_disk(root: &std::path::Path) -> Vec<TodoItem> {
+    let path = root.join(".thclaws").join("todos.md");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim_start();
+        let after_dash = match trimmed.strip_prefix("- ") {
+            Some(s) => s,
+            None => continue,
+        };
+        let (status, after_box) = if let Some(rest) = after_dash.strip_prefix("[x] ") {
+            ("completed", rest)
+        } else if let Some(rest) = after_dash.strip_prefix("[-] ") {
+            ("in_progress", rest)
+        } else if let Some(rest) = after_dash.strip_prefix("[ ] ") {
+            ("pending", rest)
+        } else {
+            continue;
+        };
+        // Split off ` (id: <id>)` suffix; require both pieces.
+        let (content, id) = match after_box.rsplit_once(" (id: ") {
+            Some((c, id_with_paren)) => match id_with_paren.strip_suffix(')') {
+                Some(id) => (c.to_string(), id.to_string()),
+                None => continue,
+            },
+            None => continue,
+        };
+        out.push(TodoItem {
+            id,
+            content,
+            status: status.into(),
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -475,6 +525,53 @@ mod tests {
             d.contains("don't batch") || d.contains("don't batch"),
             "no-batching rule missing: {d}",
         );
+    }
+
+    #[test]
+    fn read_todos_from_disk_round_trips_known_markdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let todos = vec![
+            TodoItem {
+                id: "1".into(),
+                content: "Fix bug".into(),
+                status: "completed".into(),
+            },
+            TodoItem {
+                id: "abc-2".into(),
+                content: "Add tests".into(),
+                status: "in_progress".into(),
+            },
+            TodoItem {
+                id: "3".into(),
+                content: "Deploy".into(),
+                status: "pending".into(),
+            },
+        ];
+        TodoWriteTool::write_todos_to(dir.path(), &todos).unwrap();
+        let parsed = read_todos_from_disk(dir.path());
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].id, "1");
+        assert_eq!(parsed[0].content, "Fix bug");
+        assert_eq!(parsed[0].status, "completed");
+        assert_eq!(parsed[1].id, "abc-2");
+        assert_eq!(parsed[1].status, "in_progress");
+        assert_eq!(parsed[2].status, "pending");
+    }
+
+    #[test]
+    fn read_todos_from_disk_returns_empty_when_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        // No .thclaws/todos.md written.
+        assert!(read_todos_from_disk(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn read_todos_from_disk_skips_empty_state_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        TodoWriteTool::write_todos_to(dir.path(), &[]).unwrap();
+        // The file contains "_No todos._" — the parser must not
+        // treat that as a todo item.
+        assert!(read_todos_from_disk(dir.path()).is_empty());
     }
 
     #[test]

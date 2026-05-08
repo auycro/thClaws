@@ -251,6 +251,24 @@ pub enum ViewEvent {
     /// `chat_plan_update` IPC envelope to the right-side
     /// `PlanSidebar`. Plan-mode rebuild M1.
     PlanUpdate(Option<crate::tools::plan_state::Plan>),
+    /// TodoWrite snapshot — emitted every time the model writes the
+    /// scratchpad checklist (and once at worker boot from disk so the
+    /// sidebar starts populated). The translator forwards as a
+    /// `chat_todo_update` IPC envelope to the right-side `TodoSidebar`.
+    /// Empty vec means "no todos" (file missing OR explicit empty
+    /// list); the sidebar collapses to a chevron in that case.
+    TodoUpdate(Vec<crate::tools::todo::TodoItem>),
+    /// Status note emitted by the skill-model resolver when a skill
+    /// with `model:` frontmatter is invoked. Carries a single-line
+    /// human-readable string the chat surface renders inline (italic,
+    /// muted) so the user sees swap / fallback decisions without
+    /// digging through tool logs. Three flavors in practice — the
+    /// resolver formats them so the worker doesn't repeat the prose:
+    ///   - "[model → claude-sonnet-4-6 (skill: namecard-to-excel)]"
+    ///   - "[skill 'namecard-to-excel' recommends claude-sonnet-4-6
+    ///      (vision); using current gemini-2.5-flash]"
+    ///   - "[model → gemini-2.5-flash (skill ended)]"
+    SkillModelNote(String),
     /// Permission mode changed (M2). Carried to the sidebar so the
     /// status pill / mode badge can update without polling. Fired by
     /// EnterPlanMode / ExitPlanMode, `/plan`, sidebar Approve / Cancel.
@@ -544,6 +562,7 @@ impl WorkerState {
             &self.config.model,
             &self.system_prompt,
         )
+        .with_max_tokens(self.config.max_tokens)
         .with_approver(self.approver.clone())
         .with_cancel(self.cancel.clone())
         // M6.35 HOOK1: re-snapshot config.hooks on rebuild — config
@@ -811,6 +830,25 @@ async fn run_worker(
         });
     }
 
+    // Todo-state → ViewEvent bridge. Mirrors the plan broadcaster
+    // pattern but simpler: TodoWrite has no sequential gate, no
+    // JSONL persistence (the markdown file IS the persistence
+    // surface), so the closure just forwards the snapshot. Hydrate
+    // from disk once at boot so the sidebar starts populated when
+    // the user reopens a project that already has a todo list.
+    {
+        let todo_tx = events_tx.clone();
+        crate::tools::todo_state::set_broadcaster(move |todos| {
+            let _ = todo_tx.send(ViewEvent::TodoUpdate(todos));
+        });
+        let initial = crate::tools::todo::read_todos_from_disk(&cwd);
+        let _ = events_tx.send(ViewEvent::TodoUpdate(initial));
+    }
+
+    // (Skill-model resolver registered below, after the agent has
+    // been constructed — it needs the agent's `model_override`
+    // handle.)
+
     // Goal-state → ViewEvent bridge + JSONL persistence (Phase A). Same
     // pattern as plan_state above; reuses `plan_persist_path` because
     // both snapshot kinds always target the same session JSONL — every
@@ -838,6 +876,7 @@ async fn run_worker(
         // wiki maintainer (not just a passive reader).
         tools.register(std::sync::Arc::new(crate::tools::KmsWriteTool));
         tools.register(std::sync::Arc::new(crate::tools::KmsAppendTool));
+        tools.register(std::sync::Arc::new(crate::tools::KmsDeleteTool));
     }
 
     // M6.26 BUG #1: Memory tools always-on. The model needs them even
@@ -1030,6 +1069,7 @@ async fn run_worker(
             system: system.clone(),
             max_iterations: config.max_iterations,
             max_depth: crate::subagent::DEFAULT_MAX_DEPTH,
+            max_tokens: config.max_tokens,
             agent_defs: agent_defs_state.clone(),
             approver: approver.clone(),
             permission_mode: perm_mode,
@@ -1046,6 +1086,7 @@ async fn run_worker(
         factory
     };
     let mut agent = Agent::new(provider, tools.clone(), &config.model, &system)
+        .with_max_tokens(config.max_tokens)
         .with_approver(approver.clone())
         .with_cancel(cancel.clone())
         .with_hooks(hooks_arc.clone());
@@ -1059,6 +1100,46 @@ async fn run_worker(
     // gate, M2+) starts on the right value before any EnterPlanMode /
     // sidebar-Approve flip can change it.
     crate::permissions::set_current_mode(agent.permission_mode);
+
+    // Skill-model resolver. When SkillTool loads a skill whose
+    // frontmatter carries `model:`, it calls
+    // `skills_state::request_model(spec)`. The closure registered
+    // here probes each candidate via `ProviderKind::has_key_available`,
+    // writes the first matching model into the agent's
+    // `model_override` slot (read fresh by the agent's iteration
+    // loop), and emits a chat status note. Falls back to a warning
+    // note when no candidate has a usable key.
+    {
+        let skill_tx = events_tx.clone();
+        let override_handle = agent.model_override_handle();
+        crate::skills_state::set_resolver(move |spec| {
+            for candidate in spec.candidates() {
+                let Some(kind) = crate::providers::ProviderKind::detect(candidate) else {
+                    continue;
+                };
+                if !kind.has_key_available() {
+                    continue;
+                }
+                if let Ok(mut g) = override_handle.lock() {
+                    *g = Some(candidate.clone());
+                }
+                crate::skills_state::mark_swap_active();
+                let _ = skill_tx.send(ViewEvent::SkillModelNote(format!(
+                    "[model → {candidate} (skill recommendation, reverts at end of turn)]"
+                )));
+                return crate::skills_state::SkillModelOutcome::Switched(candidate.clone());
+            }
+            let first = spec
+                .candidates()
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "<unspecified>".into());
+            let _ = skill_tx.send(ViewEvent::SkillModelNote(format!(
+                "[skill recommends {first}; you don't have a key for that provider — using current model]"
+            )));
+            crate::skills_state::SkillModelOutcome::KeptCurrent { recommended: first }
+        });
+    }
 
     // Permission-mode → ViewEvent bridge (M2). Mirrors the plan-state
     // broadcaster — every set_current_mode_and_broadcast() call
@@ -2176,6 +2257,18 @@ async fn drive_turn_stream(
                 let tracker =
                     crate::usage::UsageTracker::new(crate::usage::UsageTracker::default_path());
                 tracker.record(provider_name, &state.config.model, &usage);
+
+                // If a skill applied a model override this turn, emit
+                // a revert chat note so the user sees the active
+                // model returning to their baseline. The agent itself
+                // already cleared the override slot before yielding
+                // Done; this only handles the user-visible signaling.
+                if crate::skills_state::take_swap_active() {
+                    let _ = events_tx.send(ViewEvent::SkillModelNote(format!(
+                        "[model → {} (skill ended)]",
+                        state.config.model
+                    )));
+                }
 
                 save_history(&state.agent, &mut state.session, &state.session_store);
                 maybe_warn_file_size(state, events_tx);
