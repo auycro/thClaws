@@ -74,6 +74,10 @@ pub async fn dispatch(
                 .unwrap_or_else(|_| "?".to_string());
             emit(events_tx, format!("cwd: {cwd}"));
         }
+        SlashCommand::System { mode } => {
+            let view = crate::repl::render_system_prompt_view(&state.system_prompt, &mode);
+            emit(events_tx, view);
+        }
         SlashCommand::Context => {
             let history = state.agent.history_snapshot();
             let blocks: usize = history.iter().map(|m| m.content.len()).sum();
@@ -1072,6 +1076,139 @@ pub async fn dispatch(
             Some(g) => emit(events_tx, format_goal_show(&g)),
             None => emit(events_tx, "no active goal".into()),
         },
+        // ─── /research (M6.39.2) ────────────────────────────────────
+        // Research jobs run as background tokio tasks via
+        // `crate::research::start`. The GUI sees status updates by
+        // polling `crate::research::manager().list()` (M6.39.3 will
+        // wire a sidebar panel + ViewEvent broadcast). Until then,
+        // these arms emit a one-line acknowledgement and the user
+        // queries status via `/research list / status / show`.
+        SlashCommand::ResearchStart {
+            query,
+            kms_target,
+            min_iter,
+            max_iter,
+            score_threshold_pct,
+            budget_tokens: _,
+            budget_time_secs,
+        } => {
+            let mut cfg = crate::research::JobConfig::default();
+            cfg.kms_target = kms_target;
+            if let Some(v) = min_iter {
+                cfg.min_iter = v;
+            }
+            if let Some(v) = max_iter {
+                cfg.max_iter = v;
+            }
+            if let Some(pct) = score_threshold_pct {
+                cfg.score_threshold = (pct as f32 / 100.0).clamp(0.0, 1.0);
+            }
+            if let Some(secs) = budget_time_secs {
+                cfg.time_budget = std::time::Duration::from_secs(secs);
+            }
+            let provider = match crate::repl::build_provider(&state.config) {
+                Ok(p) => p,
+                Err(e) => {
+                    emit(events_tx, format!("/research: provider unavailable: {e}"));
+                    return;
+                }
+            };
+            let model = state.config.model.clone();
+            match crate::research::start(query.clone(), cfg, provider, model).await {
+                Ok(id) => emit(
+                    events_tx,
+                    format!(
+                        "[research started: id={id}] query: {query}\n  \
+                         /research status {id}     check progress\n  \
+                         /research show {id}       stream result\n  \
+                         /research cancel {id}     cancel"
+                    ),
+                ),
+                Err(e) => emit(events_tx, format!("/research start failed: {e}")),
+            }
+        }
+        SlashCommand::ResearchList => {
+            let jobs = crate::research::manager().list();
+            if jobs.is_empty() {
+                emit(events_tx, "no research jobs (try /research <query>)".into());
+            } else {
+                let mut out = String::new();
+                for j in jobs {
+                    out.push_str(&format!(
+                        "{}  {}  iter={}  src={}  score={}  query={}\n",
+                        j.id,
+                        j.status.as_str(),
+                        j.iterations_done,
+                        j.source_count,
+                        j.last_score
+                            .map(|s| format!("{s:.2}"))
+                            .unwrap_or_else(|| "—".into()),
+                        truncate_chars(&j.query, 60),
+                    ));
+                }
+                emit(events_tx, out);
+            }
+        }
+        SlashCommand::ResearchStatus { id } => match crate::research::manager().get(&id) {
+            Some(j) => emit(events_tx, format!("{:#?}", j)),
+            None => emit(events_tx, format!("no research job '{id}'")),
+        },
+        SlashCommand::ResearchShow { id } => match crate::research::manager().get(&id) {
+            Some(j) => match (j.status, &j.result_page) {
+                (crate::research::JobStatus::Done, Some(path)) => {
+                    let parts: Vec<&str> = path.splitn(2, '/').collect();
+                    if parts.len() == 2 {
+                        if let Some(kref) = crate::kms::resolve(parts[0]) {
+                            let p = kref.pages_dir().join(parts[1]);
+                            match std::fs::read_to_string(&p) {
+                                Ok(body) => emit(events_tx, body),
+                                Err(e) => {
+                                    emit(events_tx, format!("cannot read {}: {e}", p.display()))
+                                }
+                            }
+                        } else {
+                            emit(events_tx, format!("KMS '{}' not found", parts[0]));
+                        }
+                    } else {
+                        emit(events_tx, format!("malformed result_page: {path}"));
+                    }
+                }
+                (status, _) => emit(
+                    events_tx,
+                    format!(
+                        "status: {} — phase: {} (iter {}, src {}, score {})",
+                        status.as_str(),
+                        j.phase,
+                        j.iterations_done,
+                        j.source_count,
+                        j.last_score
+                            .map(|s| format!("{s:.2}"))
+                            .unwrap_or_else(|| "—".into()),
+                    ),
+                ),
+            },
+            None => emit(events_tx, format!("no research job '{id}'")),
+        },
+        SlashCommand::ResearchCancel { id } => {
+            if crate::research::manager().cancel(&id) {
+                emit(events_tx, format!("[research cancel signaled: {id}]"));
+            } else {
+                emit(
+                    events_tx,
+                    format!("cannot cancel '{id}' (unknown id or already terminal)"),
+                );
+            }
+        }
+        SlashCommand::ResearchWait { id } => {
+            // GUI doesn't block — emit a one-line note so the user
+            // knows to check status. CLI's `/research wait` polls; GUI
+            // surfaces the same info via the future sidebar panel
+            // (M6.39.3) + auto-notification on completion.
+            emit(
+                events_tx,
+                format!("/research wait is CLI-only — use /research show {id} from chat to poll"),
+            );
+        }
         SlashCommand::GoalContinue => {
             // Handled in shared_session.rs::handle_line as a turn-rewrite
             // BEFORE this dispatch is called (mirrors the
@@ -1654,6 +1791,12 @@ pub async fn dispatch(
                     state.tool_registry.remove("KmsSearch");
                     state.tool_registry.remove("KmsWrite");
                     state.tool_registry.remove("KmsAppend");
+                    // M6.38.2 audit fix (Bug A): KmsDelete was added in
+                    // M6.27 (`/dream` work) but never paired with a remove
+                    // here. After the last /kms off it lingered in the
+                    // registry — model saw the affordance but every call
+                    // failed because no KMS was active.
+                    state.tool_registry.remove("KmsDelete");
                 }
                 state.rebuild_system_prompt();
                 if let Err(e) = state.rebuild_agent(true) {
@@ -1802,6 +1945,75 @@ pub async fn dispatch(
                 ),
             );
         }
+        SlashCommand::KmsDump { name, .. } => {
+            // Same shape as KmsIngestSession: handled by the
+            // handle_line turn-rewrite. This arm only fires for
+            // direct dispatch, or when the KMS doesn't resolve.
+            if crate::kms::resolve(&name).is_none() {
+                emit(events_tx, format!("no KMS named '{name}'"));
+            } else {
+                emit(
+                    events_tx,
+                    format!(
+                        "/kms dump {name} requires the agent loop — invoke from chat / CLI, \
+                         not via shell_dispatch::dispatch directly."
+                    ),
+                );
+            }
+        }
+        SlashCommand::KmsChallenge { name, .. } => {
+            // Same shape as KmsDump — handled in shared_session.rs's
+            // turn-rewrite. This arm fires only when the KMS doesn't
+            // resolve, or when dispatch is called directly.
+            if crate::kms::resolve(&name).is_none() {
+                emit(events_tx, format!("no KMS named '{name}'"));
+            } else {
+                emit(
+                    events_tx,
+                    format!(
+                        "/kms challenge {name} requires the agent loop — invoke from chat / CLI, \
+                         not via shell_dispatch::dispatch directly."
+                    ),
+                );
+            }
+        }
+        SlashCommand::KmsReconcile { name, focus, apply } => {
+            let Some(_k) = crate::kms::resolve(&name) else {
+                emit(events_tx, format!("no KMS named '{name}'"));
+                return;
+            };
+            if state.config.kms_active.is_empty() {
+                // Subagent inherits parent's tool registry; KMS tools
+                // register only when kms_active is non-empty.
+                emit(
+                    events_tx,
+                    format!(
+                        "/kms reconcile {name}: no KMS attached to this session. \
+                         Run `/kms use {name}` first so KMS tools are registered."
+                    ),
+                );
+                return;
+            }
+            let prompt = compose_kms_reconcile_prompt(&name, focus.as_deref(), apply);
+            match crate::side_channel::spawn_side_channel(
+                "kms-reconcile".to_string(),
+                prompt,
+                state.agent_factory.clone(),
+                state.agent_defs.clone(),
+                events_tx.clone(),
+            )
+            .await
+            {
+                Ok(id) => emit(
+                    events_tx,
+                    format!(
+                        "✓ kms-reconcile dispatched (id: {id}, {})",
+                        if apply { "--apply" } else { "dry-run" }
+                    ),
+                ),
+                Err(e) => emit(events_tx, format!("/kms reconcile: {e}")),
+            }
+        }
         SlashCommand::KmsLint(name) => {
             // M6.25 BUG #3: pure-read health check.
             let Some(k) = crate::kms::resolve(&name) else {
@@ -1810,9 +2022,86 @@ pub async fn dispatch(
             };
             match crate::kms::lint(&k) {
                 Ok(report) => {
-                    emit(events_tx, format_lint_report(&name, &report));
+                    emit(events_tx, crate::kms::format_lint_report(&name, &report));
                 }
                 Err(e) => emit(events_tx, format!("lint failed: {e}")),
+            }
+        }
+        SlashCommand::KmsWrapUp { name, fix } => {
+            let Some(k) = crate::kms::resolve(&name) else {
+                emit(events_tx, format!("no KMS named '{name}'"));
+                return;
+            };
+            let lint = match crate::kms::lint(&k) {
+                Ok(r) => r,
+                Err(e) => {
+                    emit(events_tx, format!("wrap-up failed (lint): {e}"));
+                    return;
+                }
+            };
+            let stale = match crate::kms::scan_stale_markers(&k) {
+                Ok(s) => s,
+                Err(e) => {
+                    emit(events_tx, format!("wrap-up failed (stale scan): {e}"));
+                    return;
+                }
+            };
+            emit(
+                events_tx,
+                crate::kms::format_wrap_up_report(&name, &lint, &stale),
+            );
+            if fix {
+                if !has_actionable_issues(&lint, &stale) {
+                    emit(
+                        events_tx,
+                        "/kms wrap-up --fix: nothing actionable for kms-linker; skipping dispatch."
+                            .into(),
+                    );
+                } else if state.config.kms_active.is_empty() {
+                    // Subagent inherits the parent's tool registry (see
+                    // ProductionAgentFactory::build). KMS tools register
+                    // only when kms_active is non-empty — without that,
+                    // the subagent spawns with no usable tools.
+                    emit(
+                        events_tx,
+                        format!(
+                            "/kms wrap-up {name} --fix: no KMS attached to this session. \
+                             Run `/kms use {name}` first so KMS tools are registered."
+                        ),
+                    );
+                } else {
+                    let prompt = compose_kms_linker_prompt(&name, &lint, &stale);
+                    match crate::side_channel::spawn_side_channel(
+                        "kms-linker".to_string(),
+                        prompt,
+                        state.agent_factory.clone(),
+                        state.agent_defs.clone(),
+                        events_tx.clone(),
+                    )
+                    .await
+                    {
+                        Ok(id) => emit(events_tx, format!("✓ kms-linker dispatched (id: {id})")),
+                        Err(e) => emit(events_tx, format!("/kms wrap-up --fix: {e}")),
+                    }
+                }
+            }
+        }
+        SlashCommand::KmsMigrate { name, apply } => {
+            let Some(k) = crate::kms::resolve(&name) else {
+                emit(events_tx, format!("no KMS named '{name}'"));
+                return;
+            };
+            match crate::kms::migrate(&k, !apply) {
+                Ok(report) => {
+                    emit(
+                        events_tx,
+                        crate::kms::format_migration_report(&name, &report),
+                    );
+                    if apply {
+                        broadcast_kms_update(events_tx);
+                    }
+                }
+                Err(e) => emit(events_tx, format!("migrate failed: {e}")),
             }
         }
         SlashCommand::KmsFileAnswer { name, title } => {
@@ -1904,62 +2193,33 @@ pub async fn dispatch(
                 headers: Default::default(),
                 trusted: false,
             };
-            // 1. Persist to disk (so restarts keep the server).
-            let saved_to = match crate::config::save_mcp_server(&cfg, user) {
-                Ok(p) => p,
-                Err(e) => {
-                    emit(events_tx, format!("write failed: {e}"));
-                    return;
-                }
+            persist_and_register_mcp(state, events_tx, cfg, user).await;
+        }
+        SlashCommand::McpAddStdio {
+            name,
+            command,
+            args,
+            user,
+        } => {
+            // Stdio sibling of McpAdd. Same persist + spawn + register
+            // flow — the only differences are transport and where the
+            // address lives in the struct (command/args vs url). Env
+            // vars are not settable from the slash command in v1; if a
+            // server needs them (LDR_*, GITHUB_TOKEN, ...) the user
+            // edits mcp.json after the add. The first spawn happens
+            // here, so missing-env failures surface immediately
+            // through the existing error path.
+            let cfg = crate::mcp::McpServerConfig {
+                name: name.clone(),
+                transport: "stdio".into(),
+                command,
+                args,
+                env: Default::default(),
+                url: String::new(),
+                headers: Default::default(),
+                trusted: false,
             };
-            // 2. Spawn the client + list tools + register them.
-            match crate::mcp::McpClient::spawn_with_approver(
-                cfg.clone(),
-                Some(state.approver.clone()),
-            )
-            .await
-            {
-                Ok(client) => match client.list_tools().await {
-                    Ok(tool_infos) => {
-                        let names: Vec<String> =
-                            tool_infos.iter().map(|t| t.name.clone()).collect();
-                        for info in tool_infos {
-                            let tool = crate::mcp::McpTool::new(client.clone(), info);
-                            state.tool_registry.register(std::sync::Arc::new(tool));
-                        }
-                        state.mcp_clients.push(client);
-                        if let Err(e) = state.rebuild_agent(true) {
-                            emit(events_tx, format!("rebuild failed: {e}"));
-                            return;
-                        }
-                        emit(
-                            events_tx,
-                            format!(
-                                "mcp '{name}' added ({}, {} tool(s)) → {}\nTools: {}",
-                                if user { "user" } else { "project" },
-                                names.len(),
-                                saved_to.display(),
-                                names.join(", "),
-                            ),
-                        );
-                        broadcast_mcp_update(events_tx);
-                    }
-                    Err(e) => emit(
-                        events_tx,
-                        format!(
-                            "saved '{name}' to {} but list_tools failed: {e}",
-                            saved_to.display()
-                        ),
-                    ),
-                },
-                Err(e) => emit(
-                    events_tx,
-                    format!(
-                        "saved '{name}' to {} but connect failed: {e}",
-                        saved_to.display()
-                    ),
-                ),
-            }
+            persist_and_register_mcp(state, events_tx, cfg, user).await;
         }
         SlashCommand::McpRemove { name, user } => {
             match crate::config::remove_mcp_server(&name, user) {
@@ -2403,6 +2663,35 @@ pub async fn dispatch(
                 Err(e) => emit(events_tx, format!("/schedule uninstall: join error: {e}")),
             }
         }
+        SlashCommand::SchedulePresetList => {
+            emit(events_tx, crate::schedule_presets::format_preset_list());
+        }
+        SlashCommand::SchedulePresetAdd {
+            preset_id,
+            kms,
+            cwd,
+        } => {
+            let resolved_cwd = cwd.unwrap_or_else(|| {
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            });
+            match crate::schedule_presets::add_from_preset(&preset_id, &kms, resolved_cwd) {
+                Ok(schedule) => {
+                    let preset = crate::schedule_presets::find(&preset_id);
+                    let desc = preset
+                        .map(|p| crate::schedule_presets::render_description(p, &kms))
+                        .unwrap_or_default();
+                    emit(
+                        events_tx,
+                        format!(
+                            "✓ schedule '{id}' created from preset '{preset_id}' (cron: {cron})\n  {desc}",
+                            id = schedule.id,
+                            cron = schedule.cron,
+                        ),
+                    );
+                }
+                Err(e) => emit(events_tx, format!("/schedule preset add: {e}")),
+            }
+        }
         SlashCommand::Agent { name, prompt } => {
             // Spawn user-driven side channel. Returns immediately
             // with the assigned id; the agent runs concurrently on
@@ -2765,6 +3054,18 @@ fn emit(events_tx: &broadcast::Sender<ViewEvent>, text: String) {
     let _ = events_tx.send(ViewEvent::SlashOutput(text));
 }
 
+/// Multi-byte-aware truncation for one-line research-job display.
+/// Mirrors `repl::truncate_for_repl`; both modules need it but they
+/// don't currently share a string-utils home.
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars - 1).collect();
+    out.push('…');
+    out
+}
+
 /// GUI-side mirror of `repl::resolve_skill_install_target` so the Chat
 /// tab's `/skill install <name>` resolves a marketplace slug the same
 /// way the CLI does. Inlined here (rather than reaching into `repl::`)
@@ -2906,59 +3207,130 @@ fn truncate_inline(s: &str, max: usize) -> String {
     }
 }
 
-fn format_lint_report(name: &str, report: &crate::kms::LintReport) -> String {
-    let total = report.total_issues();
-    if total == 0 {
-        return format!("KMS '{name}': clean — no issues found.");
-    }
-    let mut out = format!("KMS '{name}': {total} issue(s)\n");
-    if !report.broken_links.is_empty() {
-        out.push_str(&format!(
-            "\nbroken links ({}):\n",
-            report.broken_links.len()
-        ));
-        for (page, target) in &report.broken_links {
-            out.push_str(&format!("  - {page} → pages/{target}.md (missing)\n"));
+// `format_lint_report` and `format_wrap_up_report` were moved to
+// `crate::kms` in M6.38.3 — they need to be reachable from CLI dispatch
+// (repl.rs) which builds without the `gui` feature, but `shell_dispatch`
+// is `#[cfg(feature = "gui")]`-gated. Pure functions, so co-locating
+// with the data types they format keeps the cfg surface narrower.
+
+/// True if the lint report or stale list contains anything the
+/// `kms-linker` subagent can sensibly act on. Orphan pages and missing
+/// frontmatter are excluded — orphans are often intentional, and a
+/// missing-frontmatter page is something the subagent's prompt tells
+/// it to leave alone (it can't safely invent a category).
+pub(crate) fn has_actionable_issues(
+    lint: &crate::kms::LintReport,
+    stale: &[crate::kms::StaleEntry],
+) -> bool {
+    !lint.broken_links.is_empty()
+        || !lint.missing_in_index.is_empty()
+        || !lint.missing_required_fields.is_empty()
+        || !stale.is_empty()
+}
+
+/// Build the initial prompt for the `kms-linker` subagent. Embeds the
+/// KMS name, the lint report (only the actionable categories — see
+/// `has_actionable_issues`), and the stale-marker list as a structured
+/// brief the subagent can iterate over with TodoWrite.
+pub(crate) fn compose_kms_linker_prompt(
+    name: &str,
+    lint: &crate::kms::LintReport,
+    stale: &[crate::kms::StaleEntry],
+) -> String {
+    let mut out = format!(
+        "You are fixing the KMS named `{name}`. Pass `kms: \"{name}\"` to every tool call.\n\n"
+    );
+    out.push_str("## Lint report\n\n");
+    if lint.broken_links.is_empty() {
+        out.push_str("- broken links: none\n");
+    } else {
+        out.push_str(&format!("- broken links ({}):\n", lint.broken_links.len()));
+        for (page, target) in &lint.broken_links {
+            out.push_str(&format!("  - on `{page}` → missing `pages/{target}.md`\n"));
         }
     }
-    if !report.index_orphans.is_empty() {
+    if lint.missing_in_index.is_empty() {
+        out.push_str("- pages missing from index: none\n");
+    } else {
         out.push_str(&format!(
-            "\nindex entries with no underlying file ({}):\n",
-            report.index_orphans.len()
+            "- pages missing from index ({}):\n",
+            lint.missing_in_index.len()
         ));
-        for stem in &report.index_orphans {
-            out.push_str(&format!("  - {stem}\n"));
+        for stem in &lint.missing_in_index {
+            out.push_str(&format!("  - `{stem}`\n"));
         }
     }
-    if !report.missing_in_index.is_empty() {
+    if lint.missing_required_fields.is_empty() {
+        out.push_str("- missing required frontmatter fields: none\n");
+    } else {
         out.push_str(&format!(
-            "\npages missing from index ({}):\n",
-            report.missing_in_index.len()
+            "- missing required frontmatter fields ({}):\n",
+            lint.missing_required_fields.len()
         ));
-        for stem in &report.missing_in_index {
-            out.push_str(&format!("  - {stem}\n"));
+        for (page, source_key, field) in &lint.missing_required_fields {
+            out.push_str(&format!(
+                "  - `{page}`: '{field}' (required by {source_key})\n"
+            ));
         }
     }
-    if !report.orphan_pages.is_empty() {
+    if !lint.orphan_pages.is_empty() {
         out.push_str(&format!(
-            "\norphan pages (no inbound links from other pages, {}):\n",
-            report.orphan_pages.len()
+            "- orphan pages ({}, do NOT modify — list in final report):\n",
+            lint.orphan_pages.len()
         ));
-        for stem in &report.orphan_pages {
-            out.push_str(&format!("  - {stem}\n"));
+        for stem in &lint.orphan_pages {
+            out.push_str(&format!("  - `{stem}`\n"));
         }
     }
-    if !report.missing_frontmatter.is_empty() {
-        out.push_str(&format!(
-            "\npages without YAML frontmatter ({}):\n",
-            report.missing_frontmatter.len()
-        ));
-        for stem in &report.missing_frontmatter {
-            out.push_str(&format!("  - {stem}\n"));
+
+    out.push_str("\n## Stale markers\n\n");
+    if stale.is_empty() {
+        out.push_str("- none\n");
+    } else {
+        out.push_str(&format!("- pages awaiting refresh ({}):\n", stale.len()));
+        for entry in stale {
+            out.push_str(&format!(
+                "  - `{}`: source `{}` re-ingested on {}\n",
+                entry.page_stem, entry.source_alias, entry.date
+            ));
         }
     }
+    out.push_str(
+        "\nWork through the categories in the order from your operating procedure. \
+         Use TodoWrite to track progress. Stop after one pass and produce the final \
+         **Fixed** / **Skipped** report.\n",
+    );
     out
 }
+
+/// Build the initial prompt for the `kms-reconcile` subagent. Names the
+/// target KMS, the optional focus topic, and whether the agent should
+/// dry-run (just propose) or apply (actually rewrite). The subagent's
+/// own body declares the four-pass procedure.
+pub(crate) fn compose_kms_reconcile_prompt(name: &str, focus: Option<&str>, apply: bool) -> String {
+    let mode_clause = if apply {
+        "**Apply mode** — rewrite outdated pages with `## History` sections, write `Conflict — <topic>.md` pages for ambiguous cases. Every write must preserve the original claim somewhere."
+    } else {
+        "**Dry-run mode** — DO NOT write to the KMS. Produce the same final report you would in apply mode, listing what you *would* change, but make no `KmsWrite` or `KmsAppend` calls. The user re-runs with `--apply` to execute."
+    };
+    let focus_clause = match focus {
+        Some(f) => format!(
+            "\n\n## Focus\n\nNarrow this pass to the topic / entity: `{f}`. Skip pages unrelated to this focus.",
+        ),
+        None => String::new(),
+    };
+    format!(
+        "You are reconciling contradictions in the KMS named `{name}`. Pass `kms: \"{name}\"` to every tool call.\n\
+         \n\
+         {mode_clause}{focus_clause}\n\
+         \n\
+         Work through the four-pass procedure from your operating manual (claims, entities, decisions, source-freshness). Use TodoWrite to track progress. Stop after one pass and produce the final **Auto-resolved** / **Flagged for user** / **Stale pages updated** report."
+    )
+}
+
+// `format_schedule_preset_list` and `format_migration_report` moved to
+// their data-owning modules (schedule_presets / kms) in M6.38.3. See
+// the comment above `format_lint_report`'s removal for rationale.
 
 /// M6.25 BUG #4: alias-sanitizer used by /kms file-answer. Same rules
 /// as `kms::sanitize_alias` (which is private to that module).
@@ -2984,6 +3356,71 @@ fn sanitize_alias_for_dispatch(raw: &str) -> String {
 fn broadcast_mcp_update(events_tx: &broadcast::Sender<ViewEvent>) {
     let payload = crate::gui::build_mcp_update_payload();
     let _ = events_tx.send(ViewEvent::McpUpdate(payload.to_string()));
+}
+
+/// Shared persist + spawn + tool-registration flow used by both
+/// `/mcp add <url>` (HTTP) and `/mcp add <command> [args...]` (stdio).
+/// Caller builds the right [`McpServerConfig`] (transport, url-or-cmd);
+/// this function handles writing to mcp.json, spawning the live client,
+/// listing its tools, registering them in the session, rebuilding the
+/// agent, and emitting the user-facing result message.
+async fn persist_and_register_mcp(
+    state: &mut crate::shared_session::WorkerState,
+    events_tx: &broadcast::Sender<ViewEvent>,
+    cfg: crate::mcp::McpServerConfig,
+    user: bool,
+) {
+    let name = cfg.name.clone();
+    let saved_to = match crate::config::save_mcp_server(&cfg, user) {
+        Ok(p) => p,
+        Err(e) => {
+            emit(events_tx, format!("write failed: {e}"));
+            return;
+        }
+    };
+    match crate::mcp::McpClient::spawn_with_approver(cfg.clone(), Some(state.approver.clone()))
+        .await
+    {
+        Ok(client) => match client.list_tools().await {
+            Ok(tool_infos) => {
+                let names: Vec<String> = tool_infos.iter().map(|t| t.name.clone()).collect();
+                for info in tool_infos {
+                    let tool = crate::mcp::McpTool::new(client.clone(), info);
+                    state.tool_registry.register(std::sync::Arc::new(tool));
+                }
+                state.mcp_clients.push(client);
+                if let Err(e) = state.rebuild_agent(true) {
+                    emit(events_tx, format!("rebuild failed: {e}"));
+                    return;
+                }
+                emit(
+                    events_tx,
+                    format!(
+                        "mcp '{name}' added ({}, {} tool(s)) → {}\nTools: {}",
+                        if user { "user" } else { "project" },
+                        names.len(),
+                        saved_to.display(),
+                        names.join(", "),
+                    ),
+                );
+                broadcast_mcp_update(events_tx);
+            }
+            Err(e) => emit(
+                events_tx,
+                format!(
+                    "saved '{name}' to {} but list_tools failed: {e}",
+                    saved_to.display()
+                ),
+            ),
+        },
+        Err(e) => emit(
+            events_tx,
+            format!(
+                "saved '{name}' to {} but connect failed: {e}",
+                saved_to.display()
+            ),
+        ),
+    }
 }
 
 /// M6.16 BUG H1 helper: refresh skill_store + rebuild system prompt

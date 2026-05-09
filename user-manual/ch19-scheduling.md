@@ -228,6 +228,42 @@ $ thclaws daemon
 
 Use this to verify a schedule actually fires before installing the launchd/systemd entry.
 
+## Pre-packaged presets for KMS maintenance
+
+Four ready-made schedule templates ship with thClaws, covering common KMS-maintenance cadences. Inspired by obsidian-second-brain's four scheduled agents (nightly close, weekly review, contradiction sweep, vault-health), packaged for direct instantiation.
+
+```
+❯ /schedule preset list
+schedule presets:
+  ID                     CRON           DESCRIPTION
+  nightly-close          0 23 * * *     Wrap up the day — lint + auto-fix + stale-marker review (KMS '{kms}')
+  weekly-review          0 9 * * SUN    Sunday-morning consolidation across active KMSes
+  contradiction-sweep    0 12 * * *     Daily noon reconcile — auto-resolve clear-winner contradictions in '{kms}'
+  vault-health           0 6 * * *      Morning lint summary at 06:00 for KMS '{kms}'
+
+add via: /schedule preset add <id> --kms <name> [--cwd <path>]
+```
+
+Each preset bundles a cron expression with a prompt template that references `{kms}` (substituted at instantiation). For example, `nightly-close` runs `/kms wrap-up <name> --fix`; `contradiction-sweep` runs `/kms reconcile <name> --apply`.
+
+```
+❯ /schedule preset add nightly-close --kms mynotes
+✓ schedule 'nightly-close-mynotes' created from preset 'nightly-close' (cron: 0 23 * * *)
+  Wrap up the day — lint + auto-fix + stale-marker review (KMS 'mynotes')
+```
+
+Schedule id format is `<preset-id>-<kms>`, so the same preset can target multiple KMSes without collision (`nightly-close-foo`, `nightly-close-bar`). After instantiation, the preset becomes a regular schedule — edit cwd / cron / model via the normal `/schedule` commands, or `/schedule rm <id>` to remove.
+
+| Preset | When | What it does |
+|---|---|---|
+| `nightly-close` | Every day at 23:00 | Walk pages, fix broken markdown page links, append missing index entries, refresh STALE pages |
+| `weekly-review` | Sundays at 09:00 | Consolidate overlapping pages into canonical ones (with pointers, not deletion) + run hygiene pass |
+| `contradiction-sweep` | Every day at noon | Four-pass scan (claims / entities / decisions / source-freshness), auto-resolve clear winners with `## History`, file `Conflict — <topic>.md` for ambiguous cases |
+| `vault-health` | Every day at 06:00 | Read-only health report — broken links, orphans, missing-from-index, missing frontmatter, STALE markers |
+
+> [!IMPORTANT]
+> Preset prompts are **natural-language directives** that instruct the agent to use KMS tools (KmsRead/Search/Write/Append) directly. The scheduler fires presets via `thclaws --print` which does not run slash-command dispatch — so the preset prompts cannot use slash commands like `/kms reconcile`. The cwd's `.thclaws/settings.json` must have the target KMS in `kms_active` so KMS tools register before the agent starts.
+
 ## Practical recipes
 
 ### Daily morning briefing

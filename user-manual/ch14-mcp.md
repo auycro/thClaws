@@ -39,7 +39,7 @@ automatically for protected servers.
   "mcpServers": {
     "agentic-cloud": {
       "transport": "http",
-      "url": "https://api.agentic.cloud/mcp",
+      "url": "https://mcp.example.com",
       "headers": { "Authorization": "Bearer …" }
     }
   }
@@ -78,6 +78,42 @@ The server is persisted to `mcp.json`, connected, and its tools are
 registered into the current session — no restart, works in the CLI
 REPL and either GUI tab. `--user` writes to
 `~/.config/thclaws/mcp.json` instead.
+
+For local stdio servers (a binary on your PATH, an `npx` package, a
+Python module), pass the command instead of a URL:
+
+```
+❯ /mcp add ldr ldr-mcp
+mcp 'ldr' added (project, stdio, 8 tool(s)) → .thclaws/mcp.json
+
+❯ /mcp add gh-mcp npx -y @modelcontextprotocol/server-github
+mcp 'gh-mcp' added (project, stdio, 20 tool(s)) → .thclaws/mcp.json
+```
+
+The first non-flag positional is the binary; remaining tokens are
+passed as args. Routing is automatic — anything that doesn't start
+with `http://` / `https://` is treated as a stdio command.
+
+Servers that need environment variables (`LDR_LLM_*`, `GITHUB_TOKEN`,
+…) will save successfully but fail to spawn on the first launch. The
+error message points at the `mcp.json` file — open it and add the
+`env` block by hand:
+
+```json
+{
+  "mcpServers": {
+    "ldr": {
+      "command": "ldr-mcp",
+      "env": {
+        "LDR_LLM_PROVIDER": "anthropic",
+        "LDR_LLM_ANTHROPIC_API_KEY": "sk-ant-..."
+      }
+    }
+  }
+}
+```
+
+Then re-run `/mcp add ldr ldr-mcp` (or restart) to pick up the env.
 
 Remove:
 

@@ -201,8 +201,36 @@ impl AgentDefsConfig {
     /// has no `name:` frontmatter) with the embedded source. Built-ins
     /// land at the lowest priority so any user/project agent def with
     /// the same name will override them.
+    /// Apply settings.json overrides for built-in subagents' `model:`
+    /// field. Each built-in that needs settings tunability gets a
+    /// matching `<name>_subagent_model` field on AppConfig; this
+    /// helper resolves them against the loaded AgentDefs by name and
+    /// edits in place. Disk-loaded user agent files at
+    /// `.thclaws/agents/<name>.md` still win because they replaced
+    /// the embedded AgentDef during the prior load_md_dir pass — this
+    /// only edits whatever's currently registered under that name
+    /// (built-in or user, doesn't matter).
+    pub fn apply_builtin_subagent_overrides(&mut self, config: &crate::config::AppConfig) {
+        if let Some(ref m) = config.translator_subagent_model {
+            if let Some(def) = self.agents.iter_mut().find(|d| d.name == "translator") {
+                def.model = Some(m.clone());
+            }
+        }
+        // Future built-in subagents add their override branch here.
+        // Pattern: read AppConfig::<name>_subagent_model, find AgentDef
+        // by name, replace `model` field. Three lines per built-in.
+    }
+
     fn seed_builtins(&mut self) {
-        const BUILTINS: &[(&str, &str)] = &[("dream", include_str!("default_prompts/dream.md"))];
+        const BUILTINS: &[(&str, &str)] = &[
+            ("dream", include_str!("default_prompts/dream.md")),
+            ("translator", include_str!("default_prompts/translator.md")),
+            ("kms-linker", include_str!("default_prompts/kms-linker.md")),
+            (
+                "kms-reconcile",
+                include_str!("default_prompts/kms-reconcile.md"),
+            ),
+        ];
         for (fallback_name, raw) in BUILTINS {
             if let Some(agent) = Self::parse_agent_md_str(raw, fallback_name) {
                 self.agents.push(agent);
@@ -452,6 +480,98 @@ plugin-only reviewer
             config.get("reviewer").unwrap().instructions,
             "plugin-only reviewer"
         );
+    }
+
+    #[test]
+    fn seed_builtins_includes_translator() {
+        let mut config = AgentDefsConfig::default();
+        config.seed_builtins();
+        let translator = config
+            .get("translator")
+            .expect("built-in translator agent should be seeded");
+        assert_eq!(translator.name, "translator");
+        assert!(!translator.instructions.is_empty());
+        // Frontmatter declares the gpt-4.1 default.
+        assert_eq!(translator.model.as_deref(), Some("gpt-4.1"));
+        // Tool whitelist captured — translator has no Bash, no KMS,
+        // no Task. Just file I/O.
+        assert!(translator.tools.iter().any(|t| t == "Read"));
+        assert!(translator.tools.iter().any(|t| t == "Write"));
+        assert!(!translator.tools.iter().any(|t| t == "Bash"));
+    }
+
+    /// settings.json `translator_subagent_model` swaps the embedded
+    /// `gpt-4.1` for the override value before the AgentDef reaches
+    /// the factory. Disk-resident user agents at
+    /// `.thclaws/agents/translator.md` would have replaced the
+    /// AgentDef during the prior load_md_dir pass, so this only
+    /// runs against the embedded built-in.
+    #[test]
+    fn apply_builtin_subagent_overrides_replaces_translator_model() {
+        let mut config = AgentDefsConfig::default();
+        config.seed_builtins();
+
+        let mut app_config = crate::config::AppConfig::default();
+        app_config.translator_subagent_model = Some("claude-sonnet-4-6".into());
+
+        config.apply_builtin_subagent_overrides(&app_config);
+        let translator = config.get("translator").unwrap();
+        assert_eq!(translator.model.as_deref(), Some("claude-sonnet-4-6"));
+    }
+
+    /// Absent override leaves the embedded default in place.
+    #[test]
+    fn apply_builtin_subagent_overrides_no_op_when_absent() {
+        let mut config = AgentDefsConfig::default();
+        config.seed_builtins();
+
+        let app_config = crate::config::AppConfig::default();
+        config.apply_builtin_subagent_overrides(&app_config);
+        let translator = config.get("translator").unwrap();
+        assert_eq!(translator.model.as_deref(), Some("gpt-4.1"));
+    }
+
+    #[test]
+    fn seed_builtins_includes_kms_linker() {
+        let mut config = AgentDefsConfig::default();
+        config.seed_builtins();
+        let linker = config
+            .get("kms-linker")
+            .expect("built-in kms-linker agent should be seeded");
+        assert_eq!(linker.name, "kms-linker");
+        assert!(!linker.instructions.is_empty());
+        // Tool whitelist: KMS read/write surface only — no Bash, no
+        // KmsDelete (the operating procedure forbids deletion).
+        assert!(linker.tools.iter().any(|t| t == "KmsRead"));
+        assert!(linker.tools.iter().any(|t| t == "KmsSearch"));
+        assert!(linker.tools.iter().any(|t| t == "KmsWrite"));
+        assert!(linker.tools.iter().any(|t| t == "KmsAppend"));
+        assert!(!linker.tools.iter().any(|t| t == "KmsDelete"));
+        assert!(!linker.tools.iter().any(|t| t == "Bash"));
+    }
+
+    #[test]
+    fn seed_builtins_includes_kms_reconcile() {
+        let mut config = AgentDefsConfig::default();
+        config.seed_builtins();
+        let reconcile = config
+            .get("kms-reconcile")
+            .expect("built-in kms-reconcile agent should be seeded");
+        assert_eq!(reconcile.name, "kms-reconcile");
+        assert!(!reconcile.instructions.is_empty());
+        // Tool whitelist: same shape as kms-linker — KMS surface only,
+        // no KmsDelete (reconcile preserves history; rewrites with
+        // History sections, never silently drops claims), no Bash.
+        assert!(reconcile.tools.iter().any(|t| t == "KmsRead"));
+        assert!(reconcile.tools.iter().any(|t| t == "KmsSearch"));
+        assert!(reconcile.tools.iter().any(|t| t == "KmsWrite"));
+        assert!(reconcile.tools.iter().any(|t| t == "KmsAppend"));
+        assert!(reconcile.tools.iter().any(|t| t == "TodoWrite"));
+        assert!(!reconcile.tools.iter().any(|t| t == "KmsDelete"));
+        assert!(!reconcile.tools.iter().any(|t| t == "Bash"));
+        // Procedure-defining keywords from the body.
+        assert!(reconcile.instructions.contains("History"));
+        assert!(reconcile.instructions.contains("Conflict"));
     }
 
     #[test]

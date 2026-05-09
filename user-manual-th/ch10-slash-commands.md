@@ -11,7 +11,7 @@ Slash commands คือ control plane ของ thClaws พิมพ์ `/` ต
 > `/plugin install`, `/kms use`) ยังเปิดใช้ผลลัพธ์ใน session ปัจจุบัน
 > ได้เลยโดยไม่ต้อง restart ด้วย
 
-## ลำดับการตีความคำสั่ง
+## ลำดับการตีความคำสั่ง {#resolution-order}
 
 เมื่อคุณพิมพ์ `/<word>` thClaws จะตีความตามลำดับนี้:
 

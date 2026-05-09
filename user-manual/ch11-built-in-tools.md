@@ -46,10 +46,26 @@ Defaults:
 |---|---|---|
 | `WebFetch` | prompt | HTTP GET (100 KB body cap) with Markdown conversion |
 | `WebSearch` | prompt | Web search via Tavily / Brave / DuckDuckGo |
+| `WebScrape` | prompt | Headless-browser scrape via HAL (JS-rendered pages, lazy content, selector-based cleanup) — appears only when `HAL_API_KEY` is set |
+| `YouTubeTranscript` | prompt | Fetch YouTube captions via HAL (multi-language fallback, optional timestamps) — appears only when `HAL_API_KEY` is set |
 
 Search provider is picked via `TAVILY_API_KEY` or `BRAVE_SEARCH_API_KEY`
 if set, else DuckDuckGo (no key, lower quality). Override with
 `searchEngine: "tavily"` in settings.
+
+### Service-key tools (HAL)
+
+`WebScrape` and `YouTubeTranscript` call HAL's public API
+(`hal.thaigpt.com/api`) — both gated on a single `HAL_API_KEY`. Paste
+it in **Settings → Providers → Service keys → HAL Public API**, or set
+`HAL_API_KEY` in your shell. The tools auto-appear in the model's
+tool list when the key is present and disappear when it isn't, so
+they never waste tokens or invite failed calls. Live key changes flip
+them in/out on the next turn — no restart.
+
+This pattern is general: any tool can declare `requires_env` and the
+registry filters it out when the listed env var(s) aren't set. The
+two HAL tools are the first concrete users.
 
 ## Documents — PDF & Office
 

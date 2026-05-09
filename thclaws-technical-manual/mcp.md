@@ -84,6 +84,15 @@ state.rebuild_agent(true)   → next turn sees the new tools
 
 **Ordering:** servers spawn in **parallel** background tasks (`shared_session.rs:726-757`). Each one independently emits either `ShellInput::McpReady { … }` or `ShellInput::McpFailed { … }` once its handshake completes. The worker's main `select!` loop drains these messages and registers tools as they arrive. A slow / hung server doesn't block faster ones.
 
+**Runtime add via `/mcp add`.** Two shapes routed by argument shape:
+
+| Form | Slash variant | `transport` written |
+|---|---|---|
+| `/mcp add <name> <url>` (URL starts with `http://` / `https://`) | `SlashCommand::McpAdd` | `"http"` |
+| `/mcp add <name> <command> [args...]` (anything else) | `SlashCommand::McpAddStdio` | `"stdio"` |
+
+Both share the `persist_and_register_mcp` helper (`shell_dispatch.rs`): write to `mcp.json` → `McpClient::spawn_with_approver` → `list_tools` → `tool_registry.register` → `rebuild_agent`. Stdio entries flow through the §4 allowlist check on first spawn. The slash form does not accept `--env KEY=VAL`; servers needing env vars (`LDR_LLM_*`, `GITHUB_TOKEN`, …) are saved successfully but error on spawn — the user-facing message points at `mcp.json` so the user can hand-add the `env` block and retry.
+
 **Approval modal coordination:** the `ready_gate` (signaled by frontend's `frontend_ready` IPC after the working-directory + secrets pickers close) gates the worker's main loop start, so an MCP spawn approval modal can't pop up before the user has even chosen a workspace.
 
 ---

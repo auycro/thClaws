@@ -105,6 +105,7 @@ pub fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
         ViewEvent::ProviderUpdate(json) => vec![json.clone()],
         ViewEvent::KmsUpdate(json) => vec![json.clone()],
         ViewEvent::McpUpdate(json) => vec![json.clone()],
+        ViewEvent::ResearchUpdate(json) => vec![json.clone()],
         ViewEvent::ModelPickerOpen(json) => vec![json.clone()],
         ViewEvent::ScheduleAddOpen(json) => vec![json.clone()],
         ViewEvent::ContextWarning { file_size_mb } => vec![serde_json::json!({
@@ -343,8 +344,14 @@ pub fn render_terminal_ansi(state: &mut TerminalRenderState, ev: &ViewEvent) -> 
             state.pending_newline_after_tool = false;
             return Some(format!("\r\n\x1b[2m[tool: {label}]\x1b[0m"));
         }
-        ViewEvent::ToolCallResult { .. } => {
+        ViewEvent::ToolCallResult { output, .. } => {
             state.last_was_thinking = false;
+            // M6.38.9: surface upstream source (e.g. "via Tavily")
+            // next to the ✓ when the tool emits a `Source: <engine>`
+            // line. Independent of whether the model surfaces it.
+            let src_suffix = crate::tools::extract_tool_source(output)
+                .map(|s| format!(" \x1b[2m(via {s})\x1b[0m"))
+                .unwrap_or_default();
             if state.merging {
                 state.merging = false;
                 state.last_tool_count += 1;
@@ -352,12 +359,12 @@ pub fn render_terminal_ansi(state: &mut TerminalRenderState, ev: &ViewEvent) -> 
                 let label = state.last_tool_label.clone().unwrap_or_default();
                 let count = state.last_tool_count;
                 return Some(format!(
-                    "\r\x1b[2K\x1b[2m[tool: {label}]\x1b[0m \x1b[32m✓\x1b[0m \x1b[2m×{count}\x1b[0m"
+                    "\r\x1b[2K\x1b[2m[tool: {label}]\x1b[0m \x1b[32m✓\x1b[0m{src_suffix} \x1b[2m×{count}\x1b[0m"
                 ));
             }
             state.last_tool_count = 1;
             state.pending_newline_after_tool = true;
-            return Some(" \x1b[32m✓\x1b[0m".to_string());
+            return Some(format!(" \x1b[32m✓\x1b[0m{src_suffix}"));
         }
         _ => {}
     }
@@ -433,6 +440,7 @@ pub fn render_terminal_ansi(state: &mut TerminalRenderState, ev: &ViewEvent) -> 
         ViewEvent::ProviderUpdate(_) => None,
         ViewEvent::KmsUpdate(_) => None,
         ViewEvent::McpUpdate(_) => None,
+        ViewEvent::ResearchUpdate(_) => None,
         ViewEvent::ModelPickerOpen(_) => None,
         ViewEvent::ScheduleAddOpen(_) => None,
         ViewEvent::ContextWarning { file_size_mb } => Some(format!(

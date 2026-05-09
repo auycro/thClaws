@@ -157,7 +157,7 @@ directory (Chapter 3), a dialog asks you to pick how your secrets
 should be stored. This runs before thClaws touches the OS keychain at
 all — pick `.env` and no keychain prompt ever fires.
 
-![Where should thClaws store API keys? — OS keychain (recommended) vs .env file](../user-manual-img/ch-04/secrets-backend-chooser.png)
+![Where should thClaws store API keys? — OS keychain (recommended) vs .env file](../user-manual-img/ch-03/secrets-backend-chooser.png)
 
 Two choices:
 

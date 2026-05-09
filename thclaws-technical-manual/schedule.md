@@ -538,7 +538,11 @@ Adding real Windows support means: Task Scheduler XML emit (or `windows-service`
 
 Test-time isolation: `WatchManager::from_store_with_path` and `InProcessScheduler::with_store_path` thread an explicit `store_path` through the dispatcher to `run_once_with`, so integration tests can use a tempdir-backed store without polluting the user's real schedules.json. Per-id log dirs are cleaned up at the end of each test.
 
-Total schedule-related tests: 24 unit + 6 integration + 8 IPC = ~38 of the project's 931 lib tests.
+**Preset tests (M6.38):**
+- `schedule_presets::tests::*` — 6 unit tests covering preset shape, cron validation, template substitution, lookup, and `add_from_preset` error paths (see §15.6 for the full breakdown)
+- `repl::tests::parse_slash_schedule_preset_*` — 5 parser tests for `/schedule preset list` / `add` flag handling
+
+Total schedule-related tests: 24 unit + 6 integration + 8 IPC + 6 preset unit + 5 preset parser = ~49 of the project's 1051 lib tests.
 
 ## 14. Operations notes
 
@@ -576,7 +580,154 @@ Per-fire is a child process — `ps aux | grep thclaws` to find it, `kill <pid>`
 - `~/.local/share/thclaws/daemon.log` grows unbounded (launchd doesn't rotate)
 - Manual prune: `find ~/.local/share/thclaws/logs -mtime +30 -delete` for old per-job logs, `> ~/.local/share/thclaws/daemon.log` to truncate
 
-## 15. Deferred / known gaps
+## 15. Pre-packaged presets (M6.38)
+
+`crate::schedule_presets` ([schedule_presets.rs](../crates/core/src/schedule_presets.rs)) ships four ready-made schedule templates for common KMS-maintenance cadences. Inspired by obsidian-second-brain's four scheduled agents (nightly close, weekly review, contradiction sweep, vault-health). Pure-content layer on top of §1's three-layer scheduler — no scheduler-plumbing changes; presets just produce `Schedule` entries that flow through the existing in-process / daemon paths.
+
+See [`dev-log/168`](../dev-log/168-schedule-presets-m6-38.md) for the original sprint context.
+
+### 15.1 The `SchedulePreset` shape
+
+```rust
+pub struct SchedulePreset {
+    pub id: &'static str,
+    pub description: &'static str,
+    pub cron: &'static str,
+    pub prompt_template: &'static str,
+}
+
+pub fn presets() -> &'static [SchedulePreset];
+pub fn find(id: &str) -> Option<&'static SchedulePreset>;
+pub fn list_ids() -> Vec<&'static str>;
+pub fn render_prompt(preset: &SchedulePreset, kms: &str) -> String;
+pub fn render_description(preset: &SchedulePreset, kms: &str) -> String;
+pub fn add_from_preset(preset_id: &str, kms: &str, cwd: PathBuf) -> Result<Schedule>;
+```
+
+`prompt_template` uses `{kms}` as the only template variable. Future variables (e.g., `{cwd}`, `{user}`) would extend `render_prompt` — currently only `{kms}` is supported.
+
+### 15.2 Shipped presets
+
+| ID | Cron | Prompt template |
+|---|---|---|
+| `nightly-close` | `0 23 * * *` | `/kms wrap-up {kms} --fix` |
+| `weekly-review` | `0 9 * * SUN` | `/dream\n/kms wrap-up {kms}` |
+| `contradiction-sweep` | `0 12 * * *` | `/kms reconcile {kms} --apply` |
+| `vault-health` | `0 6 * * *` | `/kms lint {kms}` |
+
+Note `weekly-review` uses `SUN` (three-letter day name) rather than numeric `0` — the underlying `cron` crate that backs `validate_cron` (§3) accepts string day-of-week aliases (`MON`/`TUE`/…) but rejects bare `0` for Sunday in 5-field POSIX form. The test `all_presets_have_validatable_cron` catches this kind of typo at test-time.
+
+### 15.3 `add_from_preset` flow
+
+```rust
+pub fn add_from_preset(
+    preset_id: &str,
+    kms: &str,
+    cwd: PathBuf,
+) -> Result<Schedule> {
+    let preset = find(preset_id).ok_or_else(/* unknown-preset error with hint listing valid ids */)?;
+    if kms.is_empty() {
+        return Err(/* preset prompts substitute {kms}; reject early */);
+    }
+    let schedule = Schedule {
+        id: format!("{}-{kms}", preset.id),
+        cron: preset.cron.into(),
+        cwd,
+        prompt: render_prompt(preset, kms),
+        // ... defaults for model / max_iterations / timeout / watch
+        ..Default::default()
+    };
+    let mut store = ScheduleStore::load()?;
+    store.add(schedule.clone())?;
+    store.save()?;
+    Ok(schedule)
+}
+```
+
+The generated id is `<preset.id>-<kms>` (e.g., `nightly-close-mynotes`), so the same preset can target multiple KMSes without colliding in the store. After instantiation the `Schedule` is just a regular schedule — editable via `/schedule pause`, `/schedule rm`, or by hand-editing `~/.config/thclaws/schedules.json`.
+
+`ScheduleStore::add` already enforces unique ids and rejects collisions; instantiating the same preset twice for the same KMS produces a clear error.
+
+### 15.4 Slash-command surface
+
+Two new variants in `SlashCommand`:
+
+```rust
+SchedulePresetList,
+SchedulePresetAdd {
+    preset_id: String,
+    kms: String,
+    cwd: Option<PathBuf>,
+},
+```
+
+Routed via `parse_schedule_preset_subcommand` in [repl.rs](../crates/core/src/repl.rs):
+
+| Syntax | Effect |
+|---|---|
+| `/schedule preset` | List presets (alias `list`, `ls`) |
+| `/schedule preset list` / `ls` | Same |
+| `/schedule preset add <id> --kms <name>` | Instantiate. `--cwd` defaults to current dir. |
+| `/schedule preset add <id> --kms <name> --cwd <path>` | Override cwd |
+
+Order-insensitive flag parsing — `--kms` and `--cwd` can appear before or after the preset id.
+
+### 15.5 GUI + CLI dispatch
+
+Both surfaces call `crate::shell_dispatch::format_schedule_preset_list` for the list command (aligned table with ID / CRON / DESCRIPTION columns). The add command goes through `schedule_presets::add_from_preset` directly; same call shape on both sides:
+
+```rust
+let resolved_cwd = cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+match schedule_presets::add_from_preset(&preset_id, &kms, resolved_cwd) {
+    Ok(schedule) => emit(format!(
+        "✓ schedule '{}' created from preset '{}' (cron: {})\n  {}",
+        schedule.id,
+        preset_id,
+        schedule.cron,
+        schedule_presets::find(&preset_id)
+            .map(|p| schedule_presets::render_description(p, &kms))
+            .unwrap_or_default(),
+    )),
+    Err(e) => emit(format!("/schedule preset add: {e}")),
+}
+```
+
+There is no GUI sidebar broadcast on add yet (no `broadcast_schedule_update` helper exists in the dispatch module — the schedule sidebar polls or uses a different refresh path; out of scope to wire up here). The new schedule shows up on the next manual sidebar refresh or `/schedule list` call.
+
+### 15.6 Testing
+
+`schedule_presets::tests` (6):
+- `all_presets_have_validatable_cron` — every shipped preset's cron passes `schedule::validate_cron` (the same validator runtime uses on `add`). Catches future typos at test-time.
+- `render_prompt_substitutes_kms` — happy path
+- `render_prompt_substitutes_multiple_occurrences` — `weekly-review`'s multi-line template substitutes correctly
+- `find_returns_none_for_unknown_id`
+- `list_ids_includes_all_presets` — full enumeration matches the count
+- `add_from_preset_rejects_unknown` — error message lists known preset IDs as hints
+- `add_from_preset_rejects_empty_kms` — empty KMS would render literal `{kms}` in the prompt; reject early
+
+`repl::tests` (5 KMS-side parser arms):
+- `parse_slash_schedule_preset_bare_lists` — `/schedule preset`, `list`, `ls` all → `SchedulePresetList`
+- `parse_slash_schedule_preset_add_basic`
+- `parse_slash_schedule_preset_add_with_cwd`
+- `parse_slash_schedule_preset_add_rejects_missing_kms`
+- `parse_slash_schedule_preset_add_rejects_missing_id`
+
+### 15.7 Adding a new preset
+
+Two-line addition to `presets()`:
+
+```rust
+SchedulePreset {
+    id: "my-cadence",
+    description: "...",
+    cron: "...",
+    prompt_template: "...{kms}...",
+},
+```
+
+The `all_presets_have_validatable_cron` test catches cron typos. Slash commands and CLI dispatch automatically pick the new preset up via `find` and `presets()`. No scheduler-plumbing changes needed.
+
+## 16. Deferred / known gaps
 
 - **Windows daemon** — see [section 12](#12-windows-status)
 - **IPC socket** — daemon and CLI talk only via store + PID file. `schedule reload`, live `schedule logs --tail`, daemon-side metrics are deferred. The 30s reconciler picks up store edits within one tick.

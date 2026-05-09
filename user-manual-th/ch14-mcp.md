@@ -39,7 +39,7 @@ thClaws จะจัดการ OAuth 2.1 พร้อม PKCE ให้โด�
   "mcpServers": {
     "agentic-cloud": {
       "transport": "http",
-      "url": "https://api.agentic.cloud/mcp",
+      "url": "https://mcp.example.com",
       "headers": { "Authorization": "Bearer …" }
     }
   }
@@ -77,6 +77,41 @@ Server จะถูกบันทึกลง `mcp.json` เชื่อมต�
 เข้า session ปัจจุบันโดยไม่ต้อง restart ใช้ได้ทั้ง CLI REPL และ GUI
 ทั้งสองแท็บ หากต้องการเขียนลง `~/.config/thclaws/mcp.json` แทน ให้ใช้
 `--user`
+
+สำหรับ stdio server (binary ใน PATH, npx package, Python module)
+ให้ใส่คำสั่งแทน URL:
+
+```
+❯ /mcp add ldr ldr-mcp
+mcp 'ldr' added (project, stdio, 8 tool(s)) → .thclaws/mcp.json
+
+❯ /mcp add gh-mcp npx -y @modelcontextprotocol/server-github
+mcp 'gh-mcp' added (project, stdio, 20 tool(s)) → .thclaws/mcp.json
+```
+
+token ตัวแรกที่ไม่ใช่ flag คือ binary ส่วน token ที่เหลือจะถูกส่งเป็น
+args การกำหนดเส้นทางทำเองอัตโนมัติ — ถ้าไม่ขึ้นต้นด้วย `http://` /
+`https://` จะถูกถือว่าเป็นคำสั่ง stdio
+
+Server ที่ต้องการ environment variables (`LDR_LLM_*`, `GITHUB_TOKEN`,
+…) จะบันทึกได้สำเร็จ แต่ spawn ครั้งแรกจะล้มเหลว ข้อความ error จะชี้
+ไฟล์ `mcp.json` เปิดแล้วเติม block `env` ด้วยมือ:
+
+```json
+{
+  "mcpServers": {
+    "ldr": {
+      "command": "ldr-mcp",
+      "env": {
+        "LDR_LLM_PROVIDER": "anthropic",
+        "LDR_LLM_ANTHROPIC_API_KEY": "sk-ant-..."
+      }
+    }
+  }
+}
+```
+
+จากนั้นรัน `/mcp add ldr ldr-mcp` ซ้ำ (หรือ restart) เพื่อให้ env ถูกโหลด
 
 ลบ:
 

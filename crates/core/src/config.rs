@@ -91,6 +91,48 @@ pub struct AppConfig {
     /// via the sidebar or `/kms use NAME`.
     #[serde(default)]
     pub kms_active: Vec<String>,
+
+    /// M6.39.5: opt-in to loading user-level Claude Code memory
+    /// (`~/.claude/CLAUDE.md` and `~/.claude/AGENTS.md`) into
+    /// thClaws's system prompt. Default `false` — the user's Claude
+    /// Code identity (Pinn.AI bias, "use Claude Code's MCP tools",
+    /// etc.) shouldn't bleed into thClaws's behavior just because
+    /// both tools happen to live on the same machine.
+    ///
+    /// Project-level `<cwd>/.claude/CLAUDE.md` (committed to a repo)
+    /// keeps loading regardless — that's repo-shared instructions,
+    /// not user-personal config. The flag only affects the user-home
+    /// `~/.claude/*` files.
+    ///
+    /// Set `true` if you intentionally maintain one CLAUDE.md across
+    /// both tools and want the parity. The thClaws-native path
+    /// (`~/.config/thclaws/CLAUDE.md`) loads either way.
+    #[serde(default)]
+    pub claude_md_compat: bool,
+
+    /// Per-skill model recommendations from settings.json. Overrides the
+    /// `model:` field declared in the SKILL.md frontmatter for the named
+    /// built-in skill. Lets users say "for my extract-and-save runs use
+    /// claude-sonnet-4-6 not the gpt-4.1-nano default" without forking
+    /// the entire SKILL.md body. Each new built-in that needs special
+    /// model selection adds its own field here (e.g. `tts_skill_models`,
+    /// `transcribe_skill_models`) — that pattern is more discoverable
+    /// in settings.json than a generic `skill_models` map keyed by
+    /// skill name.
+    #[serde(default)]
+    pub extract_save_skill_models: Option<crate::skills::SkillModelSpec>,
+
+    /// Override the model for the built-in `translator` subagent.
+    /// AgentDef.model is a single string (no priority list), so this
+    /// is `Option<String>`, not `SkillModelSpec`. When set, the
+    /// embedded translator.md's `model: gpt-4.1` is replaced before
+    /// the AgentDef is registered with the factory; absent leaves the
+    /// embedded default in place. Same per-agent named-field
+    /// convention as `extract_save_skill_models` — future built-in
+    /// subagents (dream, etc.) get `<name>_subagent_model` fields of
+    /// their own rather than a generic map.
+    #[serde(default)]
+    pub translator_subagent_model: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -124,6 +166,9 @@ impl Default for AppConfig {
             skills_listing_strategy: "full".to_string(),
             mcp_servers: Vec::new(),
             kms_active: Vec::new(),
+            claude_md_compat: false,
+            extract_save_skill_models: None,
+            translator_subagent_model: None,
         }
     }
 }
@@ -226,6 +271,21 @@ pub struct ProjectConfig {
     /// `"discover-tool-only"`. Anything else falls back to `"full"`.
     #[serde(rename = "skillsListingStrategy")]
     pub skills_listing_strategy: Option<String>,
+    /// Per-skill model override for the built-in `extract-and-save`
+    /// skill. Single string or array (priority list). When set, takes
+    /// precedence over the SKILL.md frontmatter `model:` field. See
+    /// `AppConfig::extract_save_skill_models` for the design rationale
+    /// (per-skill named fields scale better than a generic map for
+    /// the small set of built-in skills with special model needs).
+    #[serde(rename = "extract_save_skill_models", alias = "extractSaveSkillModels")]
+    pub extract_save_skill_models: Option<crate::skills::SkillModelSpec>,
+    /// Override the model for the built-in `translator` subagent. See
+    /// `AppConfig::translator_subagent_model` for design rationale.
+    #[serde(
+        rename = "translator_subagent_model",
+        alias = "translatorSubagentModel"
+    )]
+    pub translator_subagent_model: Option<String>,
     #[serde(rename = "thinkingBudget")]
     pub thinking_budget: Option<u32>,
     #[serde(rename = "searchEngine")]
@@ -236,10 +296,16 @@ pub struct ProjectConfig {
     /// Tool names disallowed (flat list, thClaws native format).
     #[serde(rename = "disallowedTools")]
     pub disallowed_tools: Option<Vec<String>>,
-    /// GUI window width (logical pixels). Default: 1100.
+    /// GUI window width (logical pixels). When `None`, the GUI picks
+    /// a size at startup based on the primary monitor's logical
+    /// resolution: 1760×962 on workstation-class displays
+    /// (≥1920×1080) and 1200×800 on smaller / laptop screens. See
+    /// `gui::run_gui_inner` for the resolution logic.
     #[serde(rename = "windowWidth")]
     pub window_width: Option<f64>,
-    /// GUI window height (logical pixels). Default: 700.
+    /// GUI window height (logical pixels). See `window_width` for the
+    /// conditional-default behavior — both fields share the same
+    /// monitor-resolution-based fallback.
     #[serde(rename = "windowHeight")]
     pub window_height: Option<f64>,
     /// User-controlled GUI zoom multiplier applied via wry's
@@ -289,6 +355,8 @@ impl Default for ProjectConfig {
             max_iterations: None,
             plan_context_strategy: None,
             skills_listing_strategy: None,
+            extract_save_skill_models: None,
+            translator_subagent_model: None,
             thinking_budget: None,
             search_engine: None,
             allowed_tools: None,
@@ -377,10 +445,37 @@ impl ProjectConfig {
                 return false;
             }
         }
-        // Hand-rolled minimal JSON instead of serializing the full
-        // ProjectConfig so the on-disk file shows only the two fields
-        // we set — easier for the user to extend than a wall of nulls.
-        let body = "{\n  \"model\": \"gpt-4.1\",\n  \"permissions\": \"auto\"\n}\n";
+        // Hand-rolled JSON enumerating every ProjectConfig field at
+        // its default value so users discover available knobs by
+        // opening the file rather than consulting the manual. Unknown
+        // keys (`_doc`) are tolerated by the loader (no
+        // `deny_unknown_fields`). Removing a field falls back to the
+        // compiled-in default; null on an Option field has the same
+        // effect. Keep this list in sync with `ProjectConfig` whenever
+        // a field is added.
+        let body = r#"{
+  "_doc": "thClaws project settings. Every available field is listed below at its default value — change a value to override, or delete a field (or set it to null on Option fields) to inherit the global default. windowWidth/windowHeight default to a monitor-resolution-aware size picked at GUI startup (1760x962 on >=1920x1080 displays, 1200x800 otherwise) when left null. See user-manual ch10 for the field reference.",
+  "model": "gpt-4.1",
+  "permissions": "auto",
+  "maxTokens": 32000,
+  "maxIterations": 50,
+  "thinkingBudget": 10000,
+  "searchEngine": "auto",
+  "planContextStrategy": "compact",
+  "skillsListingStrategy": "full",
+  "teamEnabled": false,
+  "showRawResponse": false,
+  "allowedTools": null,
+  "disallowedTools": null,
+  "windowWidth": null,
+  "windowHeight": null,
+  "guiScale": null,
+  "extract_save_skill_models": null,
+  "translator_subagent_model": null,
+  "claude_md_compat": false,
+  "kms": { "active": [] }
+}
+"#;
         if let Some(parent) = path.parent() {
             if std::fs::create_dir_all(parent).is_err() {
                 return false;
@@ -458,6 +553,12 @@ impl ProjectConfig {
         }
         if let Some(ref kms) = self.kms {
             config.kms_active = kms.active.clone();
+        }
+        if let Some(ref spec) = self.extract_save_skill_models {
+            config.extract_save_skill_models = Some(spec.clone());
+        }
+        if let Some(ref m) = self.translator_subagent_model {
+            config.translator_subagent_model = Some(m.clone());
         }
     }
 
@@ -894,6 +995,102 @@ mod tests {
         assert_eq!(c.detect_provider().unwrap(), "openai-compat");
     }
 
+    /// settings.json `extract_save_skill_models` deserializes from
+    /// both string (single model) and array (priority list) forms.
+    /// Backward compat: absent field stays `None` so older configs
+    /// keep the v0.8.4 behaviour (frontmatter `model:` wins).
+    #[test]
+    fn extract_save_skill_models_accepts_string_and_array() {
+        // Single string form.
+        let single: ProjectConfig =
+            serde_json::from_str(r#"{"extract_save_skill_models": "claude-sonnet-4-6"}"#).unwrap();
+        assert_eq!(
+            single.extract_save_skill_models,
+            Some(crate::skills::SkillModelSpec::Single(
+                "claude-sonnet-4-6".to_string()
+            ))
+        );
+
+        // Priority-list form.
+        let priority: ProjectConfig = serde_json::from_str(
+            r#"{"extract_save_skill_models": ["claude-sonnet-4-6", "gpt-4o"]}"#,
+        )
+        .unwrap();
+        match priority.extract_save_skill_models.unwrap() {
+            crate::skills::SkillModelSpec::Priority(v) => assert_eq!(v.len(), 2),
+            other => panic!("expected Priority, got {other:?}"),
+        }
+
+        // Camel-case alias also works (matches the rest of
+        // ProjectConfig's field naming convention for users who
+        // prefer camelCase keys).
+        let camel: ProjectConfig =
+            serde_json::from_str(r#"{"extractSaveSkillModels": "gpt-4o"}"#).unwrap();
+        assert_eq!(
+            camel.extract_save_skill_models,
+            Some(crate::skills::SkillModelSpec::Single("gpt-4o".to_string()))
+        );
+
+        // Absent field → None.
+        let absent: ProjectConfig = serde_json::from_str("{}").unwrap();
+        assert!(absent.extract_save_skill_models.is_none());
+    }
+
+    /// settings.json `translator_subagent_model` deserializes from
+    /// both snake_case and camelCase. Absent → None (current
+    /// behaviour preserved).
+    #[test]
+    fn translator_subagent_model_settings_deserialize() {
+        let snake: ProjectConfig =
+            serde_json::from_str(r#"{"translator_subagent_model": "claude-sonnet-4-6"}"#).unwrap();
+        assert_eq!(
+            snake.translator_subagent_model.as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+
+        let camel: ProjectConfig =
+            serde_json::from_str(r#"{"translatorSubagentModel": "gpt-4o"}"#).unwrap();
+        assert_eq!(camel.translator_subagent_model.as_deref(), Some("gpt-4o"));
+
+        let absent: ProjectConfig = serde_json::from_str("{}").unwrap();
+        assert!(absent.translator_subagent_model.is_none());
+    }
+
+    /// ProjectConfig::apply_to propagates the override into AppConfig.
+    #[test]
+    fn translator_subagent_model_merges_into_app_config() {
+        let pc = ProjectConfig {
+            translator_subagent_model: Some("claude-sonnet-4-6".into()),
+            ..Default::default()
+        };
+        let mut config = AppConfig::default();
+        pc.apply_to(&mut config);
+        assert_eq!(
+            config.translator_subagent_model.as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+    }
+
+    /// apply_to() merges the override from ProjectConfig into the
+    /// resolved AppConfig.
+    #[test]
+    fn extract_save_skill_models_merges_into_app_config() {
+        let pc = ProjectConfig {
+            extract_save_skill_models: Some(crate::skills::SkillModelSpec::Single(
+                "claude-sonnet-4-6".into(),
+            )),
+            ..Default::default()
+        };
+        let mut config = AppConfig::default();
+        pc.apply_to(&mut config);
+        assert_eq!(
+            config.extract_save_skill_models,
+            Some(crate::skills::SkillModelSpec::Single(
+                "claude-sonnet-4-6".into()
+            ))
+        );
+    }
+
     #[test]
     fn null_team_enabled_upgrades_to_false_on_load() {
         let loaded: ProjectConfig = serde_json::from_str(r#"{"teamEnabled": null}"#).unwrap();
@@ -1009,6 +1206,63 @@ mod tests {
         pc.apply_to(&mut cfg);
         assert_eq!(cfg.permissions, "auto");
         assert_eq!(cfg.allowed_tools.unwrap(), vec!["Read", "Write", "Bash"]);
+    }
+
+    /// First-run bootstrap exposes every ProjectConfig field name so
+    /// users discover available knobs by opening the file, and is
+    /// idempotent on second call (no clobbering of user edits).
+    /// Combined into one test because both touch the global
+    /// `THCLAWS_PROJECT_ROOT` env var; splitting them would race
+    /// under cargo's default parallel test runner.
+    ///
+    /// When a new field is added to ProjectConfig, both the bootstrap
+    /// body and the `expected` list below must grow — the field-list
+    /// assertion fails otherwise.
+    #[test]
+    fn ensure_default_exists_writes_full_template_then_is_idempotent() {
+        let dir = tempdir().unwrap();
+        std::env::set_var("THCLAWS_PROJECT_ROOT", dir.path());
+
+        assert!(ProjectConfig::ensure_default_exists());
+        let path = dir.path().join(".thclaws/settings.json");
+        let body = std::fs::read_to_string(&path).unwrap();
+
+        let expected = [
+            "model",
+            "permissions",
+            "maxTokens",
+            "maxIterations",
+            "planContextStrategy",
+            "skillsListingStrategy",
+            "extract_save_skill_models",
+            "translator_subagent_model",
+            "thinkingBudget",
+            "searchEngine",
+            "allowedTools",
+            "disallowedTools",
+            "windowWidth",
+            "windowHeight",
+            "guiScale",
+            "teamEnabled",
+            "showRawResponse",
+            "kms",
+        ];
+        for field in expected {
+            assert!(
+                body.contains(&format!("\"{field}\"")),
+                "bootstrap missing field {field}"
+            );
+        }
+        let parsed: ProjectConfig = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed.model.as_deref(), Some("gpt-4.1"));
+
+        // Idempotent: a user edit survives a second bootstrap call.
+        std::fs::write(&path, r#"{"model":"custom-model"}"#).unwrap();
+        assert!(!ProjectConfig::ensure_default_exists());
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("custom-model"));
+
+        std::env::remove_var("THCLAWS_PROJECT_ROOT");
     }
 
     #[test]

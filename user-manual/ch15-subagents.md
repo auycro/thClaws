@@ -127,9 +127,46 @@ The Task tool at depth 3 disables recursion to prevent runaway chains.
 
 ## Load order
 
-`~/.config/thclaws/agents.json` → `~/.claude/agents/*.md` →
+Built-in (binary) → `~/.config/thclaws/agents.json` → `~/.claude/agents/*.md` →
 `~/.config/thclaws/agents/*.md` → `.thclaws/agents/*.md`. Later wins
 by name.
+
+## Built-in subagents
+
+thClaws ships a curated set of subagents compiled into the binary —
+no install step required. They appear alongside any user-defined
+agents in `Task(agent: "...")` and `/agent <name>` invocations. A
+disk-resident agent at `.thclaws/agents/<name>.md` of the same name
+overrides the built-in.
+
+| Name | Default model | What it does |
+|---|---|---|
+| `dream` | `claude-opus-4-7` | Consolidate the project's KMS by mining recent sessions, deduping pages, surfacing insights. Invoked via the `/dream` slash command. See [Chapter 9](ch09-knowledge-bases-kms.md). |
+| `translator` | `gpt-4.1` | Translate text or files between languages while preserving structure (markdown headings, lists, code blocks, frontmatter). Invoked via `/agent translator <prompt>` or `Task(agent: "translator")`. |
+
+### Override the model via `settings.json`
+
+Each built-in subagent's recommended model can be overridden from
+`settings.json` without forking the embedded AgentDef body. Single
+string only (AgentDef.model is `Option<String>`, no priority list):
+
+```json
+// .thclaws/settings.json (project) or ~/.config/thclaws/settings.json (user)
+{
+  "translator_subagent_model": "claude-sonnet-4-6"
+}
+```
+
+Resolution chain:
+
+1. Disk-resident `<scope>/.thclaws/agents/translator.md` — full override (replaces the entire AgentDef including instructions). Use this when you want to customize the prose, not just the model.
+2. `settings.json` field (e.g. `translator_subagent_model`) — model-only override that leaves the embedded body intact.
+3. Embedded built-in `model:` frontmatter — fallback when neither is configured.
+
+Each future built-in subagent that needs settings tunability gets its
+own field (`<name>_subagent_model`). Same per-agent named-field
+convention as the skill side (`extract_save_skill_models` etc.) — more
+discoverable in `settings.json` than a generic map.
 
 ### Plugin-contributed agents
 

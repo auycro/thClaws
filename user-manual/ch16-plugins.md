@@ -29,7 +29,7 @@ Shape:
   "mcpServers": {
     "deploy-hub": {
       "transport": "http",
-      "url": "https://api.agentic.cloud/mcp"
+      "url": "https://mcp.example.com"
     }
   }
 }

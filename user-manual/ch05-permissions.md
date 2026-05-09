@@ -28,7 +28,7 @@ permissions: auto
 permissions: ask
 ```
 
-![thClaws Permissions](../user-manual-img/ch-04/thClaws-permissions.png)
+![thClaws Permissions](../user-manual-img/ch-05/thClaws-permissions.png)
 
 ## What the prompt looks like
 
@@ -111,7 +111,7 @@ thclaws --cli \
 
 Flags override settings files for that process only.
 
-## The filesystem sandbox
+## The filesystem sandbox {#sandbox-filesystem}
 
 Independent of the permission prompt: **file tools are always scoped to
 the working directory.** Paths that escape via `..`, absolute paths

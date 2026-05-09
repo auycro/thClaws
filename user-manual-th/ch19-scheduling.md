@@ -228,6 +228,42 @@ $ thclaws daemon
 
 ใช้โหมดนี้ตรวจว่า schedule ยิงจริงก่อน install เป็น launchd/systemd entry
 
+## Preset สำเร็จรูปสำหรับการดูแล KMS
+
+template schedule สี่ตัวพร้อมใช้ติดมาในตัว ครอบคลุม cadence การดูแล KMS ที่เจอบ่อย ๆ ได้แรงบันดาลใจมาจาก scheduled agent สี่ตัวของ obsidian-second-brain (nightly close, weekly review, contradiction sweep, vault-health) packaging มาให้ instantiate ตรง ๆ
+
+```
+❯ /schedule preset list
+schedule presets:
+  ID                     CRON           DESCRIPTION
+  nightly-close          0 23 * * *     Wrap up the day — lint + auto-fix + stale-marker review (KMS '{kms}')
+  weekly-review          0 9 * * SUN    Sunday-morning consolidation across active KMSes
+  contradiction-sweep    0 12 * * *     Daily noon reconcile — auto-resolve clear-winner contradictions in '{kms}'
+  vault-health           0 6 * * *      Morning lint summary at 06:00 for KMS '{kms}'
+
+add via: /schedule preset add <id> --kms <name> [--cwd <path>]
+```
+
+แต่ละ preset เป็น cron expression รวมกับ prompt template ที่อ้าง `{kms}` (ระบบ substitute ตอน instantiate) ตัวอย่าง `nightly-close` รัน `/kms wrap-up <name> --fix`; `contradiction-sweep` รัน `/kms reconcile <name> --apply`
+
+```
+❯ /schedule preset add nightly-close --kms mynotes
+✓ schedule 'nightly-close-mynotes' created from preset 'nightly-close' (cron: 0 23 * * *)
+  Wrap up the day — lint + auto-fix + stale-marker review (KMS 'mynotes')
+```
+
+format ของ schedule id คือ `<preset-id>-<kms>` ดังนั้น preset เดียวกัน target หลาย KMS ได้ไม่ชน (`nightly-close-foo`, `nightly-close-bar`) หลัง instantiate แล้ว ตัวที่ได้คือ schedule ปกติ — แก้ cwd / cron / model ผ่าน `/schedule` คำสั่งทั่วไปได้ หรือ `/schedule rm <id>` เพื่อลบ
+
+| Preset | เมื่อไหร่ | ทำอะไร |
+|---|---|---|
+| `nightly-close` | ทุกวัน 23:00 | เดิน pages, แก้ broken markdown link, append index entry ที่ขาด, refresh STALE page |
+| `weekly-review` | อาทิตย์ 09:00 | consolidate page ที่ overlap เข้าเป็น canonical (ใส่ pointer ไม่ใช่ลบ) + ทำ hygiene pass |
+| `contradiction-sweep` | ทุกวันเที่ยง | สแกน 4 pass (claims / entities / decisions / source-freshness), auto-resolve clear winner พร้อม `## History`, ทำ `Conflict — <topic>.md` สำหรับเคส ambiguous |
+| `vault-health` | ทุกวัน 06:00 | health report read-only — broken link, orphan, missing-from-index, missing frontmatter, STALE marker |
+
+> [!IMPORTANT]
+> prompt ของ preset เป็น **คำสั่งภาษาธรรมชาติ** ที่บอก agent ให้ใช้ KMS tools (KmsRead/Search/Write/Append) ตรง ๆ scheduler ยิง preset ผ่าน `thclaws --print` ซึ่งไม่ run slash-command dispatch — preset prompt จึงใช้ slash command (เช่น `/kms reconcile`) ไม่ได้ `.thclaws/settings.json` ของ cwd ต้องมี KMS เป้าหมายอยู่ใน `kms_active` เพื่อให้ KMS tools register ก่อน agent เริ่ม
+
 ## สูตรการใช้งานจริง
 
 ### Briefing ตอนเช้าทุกวันทำงาน

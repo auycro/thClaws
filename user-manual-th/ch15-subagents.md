@@ -127,9 +127,45 @@ parent (depth 0)
 
 ## ลำดับการโหลด
 
-`~/.config/thclaws/agents.json` → `~/.claude/agents/*.md` →
-`~/.config/thclaws/agents/*.md` → `.thclaws/agents/*.md` โดยตัวหลังจะชนะ
-เมื่อชื่อซ้ำกัน
+Built-in (ฝังในไบนารี) → `~/.config/thclaws/agents.json` →
+`~/.claude/agents/*.md` → `~/.config/thclaws/agents/*.md` →
+`.thclaws/agents/*.md` โดยตัวหลังจะชนะเมื่อชื่อซ้ำกัน
+
+## Built-in subagent
+
+thClaws มี subagent ชุดหนึ่งที่ ship มาในไบนารี — ไม่ต้องติดตั้งเพิ่ม
+จะเห็นใน `Task(agent: "...")` และ `/agent <name>` ปกติ ถ้าจะ override
+สร้าง `.thclaws/agents/<name>.md` ที่ชื่อเดียวกัน — ตัวบนดิสก์ชนะ
+
+| ชื่อ | model default | หน้าที่ |
+|---|---|---|
+| `dream` | `claude-opus-4-7` | Consolidate KMS ของ project โดยอ่าน session ล่าสุด, dedupe page, ดึง insight ออกมา เรียกผ่าน `/dream` (ดู [บทที่ 9](ch09-knowledge-bases-kms.md)) |
+| `translator` | `gpt-4.1` | แปลข้อความ/ไฟล์ระหว่างภาษา รักษา structure ของ markdown (heading, list, code block, frontmatter) เรียกผ่าน `/agent translator <prompt>` หรือ `Task(agent: "translator")` |
+
+### Override model ผ่าน `settings.json`
+
+แต่ละ built-in subagent มี recommended model ที่ override ได้ผ่าน
+`settings.json` โดยไม่ต้อง fork AgentDef ทั้งไฟล์ AgentDef.model เป็น
+single string (ไม่มี priority list):
+
+```json
+// .thclaws/settings.json (project) หรือ ~/.config/thclaws/settings.json (user)
+{
+  "translator_subagent_model": "claude-sonnet-4-6"
+}
+```
+
+ลำดับการ resolve:
+
+1. ไฟล์บนดิสก์ `<scope>/.thclaws/agents/translator.md` — override เต็ม
+   (แทนทั้ง AgentDef รวม instructions) ใช้เมื่ออยาก customize prompt body
+2. ฟิลด์ใน `settings.json` (เช่น `translator_subagent_model`) —
+   override เฉพาะโมเดล ไม่แตะ body ที่ฝัง
+3. `model:` frontmatter ของ built-in — fallback เมื่อไม่มี override
+
+built-in subagent ตัวต่อ ๆ ไปที่ต้องการ tunability จะมีฟิลด์ของตัวเอง
+(`<name>_subagent_model`) — convention เดียวกับฝั่ง skill
+(`extract_save_skill_models`) — discoverability ดีกว่า map ทั่วไป
 
 ### Agent ที่มาจาก plugin
 

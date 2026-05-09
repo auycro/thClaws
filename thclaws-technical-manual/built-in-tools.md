@@ -33,10 +33,15 @@ pub trait Tool: Send + Sync {
 
     /// MCP-Apps widget to embed inline. Only McpTool overrides today.
     async fn fetch_ui_resource(&self) -> Option<UiResource> { None }
+
+    /// Env vars this tool needs at runtime. When any listed var is
+    /// unset/empty, the tool is hidden from `tool_defs()` and `call()`
+    /// rejects invocation. Default `&[]` = always available.
+    fn requires_env(&self) -> &'static [&'static str] { &[] }
 }
 ```
 
-Five methods:
+Six methods:
 - `name` — the dispatch key (matches model's `tool_use.name`). Must be unique within the registry. CamelCase convention.
 - `description` — sent to the model verbatim as part of the tool catalog. Should be concise + actionable.
 - `input_schema` — JSON Schema describing the input object. Sent to the model so it can construct valid `tool_use.input`.
@@ -44,6 +49,7 @@ Five methods:
 - `call_multimodal(input) -> Result<ToolResultContent>` — for tools that return images/blocks; default delegates to `call`.
 - `requires_approval` — gates the user prompt in Ask mode (see [`permissions.md`](permissions.md) §4 for the full matrix).
 - `fetch_ui_resource` — only `McpTool` overrides; produces an iframe widget for chat surface ([`mcp.md`](mcp.md)).
+- `requires_env` — names the env var(s) the tool needs. The registry filters out tools whose env isn't satisfied (see §2).
 
 ---
 
@@ -69,6 +75,18 @@ impl ToolRegistry {
 `with_builtins()` registers the 26 "built-in" tools (file + search + shell + web + ask + planning + 12 document tools). Task tools (TaskCreate/Update/Get/List) require shared state and are registered separately via `register_task_tools(&mut registry) -> SharedTaskStore`. Team tools register via `register_team_tools` (see team docs). MCP tools register at MCP-server-spawn time.
 
 `tool_defs()` is what gets sent to the provider — sorted by name for deterministic output (helps with prompt caching: the byte-stable ordering means the tools array doesn't change across turns until a tool registers/removes).
+
+**`requires_env` filter (M6.38.7).** Both `tool_defs()` and `call()` consult `Tool::requires_env()` against the live process env. A tool whose env-var list contains any unset or empty entry is hidden from the provider-facing tool list and rejected at invocation time:
+
+```rust
+fn tool_is_available(t: &dyn Tool) -> bool {
+    t.requires_env()
+        .iter()
+        .all(|v| std::env::var(v).map(|val| !val.is_empty()).unwrap_or(false))
+}
+```
+
+Re-evaluated every call; no registry-level cache. Live key changes (`api_key_set` / `api_key_clear` followed by the existing `rebuild_agent` after `ReloadConfig`) flip tools in/out on the next turn — no restart, no re-registration. The `call()` path also gates: even a stale provider response or hand-crafted tool_use can't reach a tool whose env isn't satisfied. The first concrete users are the two HAL tools (§5).
 
 ---
 
@@ -215,6 +233,22 @@ Multi-backend web search with auto-detection. Backend priority:
 Constructed via `WebSearchTool::new("auto" | "tavily" | "brave" | "duckduckgo")`. With `"auto"` (default), tries each in priority order. Explicit engine name forces that backend; `"duckduckgo"` skips the keyed backends entirely.
 
 If the configured backend's key is missing, falls through to the next available backend — always returns SOMETHING rather than panicking.
+
+### YouTubeTranscript & WebScrape (HAL Public API)
+
+| | |
+|---|---|
+| Names | `YouTubeTranscript`, `WebScrape` |
+| Approval | yes |
+| Source file | [`tools/hal.rs`](../thclaws/crates/core/src/tools/hal.rs) |
+| `requires_env` | `&["HAL_API_KEY"]` |
+
+Both wrap [HAL's public API](https://hal.thaigpt.com/api) with one shared `X-API-Key` header. They're the first tools to declare `requires_env`, so they're hidden from `tool_defs()` until the user pastes a key in **Settings → Providers → Service keys → HAL Public API** (or sets `HAL_API_KEY` in the shell).
+
+- `YouTubeTranscript { url? | video_id?, languages?, with_timestamps? }` → `POST /youtube/v1/transcript`. Either `url` (any common YouTube shape) or `video_id` (11-char) is required. Default languages: `["en", "th"]`. Returns the JSON shape from HAL — `{video_id, title, channel, language, transcript|segments}`.
+- `WebScrape { url, wait_for?, scroll_to_bottom?, remove_selectors?, output_format? }` → `POST /scrape/v1/url`. Renders in headless browser, returns `{title, content, metadata, scraped_at}`. Use this instead of `WebFetch` when the page is JS-heavy / needs scrolling / has noise to strip.
+
+90s hard timeout per request (`HAL_TIMEOUT`); the scrape endpoint can be slow on heavy pages with `scroll_to_bottom`. The shared `hal_post` helper surfaces HAL's `detail` field on non-2xx so error messages are actionable (e.g. `HAL 404: No transcript available for this video`).
 
 ---
 

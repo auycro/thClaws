@@ -128,6 +128,25 @@ impl ProjectContext {
 ///
 /// [AGENTS.md]: https://agents.md
 pub fn find_claude_md(start: &Path) -> Option<String> {
+    find_claude_md_with(start, load_claude_md_compat_flag())
+}
+
+/// Read the `claude_md_compat` flag from settings. Defaults to `false`
+/// when the config can't be loaded (fresh install, malformed file).
+/// Pulled into a helper so the three loaders + scanners share one
+/// source of truth.
+fn load_claude_md_compat_flag() -> bool {
+    crate::config::AppConfig::load()
+        .map(|c| c.claude_md_compat)
+        .unwrap_or(false)
+}
+
+/// Test-injectable variant of [`find_claude_md`]. `claude_md_compat`
+/// = whether to also load `~/.claude/CLAUDE.md` + `~/.claude/AGENTS.md`
+/// (user-level Claude Code memory). Default behavior (`false`) skips
+/// those — the user's Claude Code identity isn't generic agent
+/// instructions and shouldn't bleed into thClaws's prompt.
+pub fn find_claude_md_with(start: &Path, claude_md_compat: bool) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
 
     // 1. User-level instructions. Claude Code path first, then vendor-neutral
@@ -138,12 +157,19 @@ pub fn find_claude_md(start: &Path) -> Option<String> {
         // user-level thclaws-native pair was inverted (AGENTS first),
         // contradicting the "per-vendor instructions refine a shared
         // baseline" rationale used everywhere else.
-        for candidate in [
-            home.join(".claude/CLAUDE.md"),
-            home.join(".claude/AGENTS.md"),
-            home.join(".config/thclaws/CLAUDE.md"),
-            home.join(".config/thclaws/AGENTS.md"),
-        ] {
+        //
+        // M6.39.5: `~/.claude/CLAUDE.md` and `~/.claude/AGENTS.md` are
+        // gated on `claude_md_compat` — see field docstring on
+        // AppConfig. Default (`false`) means thClaws doesn't pick up
+        // the user's Claude Code identity by accident.
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if claude_md_compat {
+            candidates.push(home.join(".claude/CLAUDE.md"));
+            candidates.push(home.join(".claude/AGENTS.md"));
+        }
+        candidates.push(home.join(".config/thclaws/CLAUDE.md"));
+        candidates.push(home.join(".config/thclaws/AGENTS.md"));
+        for candidate in candidates {
             if let Ok(contents) = std::fs::read_to_string(&candidate) {
                 parts.push(contents);
             }
@@ -256,6 +282,7 @@ pub struct ClaudeMdOversize {
 /// counts so users can see which memory file is driving their token
 /// spend. Pure filesystem walk — no read.
 pub fn scan_claude_md_sizes(start: &Path) -> Vec<(PathBuf, u64)> {
+    let claude_md_compat = load_claude_md_compat_flag();
     let mut out: Vec<(PathBuf, u64)> = Vec::new();
     let mut check = |path: PathBuf| {
         if let Ok(meta) = std::fs::metadata(&path) {
@@ -267,9 +294,14 @@ pub fn scan_claude_md_sizes(start: &Path) -> Vec<(PathBuf, u64)> {
     if let Some(home) = crate::util::home_dir() {
         // M6.18 BUG M4: CLAUDE before AGENTS at every scope so the
         // size scan matches find_claude_md's load order.
+        // M6.39.5: `~/.claude/*` user-level files honor the same
+        // `claude_md_compat` flag as find_claude_md — the size
+        // scan reflects what's actually loaded into the prompt.
+        if claude_md_compat {
+            check(home.join(".claude/CLAUDE.md"));
+            check(home.join(".claude/AGENTS.md"));
+        }
         for candidate in [
-            home.join(".claude/CLAUDE.md"),
-            home.join(".claude/AGENTS.md"),
             home.join(".config/thclaws/CLAUDE.md"),
             home.join(".config/thclaws/AGENTS.md"),
         ] {
@@ -313,6 +345,7 @@ pub fn scan_claude_md_sizes(start: &Path) -> Vec<(PathBuf, u64)> {
 /// file ≥ [`CLAUDE_MD_WARN_BYTES`]. Pure filesystem walk — no read —
 /// so it's cheap enough to call at every session startup.
 pub fn scan_claude_md_oversize(start: &Path) -> Vec<ClaudeMdOversize> {
+    let claude_md_compat = load_claude_md_compat_flag();
     let mut out = Vec::new();
     let mut check = |path: PathBuf| {
         if let Ok(meta) = std::fs::metadata(&path) {
@@ -328,9 +361,14 @@ pub fn scan_claude_md_oversize(start: &Path) -> Vec<ClaudeMdOversize> {
     if let Some(home) = crate::util::home_dir() {
         // M6.18 BUG M4: CLAUDE before AGENTS at every scope so the
         // size scan matches find_claude_md's load order.
+        // M6.39.5: gate user-home `~/.claude/*` on claude_md_compat
+        // so the oversize warning at startup doesn't fire for files
+        // that aren't actually loaded into the prompt.
+        if claude_md_compat {
+            check(home.join(".claude/CLAUDE.md"));
+            check(home.join(".claude/AGENTS.md"));
+        }
         for candidate in [
-            home.join(".claude/CLAUDE.md"),
-            home.join(".claude/AGENTS.md"),
             home.join(".config/thclaws/CLAUDE.md"),
             home.join(".config/thclaws/AGENTS.md"),
         ] {
@@ -472,6 +510,81 @@ mod tests {
         let _guard = HomeGuard::new(home.path());
         let dir = tempdir().unwrap();
         assert!(find_claude_md(dir.path()).is_none());
+    }
+
+    /// M6.39.5: by default (`claude_md_compat = false`) thClaws does
+    /// NOT load the user-level `~/.claude/CLAUDE.md` file. This file
+    /// is the user's Claude Code identity (Pinn.AI bias, Thai-first
+    /// instructions, "use Claude Code's MCP tools" — none of that
+    /// applies to thClaws).
+    #[test]
+    fn find_claude_md_with_skips_user_claude_md_by_default() {
+        let home = tempdir().unwrap();
+        let _guard = HomeGuard::new(home.path());
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(
+            home.path().join(".claude/CLAUDE.md"),
+            "Claude Code identity",
+        )
+        .unwrap();
+        let dir = tempdir().unwrap();
+        // Default false → user-home claude file NOT loaded.
+        assert!(find_claude_md_with(dir.path(), false).is_none());
+    }
+
+    #[test]
+    fn find_claude_md_with_loads_user_claude_md_when_compat_true() {
+        let home = tempdir().unwrap();
+        let _guard = HomeGuard::new(home.path());
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(
+            home.path().join(".claude/CLAUDE.md"),
+            "Claude Code identity",
+        )
+        .unwrap();
+        let dir = tempdir().unwrap();
+        // Opt-in → original Claude Code parity behavior preserved.
+        let out = find_claude_md_with(dir.path(), true).unwrap();
+        assert!(out.contains("Claude Code identity"));
+    }
+
+    #[test]
+    fn find_claude_md_with_always_loads_thclaws_native_user_file() {
+        let home = tempdir().unwrap();
+        let _guard = HomeGuard::new(home.path());
+        std::fs::create_dir_all(home.path().join(".config/thclaws")).unwrap();
+        std::fs::write(
+            home.path().join(".config/thclaws/CLAUDE.md"),
+            "thClaws-native user config",
+        )
+        .unwrap();
+        let dir = tempdir().unwrap();
+        // Both flag values must load the thClaws-native user file —
+        // it's specifically thClaws's home, not Claude Code's.
+        let out_default = find_claude_md_with(dir.path(), false).unwrap();
+        assert!(out_default.contains("thClaws-native user config"));
+        let out_compat = find_claude_md_with(dir.path(), true).unwrap();
+        assert!(out_compat.contains("thClaws-native user config"));
+    }
+
+    #[test]
+    fn find_claude_md_with_always_loads_project_dotclaude_dir() {
+        let home = tempdir().unwrap();
+        let _guard = HomeGuard::new(home.path());
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        std::fs::write(
+            dir.path().join(".claude/CLAUDE.md"),
+            "project-shared instructions",
+        )
+        .unwrap();
+        // Project-level `.claude/CLAUDE.md` (committed in the repo)
+        // is NOT gated — it's repo-shared instructions, not user
+        // identity. Both flag values must load it.
+        let out_default = find_claude_md_with(dir.path(), false).unwrap();
+        assert!(out_default.contains("project-shared instructions"));
+        let out_compat = find_claude_md_with(dir.path(), true).unwrap();
+        assert!(out_compat.contains("project-shared instructions"));
     }
 
     #[test]

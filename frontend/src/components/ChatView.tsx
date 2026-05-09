@@ -50,6 +50,12 @@ type ChatMessage = {
   /// where the `todos` array drives a checklist card. Other tools
   /// ignore this.
   toolInput?: unknown;
+  /// `tool` messages only — name of the upstream service that
+  /// produced the result, parsed from a leading `Source: <engine>`
+  /// line in the tool result body (M6.38.9). Surfaced as `(via X)`
+  /// next to the ✓ glyph so the user sees the source even if the
+  /// model paraphrased it away from its summary.
+  toolSource?: string;
   /// MCP-Apps widget the bubble should embed inline below the tool
   /// label (e.g. pinn.ai's image viewer). Populated from the
   /// `ui_resource` field on `chat_tool_result` when the upstream MCP
@@ -364,6 +370,27 @@ export function ChatView({ active, modalOpen }: Props) {
             | { uri: string; html: string; mime?: string }
             | undefined;
           const output = (msg.output as string | undefined) ?? "";
+          // M6.38.9: parse `Source: <engine>` from the first line of
+          // the tool result body so the bubble can render `(via X)`
+          // next to the ✓ glyph. Independent of whether the model
+          // surfaces the source in its summary. Strict prefix match —
+          // a false positive is worse than a miss.
+          const toolSource = (() => {
+            const first = output.split("\n", 1)[0] ?? "";
+            const rest = first.startsWith("Source: ")
+              ? first.slice("Source: ".length)
+              : null;
+            if (!rest) return undefined;
+            const cut = (() => {
+              const a = rest.indexOf(" (");
+              const b = rest.indexOf(" —");
+              if (a < 0) return b < 0 ? rest.length : b;
+              if (b < 0) return a;
+              return Math.min(a, b);
+            })();
+            const name = rest.slice(0, cut).trim();
+            return name.length > 0 ? name : undefined;
+          })();
           setMessages((prev) => {
             for (let i = prev.length - 1; i >= 0; i--) {
               const candidate = prev[i];
@@ -375,6 +402,7 @@ export function ChatView({ active, modalOpen }: Props) {
                     toolDone: true,
                     content: ui ? output : candidate.content,
                     uiResource: ui,
+                    toolSource,
                   },
                   ...prev.slice(i + 1),
                 ];
@@ -905,6 +933,12 @@ export function ChatView({ active, modalOpen }: Props) {
                   <div className="inline-flex items-center gap-1 text-xs">
                     <span className="truncate">
                       {glyph} {msg.toolName ?? msg.content}
+                      {msg.toolSource && msg.toolDone && (
+                        <span style={{ opacity: 0.7 }}>
+                          {" "}
+                          (via {msg.toolSource})
+                        </span>
+                      )}
                     </span>
                     <CopyMessageButton
                       copied={copied}

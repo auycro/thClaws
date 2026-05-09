@@ -106,6 +106,28 @@ const MANAGED: &[ProviderKind] = &[
     ProviderKind::Nvidia,
 ];
 
+/// Non-LLM service keys we surface in the same Settings modal as the
+/// LLM provider keys. Each entry: `(account_name, env_var)`. The
+/// account name is what we use as the bundle/keychain key and as the
+/// `provider` field over IPC; the env var is what the running process
+/// reads at runtime (e.g. WebSearchTool). Kept deliberately small —
+/// only services that the agent loop / tools rely on at runtime.
+pub const SERVICE_KEYS: &[(&str, &str)] = &[
+    ("tavily", "TAVILY_API_KEY"),
+    ("brave-search", "BRAVE_SEARCH_API_KEY"),
+    ("hal", "HAL_API_KEY"),
+];
+
+/// Look up the env var for a non-LLM service key by account name.
+/// Returns `None` for unknown names so callers can chain with
+/// `ProviderKind::from_name(...).api_key_env()` via `or_else`.
+pub fn service_env_var(name: &str) -> Option<&'static str> {
+    SERVICE_KEYS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, env)| *env)
+}
+
 fn entry(provider: &str) -> Result<keyring::Entry> {
     keyring::Entry::new(SERVICE, provider)
         .map_err(|e| Error::Config(format!("keychain open failed: {e}")))
@@ -266,12 +288,17 @@ pub struct KeyStatus {
     /// user a visual confirmation that a real key is loaded without ever
     /// exposing its contents.
     pub key_length: usize,
+    /// `"provider"` for LLM provider keys, `"service"` for non-LLM
+    /// service keys (web search, etc.). Lets the UI group them
+    /// separately even though they flow through the same modal /
+    /// IPC.
+    pub kind: &'static str,
 }
 
 /// Snapshot the current state of every managed provider's API key. Used by
 /// the UI to render "configured / not configured" and decide button state.
 pub fn status() -> Vec<KeyStatus> {
-    MANAGED
+    let mut out: Vec<KeyStatus> = MANAGED
         .iter()
         .filter_map(|p| {
             let env_var = p.api_key_env()?;
@@ -288,9 +315,28 @@ pub fn status() -> Vec<KeyStatus> {
                 configured_in_keychain: configured,
                 env_source,
                 key_length: env_value.as_deref().map(str::len).unwrap_or(0),
+                kind: "provider",
             })
         })
-        .collect()
+        .collect();
+    for (name, env_var) in SERVICE_KEYS {
+        let configured = get(name).is_some();
+        let env_value = std::env::var(env_var).ok();
+        let env_source = if env_value.is_some() {
+            KeySource::Environment
+        } else {
+            KeySource::None
+        };
+        out.push(KeyStatus {
+            provider: name,
+            env_var,
+            configured_in_keychain: configured,
+            env_source,
+            key_length: env_value.as_deref().map(str::len).unwrap_or(0),
+            kind: "service",
+        });
+    }
+    out
 }
 
 /// Inject keychain-stored keys into the process environment, skipping any
@@ -328,6 +374,19 @@ pub fn load_into_env() {
             std::env::set_var(env_var, key);
         }
     }
+    log_trace("load_into_env() → walking SERVICE_KEYS");
+    for (name, env_var) in SERVICE_KEYS {
+        if std::env::var(env_var).is_ok() {
+            log_trace(&format!(
+                "load_into_env() → {} already in env, skip",
+                env_var
+            ));
+            continue;
+        }
+        if let Some(key) = get(name) {
+            std::env::set_var(env_var, key);
+        }
+    }
     std::env::set_var("THCLAWS_KEYCHAIN_LOADED", "1");
     log_trace("load_into_env() → done, exported THCLAWS_KEYCHAIN_LOADED=1");
 }
@@ -346,5 +405,32 @@ mod tests {
         assert!(names.contains(&"gemini"));
         assert!(names.contains(&"dashscope"));
         assert!(names.contains(&"openai-compat"));
+        // Service keys (web search) surface in the same modal.
+        assert!(names.contains(&"tavily"));
+        assert!(names.contains(&"brave-search"));
+    }
+
+    #[test]
+    fn status_marks_kind_per_entry() {
+        let s = status();
+        let tavily = s.iter().find(|k| k.provider == "tavily").unwrap();
+        assert_eq!(tavily.kind, "service");
+        assert_eq!(tavily.env_var, "TAVILY_API_KEY");
+        let brave = s.iter().find(|k| k.provider == "brave-search").unwrap();
+        assert_eq!(brave.kind, "service");
+        assert_eq!(brave.env_var, "BRAVE_SEARCH_API_KEY");
+        let anthropic = s.iter().find(|k| k.provider == "anthropic").unwrap();
+        assert_eq!(anthropic.kind, "provider");
+    }
+
+    #[test]
+    fn service_env_var_resolves_known_services() {
+        assert_eq!(service_env_var("tavily"), Some("TAVILY_API_KEY"));
+        assert_eq!(
+            service_env_var("brave-search"),
+            Some("BRAVE_SEARCH_API_KEY")
+        );
+        assert_eq!(service_env_var("anthropic"), None);
+        assert_eq!(service_env_var(""), None);
     }
 }

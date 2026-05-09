@@ -284,19 +284,40 @@ use crate::providers::{auto_fallback_model, provider_has_credentials};
 // instructions_path moved to crate::instructions in M6.36 SERVE9d.
 // instructions_path migrated; arms removed in SERVE9k.
 
+/// Per-server tool count, populated when `McpReady` fires in the worker loop.
+/// Keyed by server name; value is the number of tools the server exposed.
+static MCP_TOOL_COUNTS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, usize>>,
+> = std::sync::OnceLock::new();
+
+fn mcp_tool_counts() -> &'static std::sync::Mutex<std::collections::HashMap<String, usize>> {
+    MCP_TOOL_COUNTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record the tool count for a connected MCP server. Called from the
+/// `McpReady` handler in `shared_session.rs` so `build_mcp_update_payload`
+/// can surface real counts instead of zeros.
+pub(crate) fn update_mcp_tool_count(server_name: &str, count: usize) {
+    if let Ok(mut map) = mcp_tool_counts().lock() {
+        map.insert(server_name.to_string(), count);
+    }
+}
+
 /// Build the `mcp_update` IPC payload: the configured MCP servers for
 /// this session (read fresh from disk so removals via `/mcp remove` are
-/// reflected immediately, not after a restart). Tool count is reported
-/// as 0 for now — the live registry doesn't track which tool came from
-/// which MCP server, so we'd have to hold a separate name-to-server
-/// map to do better. The sidebar today only renders the name, so 0 is
-/// a non-misleading placeholder.
+/// reflected immediately, not after a restart). Tool counts come from
+/// `MCP_TOOL_COUNTS`, which is updated by the `McpReady` worker event
+/// once each server successfully connects and lists its tools.
 pub(crate) fn build_mcp_update_payload() -> serde_json::Value {
     let config = crate::config::AppConfig::load().unwrap_or_default();
+    let counts = mcp_tool_counts().lock().unwrap_or_else(|e| e.into_inner());
     let servers: Vec<serde_json::Value> = config
         .mcp_servers
         .iter()
-        .map(|s| serde_json::json!({"name": s.name, "tools": 0}))
+        .map(|s| {
+            let tool_count = counts.get(&s.name).copied().unwrap_or(0);
+            serde_json::json!({"name": s.name, "tools": tool_count})
+        })
         .collect();
     serde_json::json!({
         "type": "mcp_update",
@@ -312,6 +333,41 @@ pub(crate) fn build_mcp_update_payload() -> serde_json::Value {
 // SendInitialState builder) keep compiling unchanged.
 pub(crate) fn build_kms_update_payload() -> serde_json::Value {
     crate::kms::build_update_payload()
+}
+
+/// Build the `research_update` IPC payload (M6.39.3). Snapshot of every
+/// research job in newest-first order, shaped for the sidebar panel.
+/// Called by the `ResearchManager` broadcaster on every state-mutating
+/// method, plus once at session bootstrap so a fresh frontend gets a
+/// non-empty payload if jobs survived a soft refresh.
+pub(crate) fn build_research_update_payload() -> serde_json::Value {
+    let jobs = crate::research::manager().list();
+    serde_json::json!({
+        "type": "research_update",
+        "jobs": jobs.iter().map(research_job_to_json).collect::<Vec<_>>(),
+    })
+}
+
+fn research_job_to_json(j: &crate::research::JobView) -> serde_json::Value {
+    serde_json::json!({
+        "id": j.id,
+        "status": j.status.as_str(),
+        "phase": j.phase,
+        "query": j.query,
+        "iterations_done": j.iterations_done,
+        "source_count": j.source_count,
+        "last_score": j.last_score,
+        "kms_target": j.kms_target,
+        "result_page": j.result_page,
+        "error": j.error,
+        "started_at": j.started_at
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .ok(),
+        "finished_at": j.finished_at
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs()),
+    })
 }
 
 fn escape_for_js(s: &str) -> String {

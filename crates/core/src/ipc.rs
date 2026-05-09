@@ -592,6 +592,7 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                         "configured_in_keychain": s.configured_in_keychain,
                         "env_set": matches!(s.env_source, crate::secrets::KeySource::Environment),
                         "key_length": s.key_length,
+                        "kind": s.kind,
                     })
                 })
                 .collect();
@@ -605,8 +606,9 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
         "api_key_clear" => {
             let provider = msg.get("provider").and_then(|v| v.as_str()).unwrap_or("");
             let keychain = crate::secrets::clear(provider);
-            let env_var =
-                crate::providers::ProviderKind::from_name(provider).and_then(|k| k.api_key_env());
+            let env_var = crate::providers::ProviderKind::from_name(provider)
+                .and_then(|k| k.api_key_env())
+                .or_else(|| crate::secrets::service_env_var(provider));
             if let Some(var) = env_var {
                 std::env::remove_var(var);
                 let _ = crate::dotenv::remove_from_user_env(var);
@@ -919,7 +921,8 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                 (false, "provider and key are required".to_string(), "")
             } else {
                 let env_var = crate::providers::ProviderKind::from_name(provider)
-                    .and_then(|k| k.api_key_env());
+                    .and_then(|k| k.api_key_env())
+                    .or_else(|| crate::secrets::service_env_var(provider));
                 let backend =
                     crate::secrets::get_backend().unwrap_or(crate::secrets::Backend::Keychain);
                 match backend {

@@ -9,6 +9,7 @@ type KeyStatus = {
   configured_in_keychain: boolean;
   env_set: boolean;
   key_length: number;
+  kind?: "provider" | "service";
 };
 
 type EndpointStatus = {
@@ -44,6 +45,9 @@ const PROVIDER_LABELS: Record<string, string> = {
   "ollama-cloud": "Ollama Cloud",
   azure: "Azure AI Foundry",
   "openai-compat": "OpenAI-Compatible (custom endpoint)",
+  tavily: "Tavily Search",
+  "brave-search": "Brave Search",
+  hal: "HAL Public API (YouTube transcript + Web scrape)",
 };
 
 export function SettingsModal({ onClose }: { onClose: () => void }) {
@@ -151,6 +155,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   }, [backend]);
 
   // Merge keys + endpoints by provider so each provider renders once.
+  // Insertion order from `keys[]` is preserved by Map — backend
+  // already orders providers (LLM) first, services (search) last.
   const providers = new Map<string, { key?: KeyStatus; endpoint?: EndpointStatus }>();
   keys.forEach((k) => {
     const entry = providers.get(k.provider) ?? {};
@@ -162,6 +168,12 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     entry.endpoint = e;
     providers.set(e.provider, entry);
   });
+  const llmEntries = Array.from(providers.entries()).filter(
+    ([, row]) => (row.key?.kind ?? "provider") !== "service",
+  );
+  const serviceEntries = Array.from(providers.entries()).filter(
+    ([, row]) => row.key?.kind === "service",
+  );
 
   const handleSaveKey = (provider: string) => {
     const key = (keyDrafts[provider] ?? "").trim();
@@ -264,54 +276,111 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         </p>
 
         <div className="flex flex-col gap-3">
-          {Array.from(providers.entries()).map(([provider, row]) => {
-            const label = PROVIDER_LABELS[provider] ?? provider;
-            return (
+          {llmEntries.map(([provider, row]) =>
+            renderProviderCard(
+              provider,
+              row,
+              keyDrafts,
+              setKeyDrafts,
+              urlDrafts,
+              setUrlDrafts,
+              handleSaveKey,
+              handleClearKey,
+              handleSaveUrl,
+              handleClearUrl,
+              busy,
+              flash,
+            ),
+          )}
+
+          {serviceEntries.length > 0 && (
+            <>
               <div
-                key={provider}
-                className="rounded p-3"
-                style={{ background: "var(--bg-tertiary)", border: "1px solid var(--border)" }}
+                className="text-[10px] uppercase tracking-wider mt-2"
+                style={{ color: "var(--text-secondary)" }}
               >
-                <div className="flex items-center justify-between mb-2">
-                  <div className="text-xs font-semibold" style={{ color: "var(--text-primary)" }}>
-                    {label}
-                  </div>
-                </div>
-
-                {row.key && (
-                  <KeyRow
-                    status={row.key}
-                    draft={
-                      keyDrafts[provider] ??
-                      (row.key.key_length > 0
-                        ? sentinelFor(row.key.key_length)
-                        : FALLBACK_SENTINEL)
-                    }
-                    onDraft={(v) => setKeyDrafts((d) => ({ ...d, [provider]: v }))}
-                    onSave={() => handleSaveKey(provider)}
-                    onClear={() => handleClearKey(provider)}
-                    busy={busy === `${provider}:key`}
-                    flash={flash[`${provider}:key`]}
-                  />
-                )}
-
-                {row.endpoint && (
-                  <UrlRow
-                    status={row.endpoint}
-                    draft={urlDrafts[provider] ?? (row.endpoint.configured_url ?? "")}
-                    onDraft={(v) => setUrlDrafts((d) => ({ ...d, [provider]: v }))}
-                    onSave={() => handleSaveUrl(provider)}
-                    onClear={() => handleClearUrl(provider)}
-                    busy={busy === `${provider}:url`}
-                    flash={flash[`${provider}:url`]}
-                    hasKeyRow={Boolean(row.key)}
-                  />
-                )}
+                Service keys
               </div>
-            );
-          })}
+              {serviceEntries.map(([provider, row]) =>
+                renderProviderCard(
+                  provider,
+                  row,
+                  keyDrafts,
+                  setKeyDrafts,
+                  urlDrafts,
+                  setUrlDrafts,
+                  handleSaveKey,
+                  handleClearKey,
+                  handleSaveUrl,
+                  handleClearUrl,
+                  busy,
+                  flash,
+                ),
+              )}
+            </>
+          )}
         </div>
       </div>
+    </div>
+  );
+}
+
+function renderProviderCard(
+  provider: string,
+  row: { key?: KeyStatus; endpoint?: EndpointStatus },
+  keyDrafts: Record<string, string>,
+  setKeyDrafts: React.Dispatch<React.SetStateAction<Record<string, string>>>,
+  urlDrafts: Record<string, string>,
+  setUrlDrafts: React.Dispatch<React.SetStateAction<Record<string, string>>>,
+  handleSaveKey: (p: string) => void,
+  handleClearKey: (p: string) => void,
+  handleSaveUrl: (p: string) => void,
+  handleClearUrl: (p: string) => void,
+  busy: string | null,
+  flash: Record<string, { ok: boolean; msg: string }>,
+) {
+  const label = PROVIDER_LABELS[provider] ?? provider;
+  return (
+    <div
+      key={provider}
+      className="rounded p-3"
+      style={{ background: "var(--bg-tertiary)", border: "1px solid var(--border)" }}
+    >
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-xs font-semibold" style={{ color: "var(--text-primary)" }}>
+          {label}
+        </div>
+      </div>
+
+      {row.key && (
+        <KeyRow
+          status={row.key}
+          draft={
+            keyDrafts[provider] ??
+            (row.key.key_length > 0
+              ? sentinelFor(row.key.key_length)
+              : FALLBACK_SENTINEL)
+          }
+          onDraft={(v) => setKeyDrafts((d) => ({ ...d, [provider]: v }))}
+          onSave={() => handleSaveKey(provider)}
+          onClear={() => handleClearKey(provider)}
+          busy={busy === `${provider}:key`}
+          flash={flash[`${provider}:key`]}
+        />
+      )}
+
+      {row.endpoint && (
+        <UrlRow
+          status={row.endpoint}
+          draft={urlDrafts[provider] ?? (row.endpoint.configured_url ?? "")}
+          onDraft={(v) => setUrlDrafts((d) => ({ ...d, [provider]: v }))}
+          onSave={() => handleSaveUrl(provider)}
+          onClear={() => handleClearUrl(provider)}
+          busy={busy === `${provider}:url`}
+          flash={flash[`${provider}:url`]}
+          hasKeyRow={Boolean(row.key)}
+        />
+      )}
     </div>
   );
 }

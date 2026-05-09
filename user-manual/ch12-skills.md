@@ -251,6 +251,33 @@ explicitly are unaffected, and the next user prompt starts from the
 baseline again. This keeps the swap unobtrusive: it helps the skill
 without taking over the session.
 
+### Override the recommendation via `settings.json`
+
+Built-in skills (currently `extract-and-save` — see [Chapter 9](ch09-knowledge-bases-kms.md) and Chapter 1 for context) ship with a default model recommendation in their embedded SKILL.md. You can override that recommendation from `settings.json` without forking the entire skill body — useful when the default (e.g. `gpt-4.1-nano`) needs an OpenAI key that you don't have, but you'd like the skill to still apply your preferred Claude model:
+
+```json
+// .thclaws/settings.json (project) or ~/.config/thclaws/settings.json (user)
+{
+  "extract_save_skill_models": "claude-sonnet-4-6"
+}
+```
+
+Priority list (first model the user has a key for wins):
+
+```json
+{
+  "extract_save_skill_models": ["claude-sonnet-4-6", "gpt-4o", "gemini-2.5-pro"]
+}
+```
+
+**Resolution chain** when the skill is invoked:
+
+1. `settings.json` field (e.g. `extract_save_skill_models`) — wins if present
+2. SKILL.md frontmatter `model:` — fallback when no override is configured
+3. No recommendation — your current model stays untouched
+
+Each future built-in skill that needs special model selection will get its own settings field (`tts_skill_models`, `transcribe_skill_models`, etc.) — the per-skill named convention scales better than a generic map for the small curated set of built-ins, and makes the intent visible in `settings.json`.
+
 ## Writing your own skill
 
 Smallest possible skill:

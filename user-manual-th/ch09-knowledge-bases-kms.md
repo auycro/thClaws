@@ -32,17 +32,57 @@ Use case:
 
 ```
 <kms_root>/
-├── index.md      ← table of contents, one line per page. The agent reads this every turn.
-├── log.md        ← append-only change log (humans + agent write here)
-├── SCHEMA.md     ← optional: shape rules for pages
-├── pages/        ← individual wiki pages, one per topic
+├── index.md       ← table of contents, one line per page. The agent reads this every turn.
+├── log.md         ← append-only change log (humans + agent write here)
+├── SCHEMA.md      ← optional: prose shape rules for pages
+├── manifest.json  ← schema version + optional frontmatter requirements (see "Schema versioning")
+├── pages/         ← individual wiki pages, one per topic
 │   ├── auth-flow.md
 │   ├── api-conventions.md
 │   └── troubleshooting.md
-└── sources/      ← raw source material (URLs, PDFs, notes) — optional
+└── sources/       ← raw source material (URLs, PDFs, notes) — optional
 ```
 
 `/kms new` จะสร้างทุกอย่างข้างบนให้พร้อมเนื้อหา starter เล็ก ๆ เพื่อให้คุณเริ่มเขียนต่อได้ทันที
+
+## การเพิ่มเนื้อหา: capture และ ingest
+
+มีสามวิธีที่เพิ่มเนื้อหาเข้า KMS เรียงจาก "ให้ agent คิดเอง" ไปจน "บอก agent ตรง ๆ ว่าต้องทำอะไร" เลือกตามจังหวะที่คุณอยู่
+
+### ภาษาธรรมชาติ
+
+แค่บอก agent มันก็เขียน markdown แบบเดียวกับที่เขียนไฟล์อื่น ๆ:
+
+```
+❯ I just read https://example.com/oauth-guide. Ingest the key points into 'notes'.
+
+[assistant] Reading the page…
+[tool: WebFetch(url: "https://example.com/oauth-guide")]
+[tool: Write(path: "~/.config/thclaws/kms/notes/pages/oauth-client-credentials.md", ...)]
+[tool: Edit(path: "~/.config/thclaws/kms/notes/index.md", ...)]
+[tool: Edit(path: "~/.config/thclaws/kms/notes/log.md", ...)]
+Wrote pages/oauth-client-credentials.md, added entry to index.md, appended to log.md.
+```
+
+ใช้ได้กับทุกอย่าง — บทความ, screenshot, transcript, task agent หาที่วางและเขียน page, index entry, log entry ให้เอง
+
+### Slash command สำหรับเคสที่เจอบ่อย
+
+เมื่อ source มีรูปแบบตายตัว slash command ช่วยให้ไม่ต้อง prompt-engineering แต่ละตัวมีหัวข้อของตัวเองด้านล่าง — แผนคร่าว ๆ ที่นี่:
+
+- **`/kms ingest NAME <file-or-url-or-$>`** — ดึงไฟล์, URL, PDF หรือ chat session ปัจจุบันเข้า KMS เป็น stub page
+- **`/kms dump NAME <text>`** — paste เนื้อหา freeform; agent แบ่งเป็น chunk แล้ว route แต่ละชิ้นไปที่ที่ใช่
+- **`/kms file-answer NAME <title>`** — file ข้อความล่าสุดของ assistant เป็น page ใหม่
+
+### Workflow สามขั้นตอนของ Karpathy
+
+แนวคิดเบื้องหลังทั้งหมด:
+
+1. **Ingest** — อ่านแหล่งข้อมูล สกัดข้อเท็จจริง เขียน page, อัปเดต index, append log
+2. **Query** — ตอบคำถามจาก wiki (agent ทำให้เองเมื่อมี KMS ผูกอยู่)
+3. **Lint** — เป็นระยะ ๆ อ่านทุก page แล้ว flag ว่าต้อง merge / split / orphan ไหน
+
+ทำได้ผ่านภาษาธรรมชาติทั้งหมด slash command คือ shortcut
 
 ## Multi-KMS: ผูก KMS ชุดใดก็ได้เข้ากับการสนทนา
 
@@ -67,16 +107,24 @@ consult them before answering when the user's question overlaps.
 ## KMS: notes (user)
 
 # notes
-- [auth-flow](pages/auth-flow.md) — JWT refresh pattern we use
-- [api-conventions](pages/api-conventions.md) — REST style guide
+- auth-flow → pages/auth-flow.md — JWT refresh pattern we use
+- api-conventions → pages/api-conventions.md — REST style guide
 
 To read a specific page, call `KmsRead(kms: "notes", page: "<page>")`.
 To grep all pages, call `KmsSearch(kms: "notes", pattern: "...")`.
 ```
 
-พร้อมทั้งลงทะเบียน `KmsRead` และ `KmsSearch` ไว้ในรายการ tool ให้ด้วย
+พร้อมทั้งลงทะเบียน `KmsRead` / `KmsSearch` (และ `KmsWrite` / `KmsAppend` / `KmsDelete` ที่ mutate ได้) ไว้ในรายการ tool ให้ด้วย **slash command หลายตัวด้านล่างต้องการ KMS ที่ active อย่างน้อยหนึ่งตัว** — ถ้าไม่มี KMS active เลย tools ของ KMS จะไม่ถูก register เข้า registry และ agent จะแอ็กเซส KMS ใด ๆ ทาง name ไม่ได้
 
 ## Slash commands
+
+surface เต็ม จัดกลุ่มตาม purpose
+
+- **ค้นและตรวจสอบ**: `/kms`, `/kms show`
+- **Lifecycle**: `/kms new`, `/kms use`, `/kms off`
+- **Capture**: `/kms ingest`, `/kms dump`, `/kms file-answer`
+- **Maintenance**: `/kms lint`, `/kms wrap-up`, `/kms reconcile`, `/kms migrate`
+- **Decision support**: `/kms challenge`
 
 ### `/kms` (หรือ `/kms list`)
 
@@ -91,9 +139,21 @@ To grep all pages, call `KmsSearch(kms: "notes", pattern: "...")`.
 (* = attached to this project; toggle with /kms use | /kms off)
 ```
 
+### `/kms show NAME`
+
+พิมพ์ `index.md` ของ KMS ออกมาให้ดูว่ามีอะไรบ้าง
+
+```
+❯ /kms show notes
+# notes
+- auth-flow → pages/auth-flow.md — JWT refresh pattern we use
+- api-conventions → pages/api-conventions.md — REST style guide
+...
+```
+
 ### `/kms new [--project] NAME`
 
-สร้าง KMS ใหม่พร้อมไฟล์ starter ให้ในตัว
+สร้าง KMS ใหม่พร้อมไฟล์ starter ให้ในตัว (รวมถึง `manifest.json`)
 
 ```
 ❯ /kms new meeting-notes
@@ -108,9 +168,7 @@ created KMS 'design-decisions' (project) → ./.thclaws/kms/design-decisions
 
 ### `/kms use NAME`
 
-ผูก KMS เข้ากับโปรเจกต์ปัจจุบัน ระบบจะลงทะเบียน tool `KmsRead` /
-`KmsSearch` เข้า session ทันที พร้อมแทรก `index.md` เข้า system
-prompt — ไม่ต้อง restart ใช้ได้ทั้ง CLI REPL และ GUI ทั้งสองแท็บ
+ผูก KMS เข้ากับโปรเจกต์ปัจจุบัน ระบบจะลงทะเบียน tool `KmsRead` / `KmsSearch` / `KmsWrite` / `KmsAppend` / `KmsDelete` เข้า session ทันที พร้อมแทรก `index.md` เข้า system prompt — ไม่ต้อง restart ใช้ได้ทั้ง CLI REPL และ GUI ทั้งสองแท็บ
 
 ```
 ❯ /kms use notes
@@ -119,25 +177,258 @@ KMS 'notes' attached (tools registered; available this turn)
 
 ### `/kms off NAME`
 
-ถอด KMS ออก มีผลทันทีเช่นกัน — เมื่อถอด KMS ตัวสุดท้ายออก `KmsRead` /
-`KmsSearch` จะถูกลบจาก registry เพื่อไม่ให้ model เห็นเป็นทางเลือก
+ถอด KMS ออก มีผลทันทีเช่นกัน — เมื่อถอด KMS ตัวสุดท้ายออก tool ของ KMS จะถูกลบจาก registry เพื่อไม่ให้ model เห็นเป็นทางเลือก
 
 ```
 ❯ /kms off archived-docs
 KMS 'archived-docs' detached (system prompt updated)
 ```
 
-### `/kms show NAME`
+### `/kms ingest NAME <file-or-url-or-$>`
 
-พิมพ์ `index.md` ของ KMS ออกมาให้ดูว่ามีอะไรบ้าง
+เพิ่ม source เข้า KMS ระบบจับชนิดของ source อัตโนมัติแล้ว route ไปยัง ingest path ที่ถูกต้อง split สองขั้น: bytes ดิบไปอยู่ที่ `sources/<alias>.<ext>` (immutable), stub page ไปอยู่ที่ `pages/<alias>.md` พร้อม frontmatter ที่ชี้ย้อนกลับไปที่ source จากนั้นคุณ enrich stub ผ่าน prompting ตามปกติหรือ `/kms ingest --force` อีกที
+
+| รูปแบบ source | สิ่งที่ระบบทำ |
+|---|---|
+| `<file.md>` / `.txt` / `.json` / `.rst` / `.log` / `.markdown` | text ธรรมดา — copy bytes, write stub |
+| `<file.pdf>` | run `pdftotext` ก่อน (ต้องติดตั้ง `poppler-utils`) แล้วค่อย ingest |
+| `https://...` URL | HTTP fetch (timeout 30s); response body ได้ banner `<!-- fetched from <url> on <date> -->` ก่อน ingest |
+| `$` | พิเศษ — "chat session ปัจจุบัน" trigger agent turn ที่สรุป conversation เป็น wiki page (200–1500 คำ, สังเคราะห์) แล้วเรียก `KmsWrite` ชื่อ page จาก `session.title` (sanitize) ถ้ามี ไม่งั้น `session.id` (`sess-<hex>`) — ดูด้านล่าง |
+
+flag เสริม:
+
+- `as <alias>` — override page stem ที่ระบบ derive ให้ ใช้เมื่อชื่อไฟล์หรือ URL ผลิต stem หน้าตาน่าเกลียด
+- `--force` — แทนที่ page ที่มีอยู่แล้วของ alias เดียวกัน และ mark ทุก page ที่ frontmatter `sources:` reference alias นี้ด้วย marker `> ⚠ STALE` (**re-ingest cascade**) page ที่ flag STALE ต้อง refresh ตามเนื้อหา source ใหม่; `/kms wrap-up` จะ surface ขึ้นมาให้
 
 ```
-❯ /kms show notes
-# notes
-- [auth-flow](pages/auth-flow.md) — JWT refresh pattern we use
-- [api-conventions](pages/api-conventions.md) — REST style guide
-...
+❯ /kms ingest notes ~/Downloads/oauth-spec.pdf
+ingested oauth-spec → pages/oauth-spec.md (12 KB extracted)
+
+❯ /kms ingest notes https://example.com/articles/best-practices.html as best-practices
+ingested best-practices → pages/best-practices.md (4.2 KB)
+
+❯ /kms ingest notes ~/Downloads/updated-spec.pdf as oauth-spec --force
+re-ingested oauth-spec; marked 3 dependent page(s) stale
 ```
+
+สำหรับ paste หลายย่อหน้าโดยไม่มี source file เฉพาะ `/kms dump` เหมาะกว่า
+
+#### `/kms ingest NAME $` — file chat session ปัจจุบัน
+
+source target พิเศษ `$` trigger **agent turn** ที่สรุป conversation ที่กำลังทำอยู่ slash จะ rewrite ตัวเองเป็น structured prompt ที่บอก agent ให้
+
+1. สรุป conversation เป็น wiki page ที่อ่านเข้าใจในตัว (200–1500 คำ, สังเคราะห์ ไม่ใช่ transcribe)
+2. เรียก `KmsWrite(kms: "<name>", page: "<page>", content: "...")` พร้อม frontmatter `category: session, sources: chat`
+3. confirm ผลลัพธ์กับ user พร้อม path ที่ resolve ได้
+
+ชื่อ page resolve ตาม precedence
+
+1. **user-supplied** ผ่าน `as <alias>` (sanitize เป็น kebab-case stem)
+2. **session title** ถ้า session ของคุณมี title
+3. **session id** (`sess-<hex>`) เป็น fallback สุดท้าย
+
+ใช้ `--force` ถ้าต้องการแทนที่ page ที่มีอยู่แล้วของ slug ที่ resolve ได้
+
+### `/kms dump NAME <text>`
+
+บันทึกเนื้อหา freeform แล้วให้ระบบจัดเส้นทางให้เอง agent จะแบ่ง dump เป็น chunk ย่อย ๆ (หนึ่ง decision หนึ่ง observation หนึ่ง source ใหม่ ต่อหนึ่ง chunk) ประกาศแผนการ route ออกมาเป็นข้อความก่อน แล้วค่อยรัน `KmsWrite` / `KmsAppend` จริง
+
+> ต้องมี KMS tools — รัน `/kms use <name>` ก่อนถ้ายังไม่มี KMS attached ถ้าไม่มี KMS active คำสั่งนี้จะ refuse พร้อม error ที่ชัดเจน
+
+```
+❯ /kms dump notes Big standup. Decision: defer Redis migration — Tom raised cost
+  concerns, Sarah agreed. Win: auth refactor praised by manager. Risk:
+  backend cap shrinks next sprint, may push deadline.
+
+(/kms dump notes → routing 198 char(s))
+
+[agent] I'll route this:
+- Append to redis-migration.md — decision to defer with Tom's cost rationale
+- Append to brag-doc.md — manager praise on auth refactor
+- Append to team-capacity.md — backend cap risk for next sprint
+- Skip "big standup" header — too generic to file
+
+[KmsAppend ×3 fire]
+
+**Created**: none
+**Appended**: redis-migration.md, brag-doc.md, team-capacity.md
+**Skipped**: "big standup" — too generic
+```
+
+paste แบบหลายบรรทัดใช้ได้ทั้ง CLI และ GUI pattern **ประกาศก่อนค่อยทำ** ถูก bake เข้า prompt ไว้แล้ว — agent จะพิมพ์แผนออกมาก่อนยิง tool คุณจึง ⌃C เพื่อยกเลิกได้ทัน กฎเข้มที่ใส่ให้ agent: ห้ามแต่ง source เอง, ห้ามใช้ `KmsDelete`, ทุก page ใหม่ต้อง reference page อื่นที่มีอยู่แล้วอย่างน้อยหนึ่ง link (ถ้า link ไม่ได้ chunk นั้นจะถูก defer)
+
+`capture` เป็น alias ของ `dump` ใช้คำไหนก็ได้ตามถนัด
+
+### `/kms file-answer NAME <title>`
+
+file ข้อความล่าสุดของ assistant เป็น page ใหม่ใน KMS ใช้ตอนที่ agent เพิ่งผลิตอะไรที่น่าเก็บ (สังเคราะห์, comparison table, debugging recap) แล้วคุณอยากให้มันอยู่ใน wiki แทนที่จะต้องไปไล่หาใน chat history alias: `file`
+
+```
+❯ /kms file-answer notes oauth-debugging-recap
+filed answer → /Users/you/.config/thclaws/kms/notes/pages/oauth-debugging-recap.md (1428 bytes)
+```
+
+ชื่อ page คือ `<title>` ที่ sanitize เป็น stem frontmatter pre-set เป็น `category: answer, filed_from: chat` body คือข้อความ assistant ล่าสุดทั้งดุ้น ใต้ H1 ที่ใส่ title ไว้
+
+### `/kms lint NAME`
+
+ตรวจสุขภาพแบบ pure-read เดินไล่ `pages/` แล้วรายงานปัญหา 6 หมวด: link markdown ที่ชี้ไปยัง page ที่ไม่มีจริง (broken link), page ที่ไม่มีใคร link เข้ามา (orphan), entry ใน index ที่ชี้ไปไฟล์ที่หายไป, page บนดิสก์ที่ไม่มีใน index, page ที่ไม่มี YAML frontmatter และ (เมื่อ `manifest.json` ประกาศ `frontmatter_required` ไว้) field บังคับที่ขาดหายของแต่ละ category
+
+```
+❯ /kms lint notes
+KMS 'notes': 3 issue(s)
+
+broken links (1):
+  - oauth-flow → pages/sso-config.md (missing)
+
+pages missing from index (1):
+  - tracing-conventions
+
+missing required frontmatter fields (1):
+  - paper-x: 'sources' (required by research)
+```
+
+alias ของ `/kms lint`: `/kms check`, `/kms doctor`
+
+### `/kms wrap-up NAME [--fix]`
+
+review ตอนจบ session รวม lint กับการสแกนหา stale-marker page — page ที่ถูกแปะเครื่องหมาย `> ⚠ STALE: source <alias> was re-ingested on YYYY-MM-DD` จากการ re-ingest cascade รอให้ refresh เนื้อหาตาม source ใหม่
+
+```
+❯ /kms wrap-up notes
+KMS 'notes': wrap-up — 3 lint issue(s), 1 stale marker(s)
+
+broken links (1):
+  - oauth-flow → pages/sso-config.md (missing)
+
+stale pages awaiting refresh (1):
+  - summary: source `topic` re-ingested on 2026-05-08 (page not yet refreshed)
+
+next steps: ask the agent to refresh stale pages and fix lint issues, or run `/kms lint <name>` again after edits.
+```
+
+ใส่ `--fix` เพื่อสั่ง subagent **`kms-linker`** ที่ติดมาในตัว (ดูหัวข้อ "Maintenance subagents" ด้านล่าง) ให้ลงมือแก้ตาม report — ค้นหา target จริงของ broken link, append bullet ที่ขาดเข้า index, refresh stale page จาก source ของมัน กฎเข้ม: ห้ามแต่ง, ห้ามลบ, ปล่อย orphan ไว้ (มักตั้งใจไว้แบบนั้น) ใช้ได้เฉพาะใน GUI — CLI จะพิมพ์ report แล้วบอกให้ไปเรียกจาก GUI
+
+> ต้องมี KMS tools — รัน `/kms use <name>` ก่อน branch `--fix` จะ refuse พร้อม error ที่ชัดเจนถ้าไม่มี KMS attached เพราะ subagent inherit tool registry จาก parent ถ้าไม่มี tool พร้อม subagent จะ spawn มาแบบใช้งานไม่ได้
+
+### `/kms reconcile NAME [<focus>] [--apply]`
+
+แก้ contradiction อัตโนมัติ ส่งงานให้ subagent **`kms-reconcile`** ที่ติดมาในตัว ทำงาน 4 pass (claims / entities / decisions / source-freshness) จัดประเภทแต่ละจุด (clear-winner / ambiguous / evolution) แล้วทั้ง rewrite page ที่ outdated พร้อม `## History` section หรือสร้าง `Conflict — <topic>.md` ให้ user ตัดสินสำหรับเคสที่ ambiguous จริง ๆ ค่าเริ่มต้น dry-run; `--apply` ลงมือเขียนจริง arg ตำแหน่งที่สองเป็น focus ที่ narrow pass ลงเฉพาะ topic ใช้ได้เฉพาะ GUI
+
+> ต้องมี KMS tools — รัน `/kms use <name>` ก่อนถ้ายังไม่มี KMS attached
+
+```
+❯ /kms reconcile notes
+✓ kms-reconcile dispatched (id: side-7e2a, dry-run)
+
+[subagent รายงานกลับ]
+
+**Auto-resolved (3):**
+- `oauth-flow.md`: "tokens expire 15min" → "tokens expire 30min" (source ใหม่ปี 2026-04 supersede 2025-09)
+- `team-sarah-chen.md`: role อัปเดตจาก "Eng Lead" เป็น "Director" ตาม Q2 standup
+- `redis-config.md`: cite `redis-2026-spec.md` แทน `redis-2025-spec.md`
+
+**Flagged for user (1) — Conflict pages would be created:**
+- `Conflict — auth-token-rotation.md`: paper-x ว่า rotate ทุก 24h, paper-y ว่าทุก 7d
+  ทั้งคู่ peer-reviewed ต้องการการตัดสินจาก human
+
+**Stale pages updated (2):**
+- `architecture-overview.md`: ตอนนี้ cite `2026-arch-rfc.md` (เดิม `2025-arch-rfc.md`)
+- `db-migrations.md`: เหมือนกัน
+
+this was a dry-run preview. re-run with `--apply` to execute.
+```
+
+tool whitelist ของ `kms-reconcile` **แคบกว่า `dream`** — `KmsRead, KmsSearch, KmsWrite, KmsAppend, TodoWrite` เท่านั้น ไม่มี `KmsDelete` (reconcile รักษาทุก claim เดิมไว้ ทั้งใน `## History` หรือใน Conflict page) กฎเข้ม: ห้ามแต่ง date หรือ source; "เปลี่ยนใจ" จัดเป็น Evolution ไม่ใช่ contradiction
+
+### `/kms migrate NAME [--apply]`
+
+migration ของ schema ค่าเริ่มต้นเป็นแบบ dry-run (พิมพ์แผนออกมาเฉย ๆ ไม่เขียน) ใส่ `--apply` เพื่อลงมือจริง idempotent — รันบน KMS ที่อยู่เวอร์ชันล่าสุดแล้วจะรายงาน `already at schema version X — nothing to migrate`
+
+```
+❯ /kms migrate legacy-notes
+KMS 'legacy-notes': migration plan (0.x → 1.0, 1 step(s))
+
+0.x → 1.0:
+  - write /Users/you/.config/thclaws/kms/legacy-notes/manifest.json (schema_version: 1.0, frontmatter_required: empty)
+
+this was a dry-run preview. re-run with `--apply` to execute.
+
+❯ /kms migrate legacy-notes --apply
+KMS 'legacy-notes': migration applied (0.x → 1.0, 1 step(s))
+
+0.x → 1.0:
+  - write /Users/you/.config/thclaws/kms/legacy-notes/manifest.json (schema_version: 1.0, frontmatter_required: empty)
+
+logged to log.md. /kms lint to verify.
+```
+
+เมื่อมี schema ใหม่ใน release ถัดไป `/kms migrate` จะเดิน chain ทีละขั้นจากเวอร์ชันปัจจุบันของคุณไปจนถึงล่าสุด step 0.x → 1.0 ปัจจุบันแค่เขียน `manifest.json` ไม่ยุ่งกับ page
+
+### `/kms challenge NAME <idea>`
+
+red-team ก่อนตัดสินใจ — ส่งไอเดียหรือแผนเข้าไป agent จะค้น KMS หา past failure / decision ที่กลับลำ / contradiction ที่ user เคยเตือนตัวเองไว้ แล้วผลิตการวิเคราะห์ Red Team พร้อม citation ไปที่ page เฉพาะ read-only — ไม่มี write alias: `redteam`
+
+> ต้องมี KMS tools — รัน `/kms use <name>` ก่อนถ้ายังไม่มี KMS attached
+
+```
+❯ /kms challenge notes ผมจะ ship auth refactor สัปดาห์นี้โดยที่ test harness ยังไม่พร้อม
+
+[agent ค้นใน KMS]
+
+**Your position:** Ship auth refactor this week without the new test harness.
+
+**Counter-evidence from your vault:**
+- `incident-2026-01-12` (date: 2026-01-12): "Auth incident traced to insufficient
+  integration test coverage. Decision: never ship auth changes without the test harness."
+- `1-1-Sarah-2026-04-08` (date: 2026-04-08): Sarah เคย flag ไว้ว่า ship-without-tests
+  เป็น pattern ซ้ำที่กัดทุก quarter
+
+**Blind spots:** อาจกำลังลดน้ำหนักของ integration test gap เพราะ unit test ผ่านอยู่
+incident เก่าใน vault ชี้ว่า failure mode อยู่ที่ integration boundary
+
+**Verdict:** vault แนะนำให้ระวัง past incidents กับ 1:1 ล่าสุดชี้ไปทางเดียวกัน
+อย่างน้อยทำ manual smoke pass ก่อน merge
+```
+
+prompt บอก agent ตรง ๆ ว่า "อย่ายอม" — push back ถ้า vault ให้กระสุนมาถาม ผลลัพธ์เป็นการวิเคราะห์ ไม่มีการเขียนกลับเข้า vault
+
+## Schema versioning และกฎ frontmatter
+
+`manifest.json` คือ schema ของ KMS ในรูปที่เครื่องอ่านได้ KMS ใหม่จะได้ไฟล์นี้ติดมาให้อัตโนมัติ:
+
+```json
+{
+  "schema_version": "1.0",
+  "frontmatter_required": {}
+}
+```
+
+มีสองสิ่งอยู่ในนี้
+
+- **`schema_version`** — เป็น anchor ของ `/kms migrate` เมื่อ thClaws ออก schema ใหม่ migrator จะตรวจเวอร์ชันปัจจุบันจาก field นี้แล้วเดินตาม chain ขึ้นไปจนถึงเวอร์ชันล่าสุด
+- **`frontmatter_required`** — การบังคับใช้แบบ optional ค่าเริ่มต้นคือว่าง แก้ไฟล์นี้เพื่อประกาศว่า page แต่ละ category ต้องมี YAML frontmatter field อะไรบ้าง คีย์ `global` มีผลกับทุก page; คีย์อื่น ๆ มีผลเฉพาะ page ที่ field `category:` ตรงกัน
+
+```json
+{
+  "schema_version": "1.0",
+  "frontmatter_required": {
+    "global": ["category", "tags"],
+    "research": ["sources"]
+  }
+}
+```
+
+`/kms lint` จะรายงานเมื่อพบการละเมิด:
+
+```
+missing required frontmatter fields (1):
+  - paper-x: 'sources' (required by research)
+```
+
+page ที่ไม่มี frontmatter เลย จะถูกแยกรายงานในหมวด `pages without YAML frontmatter` และถูกข้ามจากการตรวจ field รายตัว — แก้ทีละอย่าง
+
+KMS เก่า (ที่สร้างก่อนมี manifest) จะไม่มี `manifest.json` ระบบจะข้ามการตรวจ field ให้เงียบ ๆ ใช้ `/kms migrate <name> --apply` เพื่อย้ายขึ้นมา v1.0 ได้ migration นี้เป็นแบบเพิ่มเท่านั้น (เขียนไฟล์ manifest ไม่ยุ่งกับ page เลย)
 
 ## Sidebar (GUI)
 
@@ -181,9 +472,23 @@ Surface สำหรับ mutate KMS ที่ agent (และ `/dream` consol
 
 ชื่อ page จะถูก validate เป็น path-segment — ไม่มี separator, ไม่มี traversal, และชื่อสงวน `index`, `log`, `SCHEMA` ใช้เป็นชื่อ page ไม่ได้ (KMS เป็นคนจัดการเอง)
 
-## การ Consolidate ด้วย `/dream`
+## Maintenance subagents
 
-หลังจากทำงานไปไม่กี่สัปดาห์ KMS จะมี duplicate สะสม: page สอง page ที่พูดเรื่องเดียวกันแต่เนื้อหาไหลออกจากกัน, ข้อมูลเก่าที่ขัดกับสิ่งที่คุณพูดเมื่อวาน, insight จาก session ที่ไม่เคยถูกบันทึกเป็น page **`/dream`** คือ slash command ที่แก้ปัญหานี้ — มัน dispatch built-in `dream` agent เป็น side channel (บทที่ 15) ซึ่ง consolidate KMS ของ project ใน background ขณะที่คุณทำงานอื่นต่อได้
+มี subagent ที่ติดมาในตัว 3 ตัวสำหรับดูแล KMS ทั้งหมดรันเป็น side channel (บทที่ 15) — agent ที่รันในของตัวเอง ในของ context window ตัวเอง งานเดินยาว ๆ จึงไม่ปนเข้า conversation หลักของคุณ
+
+| Agent | สั่งด้วย | ขอบเขต | ใช้เมื่อไหร่ |
+|---|---|---|---|
+| `dream` | `/dream` | active KMS ทุกตัว | consolidate ลึกแบบเป็นระยะ — ขุด session ล่าสุด, dedupe page, ปรับโครงสร้าง |
+| `kms-linker` | `/kms wrap-up <name> --fix` | KMS เดียว, report เดียว | แก้แบบเจาะจง — ลงมือตาม lint + stale-marker report ที่เป็นรูปธรรม |
+| `kms-reconcile` | `/kms reconcile <name> [--apply]` | KMS เดียว | แก้ contradiction ข้าม page — rewrite พร้อม `## History` หรือ flag เป็น Conflict page |
+
+> ทั้งสามตัวต้องมี KMS อย่างน้อยหนึ่งตัวอยู่ใน `kms_active` เพื่อให้ tool ของ KMS register ก่อน subagent spawn รัน `/kms use <name>` ก่อน; ถ้าไม่มี KMS active dispatch จะ refuse พร้อม error ชัดเจน แทนที่จะ spawn subagent ที่ไม่มี tool ใช้งาน
+
+นอกจากนี้ยังรันบน schedule ได้ผ่าน [preset สำเร็จรูปในบทที่ 19](ch19-scheduling.md) — `nightly-close`, `weekly-review`, `contradiction-sweep`, `vault-health` หมายเหตุ: schedule ที่ยิงผ่าน daemon จะใช้ natural-language tool directive (ไม่ใช่ slash command) เพราะ daemon ยิงผ่าน `thclaws --print` ที่ไม่มี slash dispatch
+
+### Consolidate แบบกว้าง: `/dream`
+
+หลังจากทำงานไปไม่กี่สัปดาห์ KMS จะมี duplicate สะสม: page สอง page ที่พูดเรื่องเดียวกันแต่เนื้อหาไหลออกจากกัน, ข้อมูลเก่าที่ขัดกับสิ่งที่คุณพูดเมื่อวาน, insight จาก session ที่ไม่เคยถูกบันทึกเป็น page **`/dream`** คือ slash command ที่แก้ปัญหานี้ — มัน dispatch built-in `dream` agent เป็น side channel ซึ่ง consolidate KMS ของ project ใน background ขณะที่คุณทำงานอื่นต่อได้
 
 ```
 /dream                 # consolidate ทุกอย่าง
@@ -194,7 +499,7 @@ Surface สำหรับ mutate KMS ที่ agent (และ `/dream` consol
 
 `/dream` ใช้ได้เฉพาะใน GUI (ต้องใช้ chat surface ในการ render side bubble) dream agent รันแบบ concurrent กับ main คุณจึงสั่ง main ต่อได้ระหว่าง dream ทำงาน
 
-### มันทำอะไร
+#### มันทำอะไร
 
 dream agent รัน 4 pass:
 
@@ -217,7 +522,7 @@ dream agent รัน 4 pass:
 [dream] ✓ done in 3m12s. See dream-2026-05-07.md for the change log.
 ```
 
-### การ review ผลลัพธ์
+#### การ review ผลลัพธ์
 
 dream agent รันด้วย `permission_mode: auto` — แก้และลบ page ได้โดยไม่ถาม **ขั้นตอน review คือ `git diff`** ถ้า project KMS ของคุณอยู่ใต้ git (ซึ่งควรจะอยู่ — `.thclaws/kms/` ก็แค่ markdown):
 
@@ -229,44 +534,79 @@ git add .thclaws/kms/ && git commit -m "..."  # รับงาน
 
 หน้า `dream-YYYY-MM-DD.md` คือคำอธิบายของ agent เองว่าทำอะไรไปบ้าง — อ่านอันนี้ก่อน แล้วค่อย spot-check diff ที่สำคัญ ถ้า summary บอกว่า "no new insights" และเขียน stub page นั่นคือ no-op outcome ที่ valid เช่นกัน
 
-### การ customize
+#### การ customize
 
 built-in dream agent shipped อยู่ใน binary (system prompt + tool whitelist) คุณ override ได้ที่ระดับ project โดยสร้าง `.thclaws/agents/dream.md` พร้อม frontmatter และคำสั่งของคุณเอง — ตัว disk ชนะ built-in เสมอ ใช้ได้ถ้าทีมคุณมีนโยบาย KMS curation เฉพาะ (เช่น "ห้ามลบ page ที่ tag `archive: keep`")
 
 dream agent default ใช้ tool: `KmsRead, KmsSearch, KmsWrite, KmsAppend, KmsDelete, Read, Glob, Grep, TodoWrite` — ไม่มี `Bash`, ไม่มี `Edit`/`Write` กับ project source, ไม่มี `Memory*` มัน modify ได้แค่ KMS เท่านั้น
 
-## การเขียน page: workflow การ ingest
+### แก้แบบเจาะจง: `kms-linker`
 
-ไม่ต้องมี tool พิเศษสำหรับเพิ่มเนื้อหา เพราะ agent เขียน markdown แบบเดียวกับเขียนไฟล์อื่นทั่วไป turn ingest ทั่วไปจะมีหน้าตาประมาณนี้
+ที่ `/dream` เป็นการกวาดกว้าง ๆ ทั่ว active KMS ทุกตัว **`kms-linker`** เป็นคู่หูแบบเจาะ — มันลงมือตาม lint report ที่เป็นรูปธรรมจาก `/kms wrap-up <name> --fix` จังหวะการใช้งานต่างกัน
 
-```
-❯ I just read https://example.com/oauth-guide. Ingest the key points into 'notes'.
+- `/dream` เป็นแบบ *สำรวจ*: ขุด session หาเนื้อหาใหม่ ๆ ปรับโครงสร้าง dedupe page เหมาะรันเป็นระยะ (ทุกสัปดาห์ จบสปรินต์)
+- `/kms wrap-up --fix` คือ *ปิดงาน*: ส่ง lint+stale ที่เจอให้มันปะ patch สิ่งที่แก้ตรงไปตรงมาได้ เหมาะรันตอนจบ session ก่อนเดินจาก
 
-[assistant] Reading the page…
-[tool: WebFetch(url: "https://example.com/oauth-guide")]
-[tool: Write(path: "~/.config/thclaws/kms/notes/pages/oauth-client-credentials.md", ...)]
-[tool: Edit(path: "~/.config/thclaws/kms/notes/index.md", ...)]
-[tool: Edit(path: "~/.config/thclaws/kms/notes/log.md", ...)]
-Wrote pages/oauth-client-credentials.md, added entry to index.md, appended to log.md.
-```
+operating procedure ของ agent (encode อยู่ใน prompt)
 
-gist ของ Karpathy อธิบาย workflow ไว้เป็นสามขั้นตอน ได้แก่
+| หมวดของ lint | สิ่งที่ทำ |
+|---|---|
+| Broken link `(page → target)` | `KmsSearch` หา target stem; ถ้ามีตัวเดียวที่เข้าได้ชัด แก้ link, ถ้าไม่ชัดให้ defer |
+| Stale page `(stem, source, date)` | `KmsRead` stub page ของ source กับ stale page เอง; เขียน page ใหม่โดยรักษาโครงสร้างเดิม ตัดบรรทัด `> ⚠ STALE` ออก |
+| Missing-in-index page | `KmsAppend` bullet 1 บรรทัดเข้า `index.md` ใต้ section ของ category ที่ตรงกัน |
+| Missing required field | เติมเฉพาะที่ derive จาก body หรือ source ได้; ที่เหลือ defer |
+| Orphan page | ไม่ทำอะไร — orphan มักมีเหตุผล รายงานในบรรทัดสุดท้ายให้คุณตัดสินใจ |
 
-1. **Ingest** — อ่านแหล่งข้อมูล สกัดข้อเท็จจริงที่แตกต่างออกมา แล้วเขียน page, อัปเดต index และ append ลง log
-2. **Query** — ตอบคำถามจาก wiki (agent จะทำขั้นนี้ให้เองเมื่อมี KMS ผูกไว้)
-3. **Lint** — เป็นระยะ ๆ ให้ agent อ่านทุก page แล้วเสนอว่าตรงไหนควร merge, split หรือจัดการ orphan
+ข้อความปิดท้ายของ agent มี contract ตายตัว — block `**Fixed**` ลิสต์ทุกอย่างที่แก้แล้ว, block `**Skipped (need human judgment)**` ลิสต์ที่ปล่อยให้คุณ กฎเข้มเหมือน dream: ห้าม `KmsDelete`, ห้ามแต่ง source tool whitelist แคบกว่า dream — `KmsRead, KmsSearch, KmsWrite, KmsAppend, TodoWrite` เท่านั้น — เพราะ `kms-linker` ทำงานบนสิ่งที่ wrap-up หยิบยื่นให้เท่านั้น ไม่อ่าน session ไม่อ่านไฟล์ภายนอก
 
-ทั้งหมดนี้สั่งด้วยภาษาธรรมชาติได้เลย ไม่ต้องใช้ slash command พิเศษใด ๆ
+override ที่ `.thclaws/agents/kms-linker.md` ได้ถ้าทีมต้องการ policy อื่น
+
+### Auto-reconcile: `kms-reconcile`
+
+subagent ตัวที่สามที่ทำงานบน contradiction ไม่ใช่ lint finding ที่ `kms-linker` แก้ broken link กับ stale marker จาก `/kms wrap-up` **`kms-reconcile`** รัน 4 pass แบบขนานเพื่อหา contradiction จัดประเภท แล้วแก้พร้อมรักษา history เต็ม
+
+4 pass (encode อยู่ใน prompt ของ agent)
+
+| Pass | จับอะไร |
+|---|---|
+| Claims | concept และ project page ที่มี factual claim ทับซ้อนแต่ขัดกัน |
+| Entities | entity page ที่ role / company / title / relationship drift ไป |
+| Decisions | decision page ที่ถูก contradict โดย page หลังโดยไม่มี link `supersedes:` |
+| Source-freshness | wiki page cite source เก่าทั้งที่ source ใหม่ในหัวข้อเดียวกันมีอยู่ใน KMS |
+
+ต่อ finding agent จัดเป็น
+
+- **Clear winner** — side ที่ใหม่กว่า + มี authority สูงกว่า rewrite page เก่า; `## History` section รักษาว่าอะไรเปลี่ยนกับเหตุผล
+- **Genuinely ambiguous** — ทั้งสอง side มีหลักฐาน ไม่มีฝั่งไหน authoritative ชัด สร้าง `Conflict — <topic>.md` พร้อม `status: open` ทั้งสอง position ระบุ พร้อม evidence
+- **Evolution** — ไม่ใช่ contradiction; user เปลี่ยนใจ จัดเป็น growth ผ่าน `## Timeline` section
+
+tool whitelist เหมือน `kms-linker` — `KmsRead, KmsSearch, KmsWrite, KmsAppend, TodoWrite` **ไม่มี `KmsDelete`** (reconcile รักษาทุก claim เดิม ทั้งใน `## History` หรือใน Conflict page) override ที่ `.thclaws/agents/kms-reconcile.md` ได้ถ้าทีมต้องการ policy ต่าง (เช่น "สร้าง Conflict page เสมอ ไม่ auto-resolve")
+
+`/kms reconcile` ค่าเริ่มต้น dry-run; `--apply` ลงมือ arg ตำแหน่งที่สอง narrow pass ลงเฉพาะ topic หรือ entity
+
+## Artifacts ที่จะเห็นใน vault
+
+subagent และ slash command เขียน pattern เฉพาะลง KMS ของคุณ เมื่อเจอใน page นี่คือใครเขียนและความหมาย
+
+| Artifact | ใครเขียน | หมายความว่าอย่างไร |
+|---|---|---|
+| `## History` section ต่อท้าย page | `kms-reconcile` (clear-winner classification) | page ถูก rewrite ด้วย info ใหม่; block History เก็บ claim เดิมและเหตุผลของการอัปเดต |
+| `## Timeline` section ต่อท้าย page | `kms-reconcile` (evolution classification) | ความคิดของ user เรื่องนี้เปลี่ยนตามเวลา; Timeline แสดงพัฒนาการตามลำดับ |
+| page `Conflict — <topic>.md` พร้อม `status: open` | `kms-reconcile` (ambiguous classification) | สอง page ขัดกันแต่ไม่มีฝั่งไหน authoritative ชัด; Conflict page เก็บทั้งสอง position ให้คุณตัดสิน |
+| บรรทัด `> ⚠ STALE: source ...` ใน body ของ page | `mark_dependent_pages_stale` หลัง re-ingest cascade | source ถูก re-ingest ด้วย `--force`; page นี้ reference ผ่าน frontmatter `sources:` และต้อง refresh |
+| page `dream-YYYY-MM-DD.md` | `/dream` consolidation pass | audit trail ของหนึ่ง dream session — เพิ่ม / อัปเดต / ลบอะไรไป พร้อมเหตุผล |
+| stub page ใน `pages/<alias>.md` ลงท้ายด้วย `_Replace this stub with a curated summary..._` | `/kms ingest` (file/URL/PDF) | source ดิบไปอยู่ที่ `sources/<alias>.<ext>`; stub นี้ชี้กลับไป enrich ผ่าน prompting ตามปกติหรือ `KmsWrite` |
+| บรรทัด `## [date] verb \| <alias>` ใน `log.md` | ทุกการ write KMS | change log แบบ append-only grep ได้: `grep "^## \[" log.md \| tail -20` ดู activity ล่าสุด |
 
 ## ขีดจำกัดการ scale และทิศทางในอนาคต
 
-v0.2.x ตั้งใจให้ไม่มี embeddings โดย
+KMS ตั้งใจให้ไม่มี embeddings โดย
 
 - Grep เร็วพอใช้งานได้ถึงระดับไม่กี่ร้อย page
 - การให้อ่าน `index.md` ก่อน ทำให้ agent มักเจอ page ที่เกี่ยวข้องได้โดยไม่ต้องค้นเลย
 - page เป็น markdown ที่มนุษย์อ่านได้ จึงเปิดดูเองได้โดยไม่ต้องใช้เครื่องมือใด ๆ
 
-เมื่อ KMS โตเกิน ~200 page หรือมีเนื้อหาภาษาอื่นที่ไม่ใช่อังกฤษซึ่ง grep จับคู่ข้ามไม่ได้สะอาดนัก คุณสามารถอัปเกรดเป็น hybrid RAG (hosted OpenAI embeddings) ได้ ซึ่งวางแผนไว้สำหรับ release ในอนาคต โดย API ฝั่ง client จะยังคงเหมือนเดิม
+เมื่อ KMS โตเกิน ~200 page หรือมีเนื้อหาภาษาอื่นที่ไม่ใช่อังกฤษซึ่ง grep จับคู่ข้ามไม่ได้สะอาดนัก hybrid RAG (BM25 + vector + LLM rerank ผ่าน [`qmd`](https://github.com/tobi/qmd)) เป็น fallback แบบ opt-in อยู่ใน roadmap โดย API ฝั่ง client จะยังคงเหมือนเดิม
 
 ## หมายเหตุสำหรับภาษาไทย
 
@@ -276,13 +616,18 @@ Grep ทำงานกับภาษาไทยได้ทันทีเพ
 
 ## Troubleshooting
 
+- **"no KMS attached to this session"** — `/kms challenge`, `/kms dump`, `/kms reconcile`, และ `/kms wrap-up --fix` ต้องมี KMS อย่างน้อยหนึ่งตัวอยู่ใน `kms_active` เพื่อให้ tool ของ KMS register error message จะระบุชื่อ KMS เป้าหมาย — รัน `/kms use <name>` ก่อนเพื่อแก้
 - **KMS ไม่ขึ้นใน sidebar** — ตรวจสอบว่าโฟลเดอร์มี `index.md` ที่ใช้ได้ (สร้างเองด้วยมือถ้าคุณปั้น KMS เอง) และอยู่ใน `~/.config/thclaws/kms/` หรือ `.thclaws/kms/`
 - **การเปลี่ยนแปลงไม่สะท้อนในคำตอบของ agent** — `index.md` ถูกอ่านตอนเริ่ม turn ดังนั้น turn ที่กำลังรันอยู่จะยังใช้ snapshot ที่ถ่ายไว้ก่อนหน้า ให้เริ่ม turn ใหม่เพื่ออัปเดต
 - error **"no KMS named 'X'"** จาก tool call — ชื่อเป็น case-sensitive และต้องตรงกับชื่อ directory ทุกตัวอักษร ให้ตรวจสอบด้วย `/kms list`
 - **รายการ active เก่าค้างอยู่** — `.thclaws/settings.json` คือ source of truth หาก checkbox บน sidebar ไม่ตรงกับความจริง ให้แก้ไฟล์นี้ด้วยมือ
+- **`/kms wrap-up --fix` บอก "nothing actionable"** — fix subagent ข้าม dispatch เมื่อ issue ที่เหลือมีแค่ orphan page กับ missing-frontmatter (สิ่งเหล่านี้ต้องการการตัดสินจาก human ไม่ใช่ mechanical fix) แก้เองด้วยมือ
+- **Schedule preset ยิงแต่ไม่มีอะไรเกิดขึ้น** — prompt ของ preset เป็น natural-language directive ไม่ใช่ slash command `.thclaws/settings.json` ของ cwd ต้องมี KMS เป้าหมายอยู่ใน `kms_active` เพื่อให้ tool ของ KMS register ก่อน agent เริ่ม ดูบทที่ 19
 
 ## อ่านต่อที่ไหน
 
 - [บทที่ 8](ch08-memory-and-agents-md.md) — memory และ project instructions (อีกสอง mechanism ที่ใช้จัดการ context)
 - [บทที่ 10](ch10-slash-commands.md) — เอกสารอ้างอิง slash command รวมถึงตระกูล `/kms`
 - [บทที่ 11](ch11-built-in-tools.md) — เอกสารอ้างอิง tool รวมถึง `KmsRead` และ `KmsSearch`
+- [บทที่ 15](ch15-subagents.md) — subagent และ side channel (เจาะลึก `dream`, `kms-linker`, `kms-reconcile`)
+- [บทที่ 19](ch19-scheduling.md) — scheduling รวมถึง preset สำเร็จรูปสำหรับการดูแล KMS (`nightly-close`, `weekly-review`, `contradiction-sweep`, `vault-health`)

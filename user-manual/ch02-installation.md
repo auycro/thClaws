@@ -6,7 +6,7 @@ scripted use). Both are built from the same engine — pick whichever
 matches how you launch. Download the build that matches your OS and
 CPU from:
 
-**https://thclaws.ai/downloads**
+**https://thclaws.ai/downloads.html**
 
 Builds are provided for:
 
@@ -172,7 +172,7 @@ for a key, you haven't configured one yet — see Chapter 6.
 ## Updating
 
 Re-download the newer archive from
-https://thclaws.ai/downloads and repeat the install
+https://thclaws.ai/downloads.html and repeat the install
 step for your platform. Your existing config (API keys, sessions,
 plugins, etc.) under `~/.config/thclaws/` (or `%APPDATA%\thclaws\` on
 Windows) is preserved — only the binaries are replaced.

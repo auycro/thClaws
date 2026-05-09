@@ -69,6 +69,10 @@ impl KmsRef {
         self.root.join("SCHEMA.md")
     }
 
+    pub fn manifest_path(&self) -> PathBuf {
+        self.root.join("manifest.json")
+    }
+
     /// Read `index.md`. Returns `""` (not an error) when the file is absent,
     /// OR when the path is a symlink (refused to prevent a cloned KMS
     /// with `index.md -> /etc/passwd` from exfiltrating through the
@@ -81,6 +85,21 @@ impl KmsRef {
             }
         }
         std::fs::read_to_string(&path).unwrap_or_default()
+    }
+
+    /// Read `manifest.json`. Returns `None` when the file is absent (legacy
+    /// KMS predating manifests is a valid state), when the path is a symlink
+    /// (same exfiltration concern as `read_index`), or when the JSON fails
+    /// to parse (treat malformed as absent rather than poisoning lint).
+    pub fn read_manifest(&self) -> Option<KmsManifest> {
+        let path = self.manifest_path();
+        if let Ok(md) = std::fs::symlink_metadata(&path) {
+            if md.file_type().is_symlink() {
+                return None;
+            }
+        }
+        let raw = std::fs::read_to_string(&path).ok()?;
+        serde_json::from_str(&raw).ok()
     }
 
     /// Resolve a page name to a file path inside `pages/`. `.md` is added
@@ -138,6 +157,27 @@ impl KmsRef {
         Ok(candidate)
     }
 }
+
+/// Optional per-KMS manifest at `<root>/manifest.json`. Declares the schema
+/// version (for `/kms migrate` later) and required frontmatter fields per
+/// page category (consumed by `lint`). Absent for legacy KMSes; new ones
+/// seeded by `create()` get a v1.0 manifest with empty enforcement so
+/// existing tests + workflows are unaffected and policy is opt-in.
+///
+/// `#[serde(default)]` on every field means future additions don't break
+/// older manifests on read — they just take the field's default.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct KmsManifest {
+    #[serde(default)]
+    pub schema_version: String,
+    /// Keys: `"global"` (every page) or a category name (e.g. `"research"`).
+    /// Values: required frontmatter field names. Lint flags any page whose
+    /// `category:` matches a key but is missing one of the listed fields.
+    #[serde(default)]
+    pub frontmatter_required: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+pub const KMS_SCHEMA_VERSION: &str = "1.0";
 
 fn user_root() -> Option<PathBuf> {
     crate::util::home_dir().map(|h| h.join(".config/thclaws/kms"))
@@ -277,6 +317,14 @@ pub fn create(name: &str, scope: KmsScope) -> Result<KmsRef> {
         "# Schema\n\nDescribe the shape of pages in this KMS — required\n\
          sections, naming conventions, cross-link style. Both you and the\n\
          agent read this before editing pages.\n",
+    )?;
+    let manifest = KmsManifest {
+        schema_version: KMS_SCHEMA_VERSION.into(),
+        frontmatter_required: std::collections::BTreeMap::new(),
+    };
+    std::fs::write(
+        kref.manifest_path(),
+        serde_json::to_string_pretty(&manifest).unwrap_or_else(|_| "{}".into()),
     )?;
     Ok(kref)
 }
@@ -508,6 +556,68 @@ fn mark_dependent_pages_stale(kref: &KmsRef, changed_alias: &str) -> Result<usiz
     Ok(count)
 }
 
+/// One stale marker found on a page. Multiple entries per page are possible
+/// when a source has been re-ingested several times without the page being
+/// refreshed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleEntry {
+    pub page_stem: String,
+    pub source_alias: String,
+    pub date: String,
+}
+
+/// Pure-read inverse of `mark_dependent_pages_stale`: walks every page and
+/// returns every `> ⚠ STALE: source \`<alias>\` was re-ingested on <date>.`
+/// marker found in the body. Used by `/kms wrap-up` to surface refresh debt
+/// so the user (or the agent) acts on it before the session closes.
+pub fn scan_stale_markers(kref: &KmsRef) -> Result<Vec<StaleEntry>> {
+    let pages_dir = kref.pages_dir();
+    let entries = match std::fs::read_dir(&pages_dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(Vec::new()),
+    };
+    // Anchor on the marker prefix from `mark_dependent_pages_stale`. Date
+    // format is `crate::usage::today_str()` (YYYY-MM-DD); regex stays loose
+    // on the date so a future format change in one place doesn't silently
+    // break detection in the other.
+    let re =
+        regex::Regex::new(r"> ⚠ STALE: source `([^`]+)` was re-ingested on ([^.\s]+)").unwrap();
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() || !ft.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        if stem.is_empty() {
+            continue;
+        }
+        let body = std::fs::read_to_string(&path).unwrap_or_default();
+        for cap in re.captures_iter(&body) {
+            out.push(StaleEntry {
+                page_stem: stem.clone(),
+                source_alias: cap[1].to_string(),
+                date: cap[2].to_string(),
+            });
+        }
+    }
+    out.sort_by(|a, b| {
+        a.page_stem
+            .cmp(&b.page_stem)
+            .then(a.source_alias.cmp(&b.source_alias))
+            .then(a.date.cmp(&b.date))
+    });
+    Ok(out)
+}
+
 /// M6.25 BUG #8: ingest a remote URL by fetching it via the existing
 /// WebFetchTool then writing the response body to a temp file and
 /// running `ingest()` against it. The HTML→markdown conversion is
@@ -717,6 +827,7 @@ pub fn system_prompt_section(active: &[String]) -> String {
              - `KmsSearch(kms: \"{name}\", pattern: \"...\")` — grep across pages\n\
              - `KmsWrite(kms: \"{name}\", page: \"<page>\", content: \"...\")` — create or replace a page\n\
              - `KmsAppend(kms: \"{name}\", page: \"<page>\", content: \"...\")` — append to a page\n\
+             - `KmsDelete(kms: \"{name}\", page: \"<page>\")` — remove a page (last resort; prefer KmsWrite to merge or supersede)\n\
              Pages may carry YAML frontmatter (`category:`, `tags:`, `sources:`, `created:`, `updated:`). \
              Follow the schema above when authoring."
         ));
@@ -1209,6 +1320,11 @@ pub struct LintReport {
     pub index_orphans: Vec<String>, // index entry but no underlying file
     pub missing_in_index: Vec<String>, // page file but no index entry
     pub missing_frontmatter: Vec<String>, // page has no `---` block
+    /// (page_stem, source_key, missing_field) — `source_key` is `"global"`
+    /// or the page's `category:` value, indicating which manifest rule the
+    /// field came from. Empty when no manifest exists or the manifest's
+    /// `frontmatter_required` map is empty.
+    pub missing_required_fields: Vec<(String, String, String)>,
 }
 
 impl LintReport {
@@ -1218,6 +1334,7 @@ impl LintReport {
             + self.index_orphans.len()
             + self.missing_in_index.len()
             + self.missing_frontmatter.len()
+            + self.missing_required_fields.len()
     }
 }
 
@@ -1259,12 +1376,40 @@ pub fn lint(kref: &KmsRef) -> Result<LintReport> {
     }
 
     // Frontmatter audit + outbound link extraction.
+    // Load the manifest's required-fields map once. Empty (or absent) skips
+    // the per-page required-field check entirely — keeps legacy KMSes silent.
+    let required_fields = kref
+        .read_manifest()
+        .map(|m| m.frontmatter_required)
+        .unwrap_or_default();
     let link_re = regex::Regex::new(r"\(pages/([^)]+?)\.md\)").unwrap();
     let mut inbound_targets: HashSet<String> = HashSet::new();
     for (stem, body) in &page_bodies {
         let (fm, _rest) = parse_frontmatter(body);
         if fm.is_empty() {
             report.missing_frontmatter.push(stem.clone());
+        } else if !required_fields.is_empty() {
+            // Check global rules first, then any category-specific rules.
+            // The same field listed under both keys is reported twice — by
+            // design, so the user can see which rule fired and remove the
+            // redundancy from their manifest.
+            let category = fm.get("category").map(String::as_str).unwrap_or("");
+            for source_key in ["global", category] {
+                if source_key.is_empty() {
+                    continue;
+                }
+                if let Some(fields) = required_fields.get(source_key) {
+                    for field in fields {
+                        if !fm.contains_key(field) {
+                            report.missing_required_fields.push((
+                                stem.clone(),
+                                source_key.to_string(),
+                                field.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
         }
         for cap in link_re.captures_iter(body) {
             let target = cap[1].to_string();
@@ -1305,7 +1450,279 @@ pub fn lint(kref: &KmsRef) -> Result<LintReport> {
     report.index_orphans.sort();
     report.missing_in_index.sort();
     report.missing_frontmatter.sort();
+    report.missing_required_fields.sort();
     Ok(report)
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Schema migrations — chained version upgrades anchored on KmsManifest.
+
+/// Sentinel for any KMS that predates the manifest entirely. Treated as
+/// "0.x" by the migration chain so legacy stores get bumped to 1.0 the
+/// first time `/kms migrate` runs.
+pub const LEGACY_SCHEMA_VERSION: &str = "0.x";
+
+/// One step in the migration chain. `from`/`to` are the `schema_version`
+/// strings as they appear in `manifest.json`. The `apply` function takes
+/// a `dry_run` flag — in dry-run mode it must not touch the filesystem;
+/// in live mode it returns descriptions of what was actually written.
+pub struct Migration {
+    pub from: &'static str,
+    pub to: &'static str,
+    pub apply: fn(&KmsRef, dry_run: bool) -> Result<Vec<String>>,
+}
+
+/// Registry of known migrations, in chain order. Add a new entry when
+/// the schema changes; the resolver in `migrate()` walks `from → to`
+/// until it reaches `KMS_SCHEMA_VERSION`.
+pub fn migrations() -> Vec<Migration> {
+    vec![Migration {
+        from: LEGACY_SCHEMA_VERSION,
+        to: "1.0",
+        apply: migrate_0_to_1,
+    }]
+}
+
+/// 0.x → 1.0: write the initial manifest with empty enforcement.
+/// Pure additive change — no page bodies touched, no index changes.
+/// Lint behaviour is identical before and after; the manifest just
+/// anchors future migrations and gives users a place to declare
+/// `frontmatter_required` rules.
+fn migrate_0_to_1(kref: &KmsRef, dry_run: bool) -> Result<Vec<String>> {
+    let manifest_path = kref.manifest_path();
+    let actions = vec![format!(
+        "write {} (schema_version: 1.0, frontmatter_required: empty)",
+        manifest_path.display()
+    )];
+    if !dry_run {
+        let manifest = KmsManifest {
+            schema_version: "1.0".into(),
+            frontmatter_required: std::collections::BTreeMap::new(),
+        };
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap_or_else(|_| "{}".into()),
+        )
+        .map_err(|e| Error::Tool(format!("write {}: {e}", manifest_path.display())))?;
+        append_log_header(kref, "migrated", "0.x → 1.0")?;
+    }
+    Ok(actions)
+}
+
+/// Detect the current schema version. Absent manifest, or manifest with
+/// empty `schema_version`, is treated as legacy `0.x` — that's how every
+/// KMS created before the manifest feature looks on disk.
+pub fn detect_schema_version(kref: &KmsRef) -> String {
+    match kref.read_manifest() {
+        Some(m) if !m.schema_version.is_empty() => m.schema_version,
+        _ => LEGACY_SCHEMA_VERSION.into(),
+    }
+}
+
+#[derive(Debug)]
+pub struct MigrationStep {
+    pub from: String,
+    pub to: String,
+    pub actions: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct MigrationReport {
+    pub current_version: String,
+    pub target_version: String,
+    pub steps: Vec<MigrationStep>,
+    pub dry_run: bool,
+}
+
+/// Walk the migration chain from the KMS's current schema_version up to
+/// `KMS_SCHEMA_VERSION`. In dry-run mode, returns the plan without
+/// writing. In live mode, applies each step and returns what happened.
+///
+/// Idempotent: a KMS already at the latest version returns a report
+/// with no steps and `current_version == target_version`.
+pub fn migrate(kref: &KmsRef, dry_run: bool) -> Result<MigrationReport> {
+    let initial = detect_schema_version(kref);
+    let target = KMS_SCHEMA_VERSION.to_string();
+    let mut report = MigrationReport {
+        current_version: initial.clone(),
+        target_version: target.clone(),
+        steps: Vec::new(),
+        dry_run,
+    };
+    if initial == target {
+        return Ok(report);
+    }
+    let table = migrations();
+    let mut current = initial;
+    // Bound the loop defensively — `table` is hand-edited, but a bad
+    // edit (e.g. a cycle 1.0 → 1.0) shouldn't spin forever.
+    for _ in 0..table.len() + 1 {
+        if current == target {
+            break;
+        }
+        let Some(m) = table.iter().find(|m| m.from == current) else {
+            return Err(Error::Tool(format!(
+                "no migration path from schema version '{current}' to '{target}'"
+            )));
+        };
+        let actions = (m.apply)(kref, dry_run)?;
+        report.steps.push(MigrationStep {
+            from: m.from.to_string(),
+            to: m.to.to_string(),
+            actions,
+        });
+        current = m.to.to_string();
+    }
+    if current != target {
+        return Err(Error::Tool(format!(
+            "migration chain stalled at '{current}', target '{target}' (likely a cycle in migrations())"
+        )));
+    }
+    Ok(report)
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// User-facing report formatters. Live here (not in shell_dispatch.rs)
+// because the CLI binary `thclaws-cli` is built without the `gui`
+// feature — and `shell_dispatch` is gated behind `gui`. Pure functions:
+// `&LintReport` / `&MigrationReport` / `&[StaleEntry]` → `String`.
+// (M6.38.3 audit fix.)
+
+/// Render a `LintReport` as the user-facing summary block emitted by
+/// `/kms lint <name>`. Six issue categories; clean state returns a
+/// short "no issues found" line.
+pub fn format_lint_report(name: &str, report: &LintReport) -> String {
+    let total = report.total_issues();
+    if total == 0 {
+        return format!("KMS '{name}': clean — no issues found.");
+    }
+    let mut out = format!("KMS '{name}': {total} issue(s)\n");
+    if !report.broken_links.is_empty() {
+        out.push_str(&format!(
+            "\nbroken links ({}):\n",
+            report.broken_links.len()
+        ));
+        for (page, target) in &report.broken_links {
+            out.push_str(&format!("  - {page} → pages/{target}.md (missing)\n"));
+        }
+    }
+    if !report.index_orphans.is_empty() {
+        out.push_str(&format!(
+            "\nindex entries with no underlying file ({}):\n",
+            report.index_orphans.len()
+        ));
+        for stem in &report.index_orphans {
+            out.push_str(&format!("  - {stem}\n"));
+        }
+    }
+    if !report.missing_in_index.is_empty() {
+        out.push_str(&format!(
+            "\npages missing from index ({}):\n",
+            report.missing_in_index.len()
+        ));
+        for stem in &report.missing_in_index {
+            out.push_str(&format!("  - {stem}\n"));
+        }
+    }
+    if !report.orphan_pages.is_empty() {
+        out.push_str(&format!(
+            "\norphan pages (no inbound links from other pages, {}):\n",
+            report.orphan_pages.len()
+        ));
+        for stem in &report.orphan_pages {
+            out.push_str(&format!("  - {stem}\n"));
+        }
+    }
+    if !report.missing_frontmatter.is_empty() {
+        out.push_str(&format!(
+            "\npages without YAML frontmatter ({}):\n",
+            report.missing_frontmatter.len()
+        ));
+        for stem in &report.missing_frontmatter {
+            out.push_str(&format!("  - {stem}\n"));
+        }
+    }
+    if !report.missing_required_fields.is_empty() {
+        out.push_str(&format!(
+            "\nmissing required frontmatter fields ({}):\n",
+            report.missing_required_fields.len()
+        ));
+        for (page, source_key, field) in &report.missing_required_fields {
+            out.push_str(&format!(
+                "  - {page}: '{field}' (required by {source_key})\n"
+            ));
+        }
+    }
+    out
+}
+
+/// Session-end review: lint output plus any STALE markers left behind
+/// by re-ingest cascades. Both are pure-read; the user (or agent) acts
+/// on them via KmsWrite. The "next step" hints surface what's most
+/// actionable.
+pub fn format_wrap_up_report(name: &str, lint: &LintReport, stale: &[StaleEntry]) -> String {
+    let lint_total = lint.total_issues();
+    let stale_count = stale.len();
+    if lint_total == 0 && stale_count == 0 {
+        return format!("KMS '{name}': clean — nothing to wrap up.");
+    }
+    let mut out = format!(
+        "KMS '{name}': wrap-up — {lint_total} lint issue(s), {stale_count} stale marker(s)\n"
+    );
+    if lint_total > 0 {
+        // Reuse the lint formatter so both surfaces stay consistent.
+        let lint_body = format_lint_report(name, lint);
+        // Drop the lint formatter's own header line; we already wrote one.
+        if let Some((_, rest)) = lint_body.split_once('\n') {
+            out.push_str(rest);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+    }
+    if stale_count > 0 {
+        out.push_str(&format!(
+            "\nstale pages awaiting refresh ({stale_count}):\n"
+        ));
+        for entry in stale {
+            out.push_str(&format!(
+                "  - {}: source `{}` re-ingested on {} (page not yet refreshed)\n",
+                entry.page_stem, entry.source_alias, entry.date
+            ));
+        }
+    }
+    out.push_str("\nnext steps: ask the agent to refresh stale pages and fix lint issues, or run `/kms lint <name>` again after edits.\n");
+    out
+}
+
+/// Render a `MigrationReport` from `kms::migrate`. Three shapes —
+/// empty steps (already at latest), dry-run preview, applied summary.
+pub fn format_migration_report(name: &str, report: &MigrationReport) -> String {
+    let mode = if report.dry_run { "plan" } else { "applied" };
+    if report.steps.is_empty() {
+        return format!(
+            "KMS '{name}': already at schema version {} — nothing to migrate.",
+            report.target_version
+        );
+    }
+    let mut out = format!(
+        "KMS '{name}': migration {mode} ({} → {}, {} step(s))\n",
+        report.current_version,
+        report.target_version,
+        report.steps.len()
+    );
+    for step in &report.steps {
+        out.push_str(&format!("\n{} → {}:\n", step.from, step.to));
+        for action in &step.actions {
+            out.push_str(&format!("  - {action}\n"));
+        }
+    }
+    if report.dry_run {
+        out.push_str("\nthis was a dry-run preview. re-run with `--apply` to execute.\n");
+    } else {
+        out.push_str("\nlogged to log.md. /kms lint to verify.\n");
+    }
+    out
 }
 
 /// Build the `kms_update` envelope the frontend's KMS sidebar
@@ -1800,6 +2217,34 @@ mod tests {
         assert!(out.contains("KmsAppend"));
     }
 
+    /// M6.38.2 audit fix (Bug B): KmsDelete is registered alongside the
+    /// other write tools when a KMS is active. Before this fix the system
+    /// prompt's Tools block omitted KmsDelete — the model had access to
+    /// the tool via the registry but no narrative context for when to use
+    /// it. Now it's listed with a "last resort" hint to bias the model
+    /// toward KmsWrite for merge/supersede flows.
+    #[test]
+    fn system_prompt_tools_block_includes_kms_delete() {
+        let _home = scoped_home();
+        let _k = create("nb", KmsScope::User).unwrap();
+        let out = system_prompt_section(&["nb".into()]);
+        assert!(out.contains("### Tools"));
+        assert!(out.contains("KmsRead"));
+        assert!(out.contains("KmsSearch"));
+        assert!(out.contains("KmsWrite"));
+        assert!(out.contains("KmsAppend"));
+        assert!(
+            out.contains("KmsDelete"),
+            "Tools block should list KmsDelete (M6.38.2 fix). Got:\n{out}"
+        );
+        // The "last resort" framing biases the model away from default
+        // deletion behavior — locks the prompt's stance.
+        assert!(
+            out.contains("last resort") || out.contains("prefer KmsWrite"),
+            "KmsDelete entry should bias model toward KmsWrite for merges. Got:\n{out}"
+        );
+    }
+
     // ─── M6.25: categorized index (BUG #6) ────────────────────────────────
 
     #[test]
@@ -1860,5 +2305,384 @@ mod tests {
         let derived = std::fs::read_to_string(k.pages_dir().join("summary.md")).unwrap();
         assert!(derived.contains("STALE"), "stale marker missing: {derived}");
         assert!(derived.contains("source `topic`"));
+    }
+
+    // ─── manifest + schema-aware lint ─────────────────────────────────────
+
+    #[test]
+    fn create_seeds_manifest_with_empty_required() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::User).unwrap();
+        let manifest = k.read_manifest().expect("manifest seeded by create()");
+        assert_eq!(manifest.schema_version, KMS_SCHEMA_VERSION);
+        assert!(
+            manifest.frontmatter_required.is_empty(),
+            "starter manifest must not enforce policy by default"
+        );
+    }
+
+    #[test]
+    fn read_manifest_returns_none_for_legacy_kms() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::User).unwrap();
+        std::fs::remove_file(k.manifest_path()).unwrap();
+        assert!(k.read_manifest().is_none());
+    }
+
+    #[test]
+    fn read_manifest_returns_none_for_malformed_json() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::User).unwrap();
+        std::fs::write(k.manifest_path(), "{ this is not json").unwrap();
+        assert!(k.read_manifest().is_none());
+    }
+
+    #[test]
+    fn read_manifest_round_trips_required_fields() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::User).unwrap();
+        let mut required = std::collections::BTreeMap::new();
+        required.insert("global".into(), vec!["category".into(), "tags".into()]);
+        required.insert("research".into(), vec!["sources".into()]);
+        let m = KmsManifest {
+            schema_version: "1.0".into(),
+            frontmatter_required: required,
+        };
+        std::fs::write(k.manifest_path(), serde_json::to_string_pretty(&m).unwrap()).unwrap();
+        let read = k.read_manifest().unwrap();
+        assert_eq!(read.schema_version, "1.0");
+        assert_eq!(
+            read.frontmatter_required.get("global").unwrap(),
+            &vec!["category".to_string(), "tags".to_string()]
+        );
+        assert_eq!(
+            read.frontmatter_required.get("research").unwrap(),
+            &vec!["sources".to_string()]
+        );
+    }
+
+    #[test]
+    fn lint_skips_required_check_when_manifest_has_empty_map() {
+        // The starter manifest is present but enforcement is empty — must
+        // behave identically to legacy KMSes for required-field reporting.
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        std::fs::write(k.pages_dir().join("a.md"), "---\ncategory: x\n---\nbody\n").unwrap();
+        let report = lint(&k).unwrap();
+        assert!(report.missing_required_fields.is_empty());
+    }
+
+    #[test]
+    fn lint_skips_required_check_when_manifest_absent() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        std::fs::remove_file(k.manifest_path()).unwrap();
+        std::fs::write(k.pages_dir().join("a.md"), "---\ncategory: x\n---\nbody\n").unwrap();
+        let report = lint(&k).unwrap();
+        assert!(report.missing_required_fields.is_empty());
+    }
+
+    #[test]
+    fn lint_finds_missing_global_required_fields() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        let mut required = std::collections::BTreeMap::new();
+        required.insert("global".into(), vec!["category".into(), "tags".into()]);
+        let m = KmsManifest {
+            schema_version: "1.0".into(),
+            frontmatter_required: required,
+        };
+        std::fs::write(k.manifest_path(), serde_json::to_string_pretty(&m).unwrap()).unwrap();
+        std::fs::write(k.pages_dir().join("a.md"), "---\ncategory: x\n---\nbody\n").unwrap();
+        let report = lint(&k).unwrap();
+        assert!(
+            report
+                .missing_required_fields
+                .iter()
+                .any(|(p, src, f)| p == "a" && src == "global" && f == "tags"),
+            "expected missing 'tags' on page 'a': {:?}",
+            report.missing_required_fields
+        );
+        // 'category' is present on the page so must NOT appear.
+        assert!(!report
+            .missing_required_fields
+            .iter()
+            .any(|(_, _, f)| f == "category"));
+    }
+
+    #[test]
+    fn lint_finds_missing_per_category_required_fields() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        let mut required = std::collections::BTreeMap::new();
+        required.insert("research".into(), vec!["sources".into()]);
+        let m = KmsManifest {
+            schema_version: "1.0".into(),
+            frontmatter_required: required,
+        };
+        std::fs::write(k.manifest_path(), serde_json::to_string_pretty(&m).unwrap()).unwrap();
+        // Research page without `sources:` → flagged.
+        std::fs::write(
+            k.pages_dir().join("paper.md"),
+            "---\ncategory: research\n---\nbody\n",
+        )
+        .unwrap();
+        // Non-research page without `sources:` → NOT flagged (rule is
+        // category-scoped, not global).
+        std::fs::write(
+            k.pages_dir().join("note.md"),
+            "---\ncategory: misc\n---\nbody\n",
+        )
+        .unwrap();
+        let report = lint(&k).unwrap();
+        assert!(
+            report
+                .missing_required_fields
+                .iter()
+                .any(|(p, src, f)| p == "paper" && src == "research" && f == "sources"),
+            "expected research/sources flag on 'paper': {:?}",
+            report.missing_required_fields
+        );
+        assert!(!report
+            .missing_required_fields
+            .iter()
+            .any(|(p, _, _)| p == "note"));
+    }
+
+    #[test]
+    fn lint_skips_required_check_for_pages_with_no_frontmatter() {
+        // A page with no `---` block is already flagged via
+        // `missing_frontmatter`. Don't double-report by also emitting
+        // every required field as missing — the user fixes the
+        // frontmatter once and both classes resolve.
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        let mut required = std::collections::BTreeMap::new();
+        required.insert("global".into(), vec!["category".into()]);
+        let m = KmsManifest {
+            schema_version: "1.0".into(),
+            frontmatter_required: required,
+        };
+        std::fs::write(k.manifest_path(), serde_json::to_string_pretty(&m).unwrap()).unwrap();
+        std::fs::write(k.pages_dir().join("bare.md"), "no frontmatter\n").unwrap();
+        let report = lint(&k).unwrap();
+        assert!(report.missing_frontmatter.contains(&"bare".to_string()));
+        assert!(report.missing_required_fields.is_empty());
+    }
+
+    #[test]
+    fn scan_stale_markers_finds_cascade_output() {
+        // End-to-end: ingest a source, write a derived page that references
+        // it, re-ingest with --force to trigger the cascade, then verify
+        // scan_stale_markers picks up exactly what mark_dependent_pages_stale
+        // wrote. Locks the producer/consumer marker contract.
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("topic.md");
+        std::fs::write(&src, "v1").unwrap();
+        ingest(&k, &src, Some("topic"), false).unwrap();
+        write_page(
+            &k,
+            "summary",
+            "---\ncategory: synthesis\nsources: topic\n---\n# Summary\n",
+        )
+        .unwrap();
+        std::fs::write(&src, "v2").unwrap();
+        ingest(&k, &src, Some("topic"), true).unwrap();
+
+        let stale = scan_stale_markers(&k).unwrap();
+        assert_eq!(stale.len(), 1, "expected 1 stale marker: {stale:?}");
+        assert_eq!(stale[0].page_stem, "summary");
+        assert_eq!(stale[0].source_alias, "topic");
+        assert!(!stale[0].date.is_empty(), "date must be captured");
+    }
+
+    #[test]
+    fn scan_stale_markers_returns_empty_when_no_markers() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        std::fs::write(
+            k.pages_dir().join("clean.md"),
+            "---\ncategory: x\n---\nNo markers here.\n",
+        )
+        .unwrap();
+        assert!(scan_stale_markers(&k).unwrap().is_empty());
+    }
+
+    #[test]
+    fn scan_stale_markers_collects_multiple_per_page() {
+        // A page that has been left stale across two re-ingest waves
+        // should surface both markers — refresh debt accumulates.
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        std::fs::write(
+            k.pages_dir().join("debt.md"),
+            "---\ncategory: synthesis\n---\nbody\n\n\
+             > ⚠ STALE: source `alpha` was re-ingested on 2026-01-01. Refresh this page.\n\
+             > ⚠ STALE: source `beta` was re-ingested on 2026-02-15. Refresh this page.\n",
+        )
+        .unwrap();
+        let stale = scan_stale_markers(&k).unwrap();
+        assert_eq!(stale.len(), 2);
+        // Sorted by (stem, alias, date) — alpha before beta.
+        assert_eq!(stale[0].source_alias, "alpha");
+        assert_eq!(stale[0].date, "2026-01-01");
+        assert_eq!(stale[1].source_alias, "beta");
+        assert_eq!(stale[1].date, "2026-02-15");
+    }
+
+    // ─── schema migrations ────────────────────────────────────────────────
+
+    #[test]
+    fn detect_schema_version_returns_legacy_when_manifest_absent() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        std::fs::remove_file(k.manifest_path()).unwrap();
+        assert_eq!(detect_schema_version(&k), LEGACY_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn detect_schema_version_returns_legacy_when_version_field_empty() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        // Manifest exists but schema_version is empty — same legacy treatment.
+        std::fs::write(
+            k.manifest_path(),
+            r#"{"schema_version": "", "frontmatter_required": {}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_schema_version(&k), LEGACY_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn detect_schema_version_reads_explicit_version() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        // Default seed is "1.0".
+        assert_eq!(detect_schema_version(&k), "1.0");
+    }
+
+    #[test]
+    fn migrate_is_noop_when_already_at_latest() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        let report = migrate(&k, false).unwrap();
+        assert_eq!(report.current_version, "1.0");
+        assert_eq!(report.target_version, "1.0");
+        assert!(report.steps.is_empty());
+    }
+
+    #[test]
+    fn migrate_dry_run_writes_no_files_for_legacy_kms() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        std::fs::remove_file(k.manifest_path()).unwrap();
+        let log_before = std::fs::read_to_string(k.log_path()).unwrap();
+
+        let report = migrate(&k, true).unwrap();
+        assert!(report.dry_run);
+        assert_eq!(report.current_version, LEGACY_SCHEMA_VERSION);
+        assert_eq!(report.target_version, "1.0");
+        assert_eq!(report.steps.len(), 1);
+        assert_eq!(report.steps[0].from, LEGACY_SCHEMA_VERSION);
+        assert_eq!(report.steps[0].to, "1.0");
+
+        // No filesystem changes.
+        assert!(!k.manifest_path().exists(), "dry-run wrote manifest");
+        let log_after = std::fs::read_to_string(k.log_path()).unwrap();
+        assert_eq!(log_before, log_after, "dry-run touched log.md");
+    }
+
+    #[test]
+    fn migrate_apply_writes_manifest_for_legacy_kms() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        std::fs::remove_file(k.manifest_path()).unwrap();
+        assert!(!k.manifest_path().exists());
+
+        let report = migrate(&k, false).unwrap();
+        assert!(!report.dry_run);
+        assert_eq!(report.steps.len(), 1);
+
+        // Manifest now exists at v1.0 with empty enforcement.
+        let manifest = k.read_manifest().expect("manifest written");
+        assert_eq!(manifest.schema_version, "1.0");
+        assert!(manifest.frontmatter_required.is_empty());
+
+        // Log entry was appended.
+        let log = std::fs::read_to_string(k.log_path()).unwrap();
+        assert!(
+            log.contains("migrated | 0.x → 1.0"),
+            "log missing migration entry: {log}"
+        );
+
+        // Idempotent: a second migrate is a no-op.
+        let report2 = migrate(&k, false).unwrap();
+        assert!(report2.steps.is_empty());
+        assert_eq!(report2.current_version, "1.0");
+    }
+
+    #[test]
+    fn migrate_preserves_existing_pages() {
+        // Migration must not touch page bodies — only the manifest changes.
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        std::fs::remove_file(k.manifest_path()).unwrap();
+        let page_path = k.pages_dir().join("preserve.md");
+        let original = "---\ncategory: x\n---\nimportant content\n";
+        std::fs::write(&page_path, original).unwrap();
+
+        migrate(&k, false).unwrap();
+
+        let after = std::fs::read_to_string(&page_path).unwrap();
+        assert_eq!(after, original, "page body modified by migration");
+    }
+
+    #[test]
+    fn migrate_errors_on_unknown_schema_version() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        // Plant a manifest with a version that has no migration path.
+        std::fs::write(
+            k.manifest_path(),
+            r#"{"schema_version": "99.0", "frontmatter_required": {}}"#,
+        )
+        .unwrap();
+        let err = migrate(&k, false).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no migration path") && msg.contains("99.0"),
+            "expected unknown-version error: {msg}"
+        );
+    }
+
+    #[test]
+    fn lint_total_issues_includes_missing_required_fields() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::Project).unwrap();
+        let mut required = std::collections::BTreeMap::new();
+        required.insert("global".into(), vec!["tags".into()]);
+        let m = KmsManifest {
+            schema_version: "1.0".into(),
+            frontmatter_required: required,
+        };
+        std::fs::write(k.manifest_path(), serde_json::to_string_pretty(&m).unwrap()).unwrap();
+        // Self-linked pages so we don't trip orphan/broken-link checks.
+        std::fs::write(
+            k.pages_dir().join("a.md"),
+            "---\ncategory: x\n---\nLink to [b](pages/b.md)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            k.pages_dir().join("b.md"),
+            "---\ncategory: x\n---\nLink to [a](pages/a.md)\n",
+        )
+        .unwrap();
+        std::fs::write(k.index_path(), "- [a](pages/a.md)\n- [b](pages/b.md)\n").unwrap();
+        let report = lint(&k).unwrap();
+        // Both pages missing 'tags' → 2 missing-required-field issues.
+        assert_eq!(report.missing_required_fields.len(), 2);
+        assert_eq!(report.total_issues(), 2);
     }
 }

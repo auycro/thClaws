@@ -207,6 +207,14 @@ pub enum ViewEvent {
     /// renders a compact indicator (objective, iterations, tokens
     /// used/budget, status) above the plan sidebar.
     GoalUpdate(Option<crate::goal_state::GoalState>),
+    /// Research jobs sidebar refresh (M6.39.3). Pre-built JSON payload
+    /// shaped like `{type: "research_update", jobs: [{id, status,
+    /// phase, query, iterations_done, source_count, last_score,
+    /// kms_target, result_page, error}, ...]}`. Emitted after every
+    /// phase change inside the pipeline driver, plus on terminal
+    /// transitions, so the sidebar panel reflects live progress
+    /// without polling.
+    ResearchUpdate(String),
     /// Open the GUI's interactive model picker — pre-built JSON payload
     /// shaped like `{type: "model_picker_open", provider, current,
     /// models: [{id, context, max_output}, ...]}`. Emitted by the
@@ -869,6 +877,19 @@ async fn run_worker(
         });
     }
 
+    // M6.39.3: research-jobs sidebar broadcaster. Pipeline driver
+    // calls update_phase / record_iteration / finalize / cancel which
+    // each fire this once with a fresh snapshot of all jobs. Frontend
+    // gets a `research_update` IPC envelope with the JSON shape from
+    // `gui::build_research_update_payload`.
+    {
+        let research_tx = events_tx.clone();
+        crate::research::manager().set_broadcaster(move |_jobs| {
+            let payload = crate::gui::build_research_update_payload();
+            let _ = research_tx.send(ViewEvent::ResearchUpdate(payload.to_string()));
+        });
+    }
+
     if !config.kms_active.is_empty() {
         tools.register(std::sync::Arc::new(crate::tools::KmsReadTool));
         tools.register(std::sync::Arc::new(crate::tools::KmsSearchTool));
@@ -1059,7 +1080,10 @@ async fn run_worker(
         crate::permissions::PermissionMode::Ask
     };
     let plugin_agent_dirs = crate::plugins::plugin_agent_dirs();
-    let agent_defs_state = crate::agent_defs::AgentDefsConfig::load_with_extra(&plugin_agent_dirs);
+    let mut agent_defs_state =
+        crate::agent_defs::AgentDefsConfig::load_with_extra(&plugin_agent_dirs);
+    agent_defs_state.apply_builtin_subagent_overrides(&config);
+    let agent_defs_state = agent_defs_state;
     let factory_state: Arc<dyn crate::subagent::AgentFactory> = {
         let base_tools = tools.clone();
         let factory = Arc::new(crate::subagent::ProductionAgentFactory {
@@ -1100,6 +1124,23 @@ async fn run_worker(
     // gate, M2+) starts on the right value before any EnterPlanMode /
     // sidebar-Approve flip can change it.
     crate::permissions::set_current_mode(agent.permission_mode);
+
+    // Per-skill model overrides from settings.json. Built-in skills
+    // declare a default `model:` in their embedded SKILL.md
+    // frontmatter; users can override per-skill via well-named
+    // settings.json fields (e.g. `extract_save_skill_models`). Each
+    // such field maps to a specific built-in skill name; populate
+    // the generic `skills_state::skill_overrides` map here so
+    // `SkillTool::call` can consult it before falling back to the
+    // frontmatter. Each new built-in skill that needs settings
+    // tunability adds a config field above and one entry here.
+    {
+        let mut overrides = std::collections::HashMap::new();
+        if let Some(spec) = config.extract_save_skill_models.clone() {
+            overrides.insert("extract-and-save".to_string(), spec);
+        }
+        crate::skills_state::set_skill_overrides(overrides);
+    }
 
     // Skill-model resolver. When SkillTool loads a skill whose
     // frontmatter carries `model:`, it calls
@@ -1449,6 +1490,7 @@ async fn run_worker(
                 client,
                 tools: tool_infos,
             } => {
+                let tool_count = tool_infos.len();
                 for info in tool_infos {
                     let tool = crate::mcp::McpTool::new(client.clone(), info);
                     state.tool_registry.register(std::sync::Arc::new(tool));
@@ -1464,6 +1506,13 @@ async fn run_worker(
                     let _ = events_tx.send(ViewEvent::SlashOutput(format!(
                         "[mcp] '{server_name}' connected"
                     )));
+                }
+                // Update sidebar with real tool count now that the server is live.
+                #[cfg(feature = "gui")]
+                {
+                    crate::gui::update_mcp_tool_count(&server_name, tool_count);
+                    let payload = crate::gui::build_mcp_update_payload();
+                    let _ = events_tx.send(ViewEvent::McpUpdate(payload.to_string()));
                 }
             }
             ShellInput::McpFailed { server_name, error } => {
@@ -2021,6 +2070,70 @@ async fn handle_line(
         let rewritten = crate::repl::build_kms_ingest_session_prompt(&name, &page, source, force);
         let _ = events_tx.send(ViewEvent::SlashOutput(format!(
             "(/kms ingest {name} $ → page `{page}` — summarize and KmsWrite)"
+        )));
+        let stream = Box::pin(state.agent.run_turn(rewritten));
+        let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
+        let _ = lead_mb.write_status("lead", "working", None);
+        drive_turn_stream(stream, state, events_tx, cancel, &lead_mb, input_tx).await;
+        return;
+    }
+
+    // `/kms dump <name> <text>` intercept — rewrite into a routing
+    // prompt and run as a normal agent turn so KmsWrite/KmsAppend tools
+    // execute against the live registry.
+    if let Some(crate::repl::SlashCommand::KmsDump { name, text }) =
+        crate::repl::parse_slash(trimmed)
+    {
+        if crate::kms::resolve(&name).is_none() {
+            let _ = events_tx.send(ViewEvent::SlashOutput(format!("no KMS named '{name}'")));
+            let _ = events_tx.send(ViewEvent::TurnDone);
+            return;
+        }
+        // KMS tools register only when kms_active is non-empty. The
+        // dump prompt instructs the agent to use KmsWrite/KmsAppend —
+        // without active KMSes those tools aren't in the registry.
+        if state.config.kms_active.is_empty() {
+            let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+                "/kms dump {name}: no KMS attached to this session. Run `/kms use {name}` first."
+            )));
+            let _ = events_tx.send(ViewEvent::TurnDone);
+            return;
+        }
+        let rewritten = crate::repl::build_kms_dump_prompt(&name, &text);
+        let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+            "(/kms dump {name} → routing {} char(s))",
+            text.len()
+        )));
+        let stream = Box::pin(state.agent.run_turn(rewritten));
+        let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
+        let _ = lead_mb.write_status("lead", "working", None);
+        drive_turn_stream(stream, state, events_tx, cancel, &lead_mb, input_tx).await;
+        return;
+    }
+
+    // `/kms challenge <name> <idea>` intercept — same agent-loop rewrite
+    // path as KmsDump, but read-only (search + analysis, no writes).
+    if let Some(crate::repl::SlashCommand::KmsChallenge { name, idea }) =
+        crate::repl::parse_slash(trimmed)
+    {
+        if crate::kms::resolve(&name).is_none() {
+            let _ = events_tx.send(ViewEvent::SlashOutput(format!("no KMS named '{name}'")));
+            let _ = events_tx.send(ViewEvent::TurnDone);
+            return;
+        }
+        // KMS tools register only when kms_active is non-empty. The
+        // challenge prompt instructs the agent to use KmsSearch/KmsRead.
+        if state.config.kms_active.is_empty() {
+            let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+                "/kms challenge {name}: no KMS attached to this session. Run `/kms use {name}` first."
+            )));
+            let _ = events_tx.send(ViewEvent::TurnDone);
+            return;
+        }
+        let rewritten = crate::repl::build_kms_challenge_prompt(&name, &idea);
+        let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+            "(/kms challenge {name} → red-team {} char(s))",
+            idea.len()
         )));
         let stream = Box::pin(state.agent.run_turn(rewritten));
         let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());

@@ -1341,13 +1341,23 @@ impl Tool for SkillTool {
         // already-installed deps is a no-op + cached.
         append_skill_runtime_hints(&mut result, &skill.dir);
 
-        // If the skill author specified a default model, ask the
-        // worker's resolver to apply it. The resolver writes into
-        // the agent's `model_override` slot so the very next
+        // Resolve the effective model recommendation. settings.json
+        // may carry a per-skill override (e.g.
+        // `extract_save_skill_models: "claude-sonnet-4-6"`) that takes
+        // precedence over the embedded SKILL.md frontmatter `model:`
+        // field — lets users tune the recommended model without
+        // forking the whole skill body. Falls through to the
+        // frontmatter spec when no override is set.
+        let effective_spec =
+            crate::skills_state::skill_override(name).or_else(|| skill.model.clone());
+
+        // If a recommendation exists (from override OR frontmatter),
+        // ask the worker's resolver to apply it. The resolver writes
+        // into the agent's `model_override` slot so the very next
         // provider.stream call uses the recommended model. Append a
         // one-line note to the body so the model knows what
         // happened (and can mention it to the user if relevant).
-        if let Some(spec) = skill.model.as_ref() {
+        if let Some(spec) = effective_spec.as_ref() {
             let outcome = crate::skills_state::request_model(spec);
             let note = match outcome {
                 crate::skills_state::SkillModelOutcome::Switched(picked) => format!(
@@ -1819,6 +1829,51 @@ mod tests {
         };
         assert!(!body.contains("{skill_dir}"));
         assert!(body.contains("<builtin>/synth/scripts/foo.sh"));
+    }
+
+    /// settings.json `extract_save_skill_models` override gets stored
+    /// in skills_state and surfaces via `skill_override(name)` for
+    /// the SkillTool to consult before falling back to the SKILL.md
+    /// frontmatter. Mutex-poisoning recovery is exercised
+    /// transitively — set then read in the same test.
+    #[test]
+    fn skills_state_override_round_trip() {
+        use std::collections::HashMap;
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "extract-and-save".to_string(),
+            SkillModelSpec::Single("claude-sonnet-4-6".to_string()),
+        );
+        crate::skills_state::set_skill_overrides(overrides);
+
+        let got = crate::skills_state::skill_override("extract-and-save");
+        assert_eq!(
+            got,
+            Some(SkillModelSpec::Single("claude-sonnet-4-6".to_string()))
+        );
+
+        // A skill with no override returns None.
+        assert!(crate::skills_state::skill_override("not-configured").is_none());
+
+        // Reset for other tests.
+        crate::skills_state::set_skill_overrides(HashMap::new());
+    }
+
+    /// Priority-list override (array form) round-trips intact.
+    #[test]
+    fn skills_state_override_priority_list_round_trip() {
+        use std::collections::HashMap;
+        let spec =
+            SkillModelSpec::Priority(vec!["claude-sonnet-4-6".to_string(), "gpt-4o".to_string()]);
+        let mut overrides = HashMap::new();
+        overrides.insert("extract-and-save".to_string(), spec.clone());
+        crate::skills_state::set_skill_overrides(overrides);
+
+        assert_eq!(
+            crate::skills_state::skill_override("extract-and-save"),
+            Some(spec)
+        );
+        crate::skills_state::set_skill_overrides(HashMap::new());
     }
 
     // ── dev-plan/06 P1: lazy disk reads ──────────────────────────────

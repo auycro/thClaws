@@ -24,6 +24,7 @@
 //! model can suggest a manual `/model` switch if it wants to.
 
 use crate::skills::SkillModelSpec;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -33,6 +34,34 @@ use std::sync::{Mutex, OnceLock};
 /// note, then clears it. Single-threaded relative to a turn (the
 /// agent loop is sequential), so a plain AtomicBool is enough.
 static SWAP_ACTIVE_THIS_TURN: AtomicBool = AtomicBool::new(false);
+
+/// settings.json overrides keyed by skill name. The worker populates
+/// this at boot (and on `/config` reloads) by mapping per-skill named
+/// fields like `AppConfig::extract_save_skill_models` to their skill
+/// names (`"extract-and-save"`). When a SkillTool resolves a skill
+/// with a `model:` recommendation, the request_model resolver checks
+/// this map first and uses the override spec if present, falling
+/// back to the embedded SKILL.md frontmatter only when nothing was
+/// configured.
+fn skill_overrides() -> &'static Mutex<HashMap<String, SkillModelSpec>> {
+    static M: OnceLock<Mutex<HashMap<String, SkillModelSpec>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Replace the entire skill-override map with the supplied entries.
+/// Called by the worker after loading settings. Recovers from mutex
+/// poisoning so a panic elsewhere can't silently disable overrides.
+pub fn set_skill_overrides(overrides: HashMap<String, SkillModelSpec>) {
+    let mut g = skill_overrides().lock().unwrap_or_else(|p| p.into_inner());
+    *g = overrides;
+}
+
+/// Read the override for a given skill name (returns None if no
+/// settings.json override is configured for it).
+pub fn skill_override(name: &str) -> Option<SkillModelSpec> {
+    let g = skill_overrides().lock().unwrap_or_else(|p| p.into_inner());
+    g.get(name).cloned()
+}
 
 /// Mark that a skill applied a model override this turn. The
 /// resolver in `shared_session` calls this after writing into the
