@@ -260,6 +260,8 @@ pub enum SlashCommand {
         /// (NaN). Converted to `f32` at dispatch time when applying to
         /// `JobConfig`.
         score_threshold_pct: Option<u32>,
+        /// M6.39.6: cap on KMS pages emitted per research run.
+        max_pages: Option<u32>,
         budget_tokens: Option<u64>,
         budget_time_secs: Option<u64>,
     },
@@ -483,6 +485,18 @@ pub enum SlashCommand {
     KmsFileAnswer {
         name: String,
         title: String,
+    },
+    /// `/kms html <name> [<output-dir>]` — agent-loop workflow that
+    /// reads the KMS via tools, designs a component vocabulary, and
+    /// writes a single-file interactive HTML site to the workspace
+    /// (defaults to `./<name>-site/index.html`). The result lives in
+    /// the user's cwd because it's a derived artifact, not part of
+    /// the KMS itself. Same dispatch shape as `/kms dump` /
+    /// `/kms challenge` — the slash is rewritten into a long agent
+    /// prompt via [`build_kms_html_prompt`].
+    KmsHtml {
+        name: String,
+        output_dir: Option<String>,
     },
     /// `/schedule` — list schedules (same as `/schedule list`).
     Schedule,
@@ -850,6 +864,7 @@ fn parse_research_start(args: &str) -> SlashCommand {
     let mut min_iter: Option<u32> = None;
     let mut max_iter: Option<u32> = None;
     let mut score_threshold_pct: Option<u32> = None;
+    let mut max_pages: Option<u32> = None;
     let mut budget_tokens: Option<u64> = None;
     let mut budget_time_secs: Option<u64> = None;
 
@@ -898,6 +913,18 @@ fn parse_research_start(args: &str) -> SlashCommand {
                     break;
                 }
             }
+            "--max-pages" if tokens.len() >= 2 => {
+                if let Ok(v) = tokens[1].parse::<u32>() {
+                    if v >= 1 && v <= 20 {
+                        max_pages = Some(v);
+                        tokens.drain(0..2);
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
             "--budget-tokens" if tokens.len() >= 2 => {
                 if let Ok(v) = tokens[1].parse::<u64>() {
                     budget_tokens = Some(v);
@@ -920,7 +947,7 @@ fn parse_research_start(args: &str) -> SlashCommand {
     let query = tokens.join(" ").trim().to_string();
     if query.is_empty() {
         return SlashCommand::Unknown(
-            "usage: /research [--kms <name>] [--min-iter N] [--max-iter K] [--score-threshold 0.X] [--budget-time SEC] <query>"
+            "usage: /research [--kms <name>] [--min-iter N] [--max-iter K] [--score-threshold 0.X] [--max-pages N] [--budget-time SEC] <query>"
                 .into(),
         );
     }
@@ -929,6 +956,7 @@ fn parse_research_start(args: &str) -> SlashCommand {
         kms_target,
         min_iter,
         max_iter,
+        max_pages,
         score_threshold_pct,
         budget_tokens,
         budget_time_secs,
@@ -1761,6 +1789,20 @@ pub fn build_kms_dump_prompt(kms_name: &str, dump_text: &str) -> String {
     )
 }
 
+/// Compose the agent-facing prompt for `/kms html <name>`. The agent
+/// runs an explore → design components → assemble workflow against
+/// the KMS, using `KmsRead`/`KmsSearch` (and `Read` for sources) to
+/// fetch content itself, then writes the resulting single-file SPA
+/// to `<output_dir>/index.html` in the workspace. Loaded from
+/// `default_prompts/kms_html.md` and post-processed for
+/// `{kms_name}` / `{output_dir}` substitution.
+pub fn build_kms_html_prompt(kms_name: &str, output_dir: &str) -> String {
+    const TEMPLATE: &str = include_str!("default_prompts/kms_html.md");
+    TEMPLATE
+        .replace("{kms_name}", kms_name)
+        .replace("{output_dir}", output_dir)
+}
+
 /// Compose the agent-facing prompt for `/kms challenge <name> <idea>`. The
 /// agent searches the vault for counter-evidence to the user's position
 /// and produces a structured Red Team analysis. Read-only — no writes.
@@ -2261,6 +2303,35 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
                 ),
             }
         }
+        "html" | "site" | "export" => {
+            // `/kms html <name> [<output-dir>]` — order-insensitive
+            // positional parse. First non-flag is the kms name, the
+            // optional second positional is the output directory
+            // (defaults to `./<name>-site` resolved by the caller).
+            let mut name: Option<String> = None;
+            let mut output_dir: Option<String> = None;
+            for tok in rest.split_whitespace() {
+                if tok.starts_with("--") {
+                    return SlashCommand::Unknown(format!(
+                        "unknown flag '{tok}' — usage: /kms html <name> [<output-dir>]"
+                    ));
+                }
+                if name.is_none() {
+                    name = Some(tok.to_string());
+                } else if output_dir.is_none() {
+                    output_dir = Some(tok.to_string());
+                }
+            }
+            match name {
+                Some(n) => SlashCommand::KmsHtml {
+                    name: n,
+                    output_dir,
+                },
+                None => SlashCommand::Unknown(
+                    "usage: /kms html <name> [<output-dir>]".into(),
+                ),
+            }
+        }
         "migrate" | "upgrade" => {
             // `/kms migrate <name> [--apply]` — dry-run by default, --apply
             // to execute. Order-insensitive so `--apply <name>` also works.
@@ -2307,7 +2378,7 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
             }
         }
         other => SlashCommand::Unknown(format!(
-            "unknown kms subcommand: '{other}' (try: /kms, /kms new …, /kms use …, /kms off …, /kms show …, /kms ingest …, /kms dump …, /kms challenge …, /kms lint …, /kms wrap-up …, /kms reconcile …, /kms migrate …, /kms file-answer …)"
+            "unknown kms subcommand: '{other}' (try: /kms, /kms new …, /kms use …, /kms off …, /kms show …, /kms ingest …, /kms dump …, /kms challenge …, /kms html …, /kms lint …, /kms wrap-up …, /kms reconcile …, /kms migrate …, /kms file-answer …)"
         )),
     }
 }
@@ -3011,6 +3082,26 @@ pub fn build_provider(config: &AppConfig) -> Result<Arc<dyn Provider>> {
                 OpenAIProvider::new(api_key)
                     .with_base_url(url)
                     .with_strip_model_prefix("thaillm/"),
+            ))
+        }
+        ProviderKind::Minimax => {
+            // MiniMax (minimax.io) — Chinese AI lab. OpenAI-compatible
+            // endpoint at api.minimax.io/v1 (international). Models use
+            // the `minimax/<id>` form (e.g. `minimax/MiniMax-M2`); the
+            // prefix is stripped before the request reaches the
+            // upstream. Override via MINIMAX_BASE_URL for the China
+            // endpoint (api.minimax.chat) or self-hosted proxies.
+            let base = std::env::var("MINIMAX_BASE_URL")
+                .unwrap_or_else(|_| "https://api.minimax.io/v1".to_string());
+            let url = if base.ends_with("/chat/completions") {
+                base
+            } else {
+                format!("{}/chat/completions", base.trim_end_matches('/'))
+            };
+            Ok(Arc::new(
+                OpenAIProvider::new(api_key)
+                    .with_base_url(url)
+                    .with_strip_model_prefix("minimax/"),
             ))
         }
         ProviderKind::Nvidia => {
@@ -4517,6 +4608,38 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         text.len()
                     );
                     line = build_kms_dump_prompt(&name, &text);
+                }
+            }
+
+            // `/kms html <name> [<output-dir>]` — same agent-loop
+            // rewrite. The agent reads the KMS via tools, designs a
+            // component vocabulary, and writes the result to the
+            // workspace via the Write tool. Default output dir is
+            // `./<name>-site`.
+            if let Some(SlashCommand::KmsHtml { name, output_dir }) = parse_slash(&line) {
+                if crate::kms::resolve(&name).is_none() {
+                    // falls through to dispatch arm
+                } else if config.kms_active.is_empty() {
+                    println!(
+                        "{COLOR_YELLOW}/kms html {name}: no KMS attached to this session. \
+                         Run `/kms use {name}` first.{COLOR_RESET}"
+                    );
+                    continue;
+                } else {
+                    let cwd =
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let outdir_pb = match output_dir.as_deref() {
+                        Some(p) if std::path::Path::new(p).is_absolute() => {
+                            std::path::PathBuf::from(p)
+                        }
+                        Some(p) => cwd.join(p),
+                        None => cwd.join(format!("{name}-site")),
+                    };
+                    let outdir_str = outdir_pb.to_string_lossy().to_string();
+                    println!(
+                        "{COLOR_DIM}(/kms html {name} → workspace site at {outdir_str}){COLOR_RESET}"
+                    );
+                    line = build_kms_html_prompt(&name, &outdir_str);
                 }
             }
 
@@ -6951,6 +7074,15 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         );
                     }
                 }
+                SlashCommand::KmsHtml { .. } => {
+                    // Handled via the line-rewrite path in the input
+                    // pre-processor (search this file for
+                    // `build_kms_html_prompt`). This arm only fires
+                    // when the KMS doesn't resolve — by then the
+                    // pre-processor will already have printed the
+                    // error and `continue`d, so reaching here is a
+                    // no-op safety net.
+                }
                 SlashCommand::KmsMigrate { name, apply } => {
                     let Some(k) = crate::kms::resolve(&name) else {
                         println!("{COLOR_YELLOW}no KMS named '{name}'{COLOR_RESET}");
@@ -7144,6 +7276,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     min_iter,
                     max_iter,
                     score_threshold_pct,
+                    max_pages,
                     budget_tokens: _,
                     budget_time_secs,
                 } => {
@@ -7157,6 +7290,9 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     }
                     if let Some(pct) = score_threshold_pct {
                         cfg.score_threshold = (pct as f32 / 100.0).clamp(0.0, 1.0);
+                    }
+                    if let Some(v) = max_pages {
+                        cfg.max_pages = v;
                     }
                     if let Some(secs) = budget_time_secs {
                         cfg.time_budget = std::time::Duration::from_secs(secs);
@@ -8220,6 +8356,7 @@ mod tests {
                 min_iter: None,
                 max_iter: None,
                 score_threshold_pct: None,
+                max_pages: None,
                 budget_tokens: None,
                 budget_time_secs: None,
             })
@@ -8234,6 +8371,7 @@ mod tests {
                 min_iter: None,
                 max_iter: None,
                 score_threshold_pct: None,
+                max_pages: None,
                 budget_tokens: None,
                 budget_time_secs: None,
             })
@@ -8250,6 +8388,7 @@ mod tests {
                 min_iter: Some(3),
                 max_iter: Some(10),
                 score_threshold_pct: Some(85),
+                max_pages: None,
                 budget_tokens: None,
                 budget_time_secs: None,
             })
@@ -8264,6 +8403,7 @@ mod tests {
                 min_iter: None,
                 max_iter: None,
                 score_threshold_pct: Some(75),
+                max_pages: None,
                 budget_tokens: None,
                 budget_time_secs: None,
             })
@@ -8278,6 +8418,7 @@ mod tests {
                 min_iter: None,
                 max_iter: None,
                 score_threshold_pct: None,
+                max_pages: None,
                 budget_tokens: None,
                 budget_time_secs: Some(300),
             })
@@ -8893,6 +9034,42 @@ mod tests {
     }
 
     // ─── /kms reconcile ───────────────────────────────────────────────────
+
+    #[test]
+    fn parse_slash_kms_html_basic() {
+        match parse_slash("/kms html llm-wiki") {
+            Some(SlashCommand::KmsHtml { name, output_dir }) => {
+                assert_eq!(name, "llm-wiki");
+                assert!(output_dir.is_none());
+            }
+            other => panic!("expected KmsHtml, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_slash_kms_html_with_output_dir() {
+        match parse_slash("/kms html llm-wiki ./out") {
+            Some(SlashCommand::KmsHtml { name, output_dir }) => {
+                assert_eq!(name, "llm-wiki");
+                assert_eq!(output_dir, Some("./out".into()));
+            }
+            other => panic!("expected KmsHtml with output_dir, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_kms_html_prompt_substitutes_placeholders() {
+        let p = build_kms_html_prompt("llm-wiki", "/Users/x/site");
+        assert!(p.contains("llm-wiki"));
+        assert!(p.contains("/Users/x/site"));
+        assert!(!p.contains("{kms_name}"));
+        assert!(!p.contains("{output_dir}"));
+        // Workflow phase markers must be present so the prompt
+        // actually drives the explore-design-assemble flow.
+        assert!(p.contains("Phase 1: Explore"));
+        assert!(p.contains("Phase 2: Design"));
+        assert!(p.contains("Phase 3:"));
+    }
 
     #[test]
     fn parse_slash_kms_reconcile_basic() {

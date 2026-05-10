@@ -38,6 +38,7 @@ const OLLAMA_CLOUD_URL: &str = "https://ollama.com/v1/models";
 const DEEPSEEK_URL: &str = "https://api.deepseek.com/v1/models";
 const THAILLM_URL: &str = "http://thaillm.or.th/api/v1/models";
 const NVIDIA_URL: &str = "https://integrate.api.nvidia.com/v1/models";
+const MINIMAX_URL: &str = "https://api.minimax.io/v1/models";
 const DEFAULT_TARGET: &str = "crates/core/resources/model_catalogue.json";
 
 // ── Wire types ──────────────────────────────────────────────────────
@@ -381,6 +382,42 @@ async fn run() -> Result<String, String> {
         }
     } else {
         report.push("  nvidia:      skipped (no NVIDIA_API_KEY)".into());
+    }
+
+    // 4e. MiniMax — international api.minimax.io OpenAI-compat
+    //     `/v1/models`. Returns bare model ids (e.g. `MiniMax-M2`,
+    //     `MiniMax-M1`). Each id is namespaced with the `minimax/`
+    //     prefix so ProviderKind::detect routes correctly. Default
+    //     context seeded at 200K (M2's published window); specific
+    //     rows can be hand-bumped. China-platform users on
+    //     api.minimax.chat (different auth) need a separate run with
+    //     MINIMAX_BASE_URL pointed there.
+    if let Ok(key) = std::env::var("MINIMAX_API_KEY") {
+        match fetch_minimax(&key).await {
+            Ok(ids) => {
+                let prefixed: Vec<String> =
+                    ids.into_iter().map(|id| format!("minimax/{id}")).collect();
+                let pc = cat
+                    .providers
+                    .entry("minimax".into())
+                    .or_insert_with(ProviderCatalogue::default);
+                if pc.default_context.is_none() {
+                    pc.default_context = Some(200000);
+                }
+                let added = merge_discovered(
+                    &mut cat,
+                    "minimax",
+                    MINIMAX_URL,
+                    prefixed,
+                    &openrouter_ctx_by_bare,
+                    &today,
+                );
+                push_provider_stats(&mut report, "minimax", &added, None);
+            }
+            Err(e) => report.push(format!("  minimax:     FAILED ({e})")),
+        }
+    } else {
+        report.push("  minimax:     skipped (no MINIMAX_API_KEY)".into());
     }
 
     // 5. Derive agent-sdk rows from anthropic. The Claude CLI subprocess
@@ -742,6 +779,37 @@ async fn fetch_nvidia(key: &str) -> Result<Vec<String>, String> {
     }
     let env: OpenAIEnvelope = resp.json().await.map_err(|e| format!("json: {e}"))?;
     Ok(env.data.into_iter().map(|m| m.id).collect())
+}
+
+/// Fetch the MiniMax model list. The international endpoint at
+/// api.minimax.io advertises an OpenAI-compatible /v1/models route
+/// but actually responds with `{"object":"","data":null}` (no model
+/// enumeration exposed). We tolerate that by treating null/empty as
+/// "no rows discovered" — hand-curated catalogue entries (M2 / M1 /
+/// abab7-chat-preview) carry the metadata. If MiniMax later starts
+/// returning real rows the same call will pick them up.
+async fn fetch_minimax(key: &str) -> Result<Vec<String>, String> {
+    #[derive(serde::Deserialize)]
+    struct MinimaxEnvelope {
+        #[serde(default)]
+        data: Option<Vec<OpenAIModel>>,
+    }
+    let resp = client()?
+        .get(MINIMAX_URL)
+        .bearer_auth(key)
+        .send()
+        .await
+        .map_err(|e| format!("GET {MINIMAX_URL}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("minimax HTTP {}", resp.status()));
+    }
+    let env: MinimaxEnvelope = resp.json().await.map_err(|e| format!("json: {e}"))?;
+    Ok(env
+        .data
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| m.id)
+        .collect())
 }
 
 /// Fetch the cloud catalog from Ollama Cloud's OpenAI-compatible

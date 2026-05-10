@@ -94,6 +94,12 @@ pub struct JobConfig {
     pub subtopics_per_iter: u32,
     /// Top-N pages per subtopic to read in detail (WebFetch). Default 3.
     pub fetch_top_n: u32,
+    /// M6.39.6: cap on KMS pages emitted per research run. Plan step
+    /// asks the LLM to group sources into ≤ this many pages. Default
+    /// 7 — enough granularity for entity / concept / comparison
+    /// pages without exploding LLM cost (each page is one LLM call).
+    /// Override via `/research --max-pages N`.
+    pub max_pages: u32,
     /// Per-LLM-call timeout. Default 120s.
     pub llm_timeout: Duration,
     /// Total wall-clock budget. Pipeline aborts as `Failed` with a
@@ -112,6 +118,7 @@ impl Default for JobConfig {
             score_threshold: 0.75,
             subtopics_per_iter: 4,
             fetch_top_n: 3,
+            max_pages: 7,
             llm_timeout: Duration::from_secs(120),
             time_budget: Duration::from_secs(15 * 60),
             kms_target: None,
@@ -534,5 +541,6 @@ mod tests {
         assert!((c.score_threshold - 0.75).abs() < f32::EPSILON);
         assert_eq!(c.subtopics_per_iter, 4);
         assert_eq!(c.fetch_top_n, 3);
+        assert_eq!(c.max_pages, 7);
     }
 }

@@ -147,34 +147,47 @@ impl Catalogue {
     /// form is catalogued — callers apply provider-default / global
     /// fallback themselves.
     pub fn lookup_context(&self, model: &str) -> Option<u32> {
+        self.lookup_field(model, |e| e.context)
+    }
+
+    /// Same matching rules as `lookup_context` but returns the
+    /// model's documented max-output-tokens limit (per-row
+    /// `maxOutput`), used to cap `max_tokens` on completion calls.
+    /// `None` if the row exists but has no `maxOutput`, OR if no row
+    /// matches at all — caller picks a safe default.
+    pub fn lookup_max_output(&self, model: &str) -> Option<u32> {
+        self.lookup_field(model, |e| e.max_output)
+    }
+
+    fn lookup_field(
+        &self,
+        model: &str,
+        get: impl Fn(&ModelEntry) -> Option<u32> + Copy,
+    ) -> Option<u32> {
         let canonical = self.resolve_alias(model);
-        if let Some(n) = self.lookup_in_any_provider(canonical) {
+        if let Some(n) = self.lookup_field_in_any_provider(canonical, get) {
             return Some(n);
         }
-        // Strip leading `vendor/` segments (e.g. `agent/claude-...`,
-        // `openrouter/anthropic/claude-...`) and retry.
         let mut remaining = canonical;
         while let Some(idx) = remaining.find('/') {
             remaining = &remaining[idx + 1..];
-            if let Some(n) = self.lookup_in_any_provider(remaining) {
+            if let Some(n) = self.lookup_field_in_any_provider(remaining, get) {
                 return Some(n);
             }
         }
         None
     }
 
-    fn lookup_in_any_provider(&self, id: &str) -> Option<u32> {
-        // Prefer the provider the id's routing prefix indicates; fall
-        // back to scanning every provider's map for the id as a
-        // safety net (cheap — total catalogue is a few hundred rows).
-        // A matched entry with `context: None` is treated the same as
-        // a missing entry — the caller falls through to the provider
-        // default.
+    fn lookup_field_in_any_provider(
+        &self,
+        id: &str,
+        get: impl Fn(&ModelEntry) -> Option<u32> + Copy,
+    ) -> Option<u32> {
         let kind_name = crate::providers::ProviderKind::detect(id).map(provider_kind_name);
         if let Some(name) = kind_name {
             if let Some(pc) = self.providers.get(name) {
                 if let Some(e) = pc.models.get(id) {
-                    if let Some(n) = e.context {
+                    if let Some(n) = get(e) {
                         return Some(n);
                     }
                 }
@@ -182,7 +195,7 @@ impl Catalogue {
         }
         for pc in self.providers.values() {
             if let Some(e) = pc.models.get(id) {
-                if let Some(n) = e.context {
+                if let Some(n) = get(e) {
                     return Some(n);
                 }
             }
@@ -343,6 +356,66 @@ impl EffectiveCatalogue {
             .or_else(|| self.baseline.provider_default(provider))
     }
 
+    /// Two-tier exact lookup for `max_output`. Mirrors `lookup_exact`
+    /// for the context window. Used to cap `max_tokens` on
+    /// completion calls so we don't blow past the model's documented
+    /// limit (e.g. gpt-4.1 = 32768).
+    pub fn lookup_max_output_exact(&self, model: &str) -> Option<u32> {
+        if let Some(c) = &self.cache {
+            if let Some(n) = c.lookup_max_output(model) {
+                return Some(n);
+            }
+        }
+        self.baseline.lookup_max_output(model)
+    }
+
+    /// Override-layer max_output lookup. Same matching rules as
+    /// `lookup_override` but reads `maxOutput` instead of `context`
+    /// from each candidate override entry.
+    pub fn lookup_max_output_override(&self, model: &str) -> Option<u32> {
+        if self.overrides.is_empty() {
+            return None;
+        }
+        let kind_name = crate::providers::ProviderKind::detect(model).map(provider_kind_name);
+        let mut candidates: Vec<String> = vec![model.to_string()];
+        if let Some(c) = &self.cache {
+            let resolved = c.resolve_alias(model);
+            if resolved != model && !candidates.iter().any(|s| s == resolved) {
+                candidates.push(resolved.to_string());
+            }
+        }
+        let resolved = self.baseline.resolve_alias(model);
+        if resolved != model && !candidates.iter().any(|s| s == resolved) {
+            candidates.push(resolved.to_string());
+        }
+        let mut all: Vec<String> = Vec::new();
+        for c in &candidates {
+            all.push(c.clone());
+            let mut rem = c.as_str();
+            while let Some(idx) = rem.find('/') {
+                rem = &rem[idx + 1..];
+                if !all.iter().any(|s| s == rem) {
+                    all.push(rem.to_string());
+                }
+            }
+        }
+        for id in &all {
+            if let Some(name) = kind_name {
+                if let Some(e) = self.overrides.get(&format!("{name}/{id}")) {
+                    if let Some(n) = e.max_output {
+                        return Some(n);
+                    }
+                }
+            }
+            if let Some(e) = self.overrides.get(id) {
+                if let Some(n) = e.max_output {
+                    return Some(n);
+                }
+            }
+        }
+        None
+    }
+
     /// Merged model listing for one provider — baseline rows plus user-cache
     /// rows, with cache winning on metadata when the same id appears in both.
     /// Override rows for the same provider are folded in last (override wins
@@ -415,6 +488,17 @@ impl EffectiveCatalogue {
 /// nudge the user.
 pub fn effective_context_window(model: &str) -> u32 {
     effective_context_window_with(&EffectiveCatalogue::load(), model).0
+}
+
+/// Look up the effective `max_output` (max completion tokens) for a
+/// model: override > catalogue > `None`. Callers cap their requested
+/// `max_tokens` against this so we don't hit per-model 400 errors
+/// (e.g. gpt-4.1 = 32768). `None` means no documented limit was
+/// found — caller picks a safe default.
+pub fn effective_max_output(model: &str) -> Option<u32> {
+    let cat = EffectiveCatalogue::load();
+    cat.lookup_max_output_override(model)
+        .or_else(|| cat.lookup_max_output_exact(model))
 }
 
 pub fn effective_context_window_with(
@@ -593,6 +677,7 @@ pub fn provider_kind_name(k: crate::providers::ProviderKind) -> &'static str {
         ProviderKind::DeepSeek => "deepseek",
         ProviderKind::ThaiLLM => "thaillm",
         ProviderKind::Nvidia => "nvidia",
+        ProviderKind::Minimax => "minimax",
     }
 }
 

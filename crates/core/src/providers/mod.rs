@@ -41,6 +41,7 @@ pub enum ProviderKind {
     DeepSeek,
     ThaiLLM,
     Nvidia,
+    Minimax,
 }
 
 impl ProviderKind {
@@ -63,6 +64,7 @@ impl ProviderKind {
         Self::DeepSeek,
         Self::ThaiLLM,
         Self::Nvidia,
+        Self::Minimax,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -85,6 +87,7 @@ impl ProviderKind {
             Self::DeepSeek => "deepseek",
             Self::ThaiLLM => "thaillm",
             Self::Nvidia => "nvidia",
+            Self::Minimax => "minimax",
         }
     }
 
@@ -142,6 +145,12 @@ impl ProviderKind {
             // that yields a doubled prefix (`nvidia/nvidia/<name>`), the outer one stripped
             // by build_provider before the request. Override via NVIDIA_BASE_URL for on-prem.
             Self::Nvidia => "nvidia/nvidia/nemotron-3-super-120b-a12b",
+            // MiniMax (minimaxi.com) — Chinese AI lab, OpenAI-compatible
+            // endpoint at api.minimaxi.com/v1. MiniMax-M2 is the latest
+            // flagship reasoning model (open-weights, hosted via the same
+            // API). Models use the `minimax/<id>` prefix; the prefix is
+            // stripped before the request reaches the upstream.
+            Self::Minimax => "minimax/MiniMax-M2",
         }
     }
 
@@ -162,6 +171,7 @@ impl ProviderKind {
             Self::DeepSeek => Some("DEEPSEEK_BASE_URL"),
             Self::ThaiLLM => Some("THAILLM_BASE_URL"),
             Self::Nvidia => Some("NVIDIA_BASE_URL"),
+            Self::Minimax => Some("MINIMAX_BASE_URL"),
             _ => None,
         }
     }
@@ -207,6 +217,15 @@ impl ProviderKind {
             Self::DeepSeek => Some("https://api.deepseek.com/v1"),
             Self::ThaiLLM => Some("http://thaillm.or.th/api/v1"),
             Self::Nvidia => Some("https://integrate.api.nvidia.com/v1"),
+            // MiniMax international endpoint (api.minimax.io). The China
+            // endpoint at api.minimax.chat uses a different auth scheme
+            // (GroupId query param) and is NOT a drop-in OpenAI-compat
+            // target — power users on the China platform must override
+            // via MINIMAX_BASE_URL and accept that some calls may fail.
+            // The legacy api.minimaxi.com URL was rejected by some
+            // tenants with "invalid api key (2049)" — .io is the
+            // current public OpenAI-compatible URL.
+            Self::Minimax => Some("https://api.minimax.io/v1"),
             _ => None,
         }
     }
@@ -248,6 +267,7 @@ impl ProviderKind {
             Self::DeepSeek => Some("DEEPSEEK_API_KEY"),
             Self::ThaiLLM => Some("THAILLM_API_KEY"),
             Self::Nvidia => Some("NVIDIA_API_KEY"),
+            Self::Minimax => Some("MINIMAX_API_KEY"),
         }
     }
 
@@ -346,7 +366,8 @@ impl ProviderKind {
             | Self::AzureAIFoundry
             | Self::OpenAICompat
             | Self::DeepSeek
-            | Self::Nvidia => None,
+            | Self::Nvidia
+            | Self::Minimax => None,
         }
     }
 
@@ -398,6 +419,11 @@ impl ProviderKind {
             // The "zai/" prefix is stripped before forwarding to the
             // OpenAI-compatible upstream.
             Some(Self::ZAi)
+        } else if model.starts_with("minimax/") {
+            // MiniMax (minimaxi.com). Models look like
+            // minimax/MiniMax-M2. The prefix is stripped before
+            // reaching the OpenAI-compatible upstream.
+            Some(Self::Minimax)
         } else if model.starts_with("oai/") {
             // Generic OpenAI-compatible endpoint (SML Gateway, LiteLLM,
             // Portkey, vLLM, internal proxies, etc.). The "oai/" prefix
@@ -752,6 +778,7 @@ pub fn auto_fallback_model(cfg: &crate::config::AppConfig) -> Option<String> {
         ProviderKind::ZAi,
         ProviderKind::DeepSeek,
         ProviderKind::ThaiLLM,
+        ProviderKind::Minimax,
     ];
     for kind in ORDER {
         if kind_has_credentials(Some(*kind)) {
@@ -970,6 +997,25 @@ mod tests {
         assert!(
             ProviderKind::resolve_alias_for_provider("sonnet", ProviderKind::ThaiLLM).is_none()
         );
+    }
+
+    #[test]
+    fn detect_minimax_prefix_routes_to_minimax_provider() {
+        assert_eq!(
+            ProviderKind::detect("minimax/MiniMax-M2"),
+            Some(ProviderKind::Minimax)
+        );
+        assert_eq!(
+            ProviderKind::detect("minimax/MiniMax-M1"),
+            Some(ProviderKind::Minimax)
+        );
+        assert_eq!(ProviderKind::Minimax.api_key_env(), Some("MINIMAX_API_KEY"));
+        assert_eq!(
+            ProviderKind::Minimax.default_endpoint(),
+            Some("https://api.minimax.io/v1")
+        );
+        assert_eq!(ProviderKind::Minimax.name(), "minimax");
+        assert_eq!(ProviderKind::Minimax.default_model(), "minimax/MiniMax-M2");
     }
 
     #[test]

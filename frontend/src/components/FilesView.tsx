@@ -5,18 +5,29 @@ import { useTheme } from "../hooks/useTheme";
 import { MarkdownEditor } from "./MarkdownEditor";
 import { CodeEditor } from "./CodeEditor";
 
-// Round-trip a native-OS confirm dialog through the Rust backend so we
-// get a real modal on macOS / Linux / Windows instead of relying on
-// `window.confirm` (which wry WebViews don't implement consistently).
-// The backend shows the dialog on its IPC worker thread and replies
-// with a `confirm_result` message keyed by `id`.
-function confirmNative(opts: {
+// Confirmation dialog with two backends.
+//
+// Desktop (`wry` WebView in `--gui`): the IPC bridge (`window.ipc`)
+// is present, so round-trip through the Rust backend to get a real
+// native modal on macOS / Linux / Windows. The backend shows the
+// dialog on its IPC worker thread and replies with a
+// `confirm_result` message keyed by `id`.
+//
+// `--serve` (web browser): no `window.ipc`, so the IPC round-trip
+// would never resolve. Fall back to the browser's built-in
+// `window.confirm()`.
+function platformConfirm(opts: {
   title: string;
   message: string;
   yesLabel?: string;
   noLabel?: string;
 }): Promise<boolean> {
   return new Promise((resolve) => {
+    const inBrowser = typeof window !== "undefined" && !window.ipc;
+    if (inBrowser) {
+      resolve(window.confirm(`${opts.title}\n\n${opts.message}`));
+      return;
+    }
     const id =
       typeof crypto !== "undefined" && "randomUUID" in crypto
         ? crypto.randomUUID()
@@ -259,7 +270,7 @@ export function FilesView({ active }: Props) {
   const onSidebarClick = async (name: string) => {
     const path = currentPath === "." ? name : `${currentPath}/${name}`;
     if (mode === "edit" && editorDirty) {
-      const ok = await confirmNative({
+      const ok = await platformConfirm({
         title: "Unsaved changes",
         message: `You have unsaved edits to ${preview?.path ?? "this file"}. Discard them and open the new file?`,
         yesLabel: "Discard",
@@ -273,7 +284,7 @@ export function FilesView({ active }: Props) {
 
   const closePreview = async () => {
     if (mode === "edit" && editorDirty) {
-      const ok = await confirmNative({
+      const ok = await platformConfirm({
         title: "Discard unsaved changes",
         message: `Discard unsaved edits to ${preview?.path ?? "this file"} and close?`,
         yesLabel: "Discard",
@@ -325,7 +336,7 @@ export function FilesView({ active }: Props) {
     // user can abort a misclick. When the editor is already clean
     // ("Preview" button label), skip the prompt and go straight back.
     if (editorDirty) {
-      const ok = await confirmNative({
+      const ok = await platformConfirm({
         title: "Discard unsaved changes",
         message: `Discard unsaved edits to ${preview?.path ?? "this file"} and return to preview?`,
         yesLabel: "Discard",

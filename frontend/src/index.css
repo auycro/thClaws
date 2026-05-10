@@ -181,3 +181,179 @@ html, body, #root {
 :root[data-theme="light"] .markdown-body .hljs-title.class_ { color: #4078f2; }
 :root[data-theme="light"] .markdown-body .hljs-variable,
 :root[data-theme="light"] .markdown-body .hljs-params { color: #c0392b; }
+
+/* KMS viewer prose — tuned for full-document reading (M6.39.9).
+   Distinct from .markdown-body which is sized for chat bubbles.
+   Larger headings with bottom borders (Obsidian / GitHub style),
+   more breathing room between blocks, accent-tinted blockquotes,
+   bordered/striped tables, and dotted-underline wikilinks so
+   internal-vs-external navigation is visible at a glance. */
+.kms-viewer-prose {
+  font-size: 14.5px;
+  line-height: 1.7;
+}
+.kms-viewer-prose > div > div > :first-child { margin-top: 0; }
+.kms-viewer-prose > div > div > :last-child  { margin-bottom: 0; }
+
+.kms-viewer-prose h1,
+.kms-viewer-prose h2,
+.kms-viewer-prose h3,
+.kms-viewer-prose h4,
+.kms-viewer-prose h5,
+.kms-viewer-prose h6 {
+  margin: 1.6em 0 0.6em;
+  line-height: 1.3;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.kms-viewer-prose h1 {
+  font-size: 1.85em;
+  margin-top: 0.4em;
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--border);
+  letter-spacing: -0.01em;
+}
+.kms-viewer-prose h2 {
+  font-size: 1.45em;
+  padding-bottom: 0.25em;
+  border-bottom: 1px solid var(--border);
+}
+.kms-viewer-prose h3 { font-size: 1.2em; }
+.kms-viewer-prose h4 { font-size: 1.05em; }
+.kms-viewer-prose h5,
+.kms-viewer-prose h6 {
+  font-size: 0.95em;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.kms-viewer-prose p { margin: 0.85em 0; }
+
+.kms-viewer-prose ul,
+.kms-viewer-prose ol {
+  margin: 0.7em 0;
+  padding-left: 1.6em;
+}
+.kms-viewer-prose li { margin: 0.25em 0; }
+.kms-viewer-prose li > p { margin: 0.25em 0; }
+.kms-viewer-prose li > ul,
+.kms-viewer-prose li > ol { margin: 0.25em 0; }
+
+.kms-viewer-prose blockquote {
+  margin: 1em 0;
+  padding: 0.4em 1em;
+  border-left: 3px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  color: var(--text-primary);
+  border-radius: 0 4px 4px 0;
+}
+.kms-viewer-prose blockquote p { margin: 0.4em 0; }
+
+.kms-viewer-prose hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 2em 0;
+}
+
+.kms-viewer-prose a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-thickness: 1px;
+}
+.kms-viewer-prose a:hover {
+  color: var(--accent-dim);
+  text-decoration-thickness: 2px;
+}
+/* Internal Obsidian-style wikilinks (rewritten by the viewer to
+   `wikilink:slug` href) — render with a dotted underline + slight
+   bracket affordance so the reader sees they hop within the KMS,
+   not out to the web. */
+.kms-viewer-prose a[href^="wikilink:"] {
+  text-decoration: underline dotted;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+  padding: 0 2px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+.kms-viewer-prose a[href^="wikilink:"]:hover {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.kms-viewer-prose code {
+  background: var(--bg-tertiary);
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+  font-family: Menlo, Monaco, "SF Mono", "Courier New", monospace;
+  font-size: 0.88em;
+  border: 1px solid var(--border);
+}
+.kms-viewer-prose pre {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.85em 1em;
+  margin: 1em 0;
+  overflow-x: auto;
+  font-size: 0.88em;
+  line-height: 1.55;
+}
+.kms-viewer-prose pre code {
+  background: transparent;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  font-size: inherit;
+}
+
+.kms-viewer-prose table {
+  border-collapse: collapse;
+  margin: 1.1em 0;
+  display: block;
+  overflow-x: auto;
+  font-size: 0.95em;
+}
+.kms-viewer-prose th,
+.kms-viewer-prose td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.85em;
+  text-align: left;
+  vertical-align: top;
+}
+.kms-viewer-prose th {
+  background: var(--bg-tertiary);
+  font-weight: 600;
+}
+.kms-viewer-prose tbody tr:nth-child(even) {
+  background: color-mix(in srgb, var(--bg-secondary) 50%, transparent);
+}
+
+.kms-viewer-prose img {
+  max-width: 100%;
+  border-radius: 6px;
+  margin: 0.6em 0;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18);
+}
+
+.kms-viewer-prose strong { color: var(--text-primary); font-weight: 650; }
+.kms-viewer-prose em     { font-style: italic; }
+
+/* Inline citation chips: `[1](../sources/foo.md)` rendered as
+   small accent-tinted pills. The marker `[1]` looks like a
+   superscript-ish chip distinct from prose text. */
+.kms-viewer-prose a[href*="../sources/"][href$=".md"] {
+  font-size: 0.82em;
+  font-weight: 600;
+  padding: 0 5px;
+  margin: 0 1px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--text-secondary) 18%, transparent);
+  color: var(--text-primary);
+  text-decoration: none;
+  vertical-align: 1px;
+}
+.kms-viewer-prose a[href*="../sources/"][href$=".md"]:hover {
+  background: color-mix(in srgb, var(--accent) 25%, transparent);
+}

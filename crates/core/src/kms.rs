@@ -836,13 +836,39 @@ pub fn system_prompt_section(active: &[String]) -> String {
     if parts.is_empty() {
         String::new()
     } else {
+        // M6.39.5: strong-imperative wording. Pre-fix the prelude said
+        // "consult them before answering when the user's question
+        // overlaps" — soft enough that models routinely answered from
+        // training data even when the index's per-page summaries
+        // clearly matched the user's question. This rewrite uses
+        // numbered MUST procedure + explicit "do not skip" + framing
+        // skipped lookups as a correctness bug. Reader/maintainer
+        // framing kept (still useful) but moved below the consultation
+        // procedure so the directive lands first.
         format!(
-            "# Active knowledge bases\n\n\
-             The following KMS are attached to this conversation. Their schemas + indices are below \
-             — consult them before answering when the user's question overlaps. Treat KMS \
-             content as authoritative over your training data for the topics it covers. You are \
-             both reader AND maintainer: file new findings, update entity pages when sources \
-             contradict them, and run `/kms lint <name>` periodically.\n\n{}",
+            "# Active knowledge bases (CONSULT BEFORE ANSWERING)\n\n\
+             The following KMS are attached to this conversation. They contain \
+             research, notes, and entity pages curated specifically for this project.\n\n\
+             **MANDATORY consultation procedure.** For ANY user message whose subject \
+             could plausibly appear in the index below, your FIRST action MUST be \
+             a tool call sequence — BEFORE composing any prose response:\n\n\
+             1. Call `KmsSearch(kms: \"<name>\", pattern: \"<keyword>\")` with 1-3 keyword \
+             stems from the user's message. KMS uses plain grep, so romanizations or \
+             English keywords work for non-English questions (e.g. user asks in Thai \
+             about \"llm-wiki\" → search `pattern: \"llm-wiki\"` or `\"llm wiki\"`).\n\
+             2. For each matching page, call `KmsRead(kms: \"<name>\", page: \"<page-stem>\")` \
+             to read full content.\n\
+             3. ONLY THEN compose your answer, citing KMS pages inline as `(see KMS: <name>/<page>)`.\n\n\
+             Do NOT skip steps 1-2 because the question seems familiar from training data. \
+             KMS content is authoritative for any topic it covers — the user populated the KMS \
+             specifically to override generic answers. Answering without KMS lookup when the \
+             index suggests relevance is a correctness bug, not a shortcut.\n\n\
+             If `KmsSearch` returns no hits AND the index lists nothing matching the user's \
+             topic, fall back to training-data knowledge — but say so explicitly (\"the KMS \
+             has nothing on this; answering from general knowledge\").\n\n\
+             You are both reader AND maintainer: file new findings via `KmsWrite`, update \
+             entity pages when sources contradict them, and run `/kms lint <name>` \
+             periodically.\n\n{}",
             parts.join("\n\n")
         )
     }
@@ -1233,6 +1259,372 @@ pub fn delete_page(kref: &KmsRef, page_name: &str) -> Result<PathBuf> {
     remove_index_bullet(kref, &stem)?;
     append_log_header(kref, "deleted", &stem)?;
     Ok(path)
+}
+
+/// M6.39.9: list every readable `*.md` file inside a KMS, split by
+/// kind (`pages/` and `sources/`). Drives the right-edge KMS browser
+/// panel — clicking the title of a KMS row in the sidebar opens this
+/// listing, clicking a list entry opens the viewer overlay.
+///
+/// Filenames returned without the `.md` extension (so the frontend
+/// can use them as page-name keys consistent with `KmsRead`).
+/// Sorted alphabetically. Hidden files (`.foo`) skipped.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BrowseFile {
+    pub name: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BrowseListing {
+    pub kms: String,
+    pub pages: Vec<BrowseFile>,
+    pub sources: Vec<BrowseFile>,
+}
+
+/// List browseable files for a KMS by name. Returns `None` if the
+/// KMS isn't found. `pages/` and `sources/` are independent — a KMS
+/// that predates M6.39.5 may have no `sources/` dir; that's fine,
+/// returns empty list for that side.
+pub fn browse(name: &str) -> Option<BrowseListing> {
+    let kref = resolve(name)?;
+    let pages = scan_dir_md(&kref.pages_dir());
+    let sources = scan_dir_md(&kref.root.join("sources"));
+    Some(BrowseListing {
+        kms: name.to_string(),
+        pages,
+        sources,
+    })
+}
+
+fn scan_dir_md(dir: &Path) -> Vec<BrowseFile> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut out: Vec<BrowseFile> = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || !name.ends_with(".md") {
+            continue;
+        }
+        let stem = name.trim_end_matches(".md").to_string();
+        let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        out.push(BrowseFile { name: stem, bytes });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// M6.39.13: build an Obsidian-style graph of one KMS — every page
+/// is a node, every `[[slug]]` wikilink is a directed edge. Used by
+/// the right-pane "Graph" view that mirrors Obsidian's visualization
+/// of the same data.
+///
+/// Pages without outgoing OR incoming links are still emitted as
+/// isolated nodes — the user wants to see them and decide whether
+/// to link them.
+///
+/// Edge resolution: a `[[other-slug]]` in `karpathy.md` becomes an
+/// edge `karpathy → other-slug` IF `other-slug.md` exists in the
+/// same KMS. Dangling links (slug not present) are dropped silently
+/// — the graph view shouldn't show ghost nodes for broken refs.
+///
+/// When `include_sources` is true, source files in `<root>/sources/`
+/// are emitted as `kind: "source"` nodes and edges are added from
+/// any page whose body cites them via `(../sources/<slug>.md)` (the
+/// format produced by `linkify_citations` and the `## Sources`
+/// section). Source nodes without any backlink are still listed —
+/// orphan archives are useful to surface.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GraphNode {
+    pub id: String, // page slug (filename stem); for sources we use `source:<stem>` to namespace
+    pub label: String, // title from frontmatter, falls back to id
+    pub size: u32,  // total link count (in + out) — sized in UI
+    pub kind: GraphNodeKind,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GraphNodeKind {
+    Page,
+    Source,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GraphEdge {
+    pub source: String,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GraphData {
+    pub kms: String,
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+}
+
+/// Build the graph for `kms_name`. Returns `None` if the KMS isn't
+/// found. Always succeeds for a valid KMS even if pages are empty.
+///
+/// `include_sources` toggles whether source archives in `<root>/sources/`
+/// are emitted as nodes. When true, page → source citation edges are
+/// also added (parsed from `(../sources/<slug>.md)` markdown links
+/// inside page bodies — the format produced by `linkify_citations`
+/// and the `## Sources` section).
+///
+/// Source node IDs are namespaced as `source:<stem>` so they can't
+/// collide with page slugs and the frontend can route clicks back
+/// to `read_browse_file(kind="source", name="<stem>.md")`.
+pub fn graph(kms_name: &str, include_sources: bool) -> Option<GraphData> {
+    let kref = resolve(kms_name)?;
+    let pages_dir = kref.pages_dir();
+    let pages_iter = std::fs::read_dir(&pages_dir).ok();
+
+    // First pass: collect every page slug + its title. Skip
+    // hidden / non-md / `_summary` (it's an index, not a real
+    // research page) so the graph isn't dominated by it.
+    let mut nodes: std::collections::BTreeMap<String, GraphNode> =
+        std::collections::BTreeMap::new();
+    let mut bodies: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if let Some(entries) = pages_iter {
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if !ft.is_file() {
+                continue;
+            }
+            let filename = entry.file_name().to_string_lossy().to_string();
+            if filename.starts_with('.') || !filename.ends_with(".md") {
+                continue;
+            }
+            let stem = filename.trim_end_matches(".md").to_string();
+            if stem == "_summary" {
+                continue;
+            }
+            let body = match std::fs::read_to_string(entry.path()) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let (fm, _) = parse_frontmatter(&body);
+            let label = fm
+                .get("title")
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| stem.clone());
+            nodes.insert(
+                stem.clone(),
+                GraphNode {
+                    id: stem.clone(),
+                    label,
+                    size: 0,
+                    kind: GraphNodeKind::Page,
+                },
+            );
+            bodies.insert(stem, body);
+        }
+    }
+
+    // Optional: list sources/ as nodes (`source:<stem>` IDs) and
+    // register their stems for citation-edge resolution. Title comes
+    // from frontmatter if the source archive has it (HAL-fetched
+    // markdown often does), else falls back to the bare stem.
+    let mut source_stems: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if include_sources {
+        let sources_dir = kref.root.join("sources");
+        if let Ok(entries) = std::fs::read_dir(&sources_dir) {
+            for entry in entries.flatten() {
+                let Ok(ft) = entry.file_type() else { continue };
+                if !ft.is_file() {
+                    continue;
+                }
+                let filename = entry.file_name().to_string_lossy().to_string();
+                if filename.starts_with('.') || !filename.ends_with(".md") {
+                    continue;
+                }
+                let stem = filename.trim_end_matches(".md").to_string();
+                let label = std::fs::read_to_string(entry.path())
+                    .ok()
+                    .and_then(|raw| {
+                        let (fm, _) = parse_frontmatter(&raw);
+                        fm.get("title")
+                            .map(|s| s.trim().trim_matches('"').to_string())
+                            .filter(|s| !s.is_empty())
+                    })
+                    .unwrap_or_else(|| stem.clone());
+                let node_id = format!("source:{stem}");
+                nodes.insert(
+                    node_id.clone(),
+                    GraphNode {
+                        id: node_id,
+                        label,
+                        size: 0,
+                        kind: GraphNodeKind::Source,
+                    },
+                );
+                source_stems.insert(stem);
+            }
+        }
+    }
+
+    // Second pass: scan each body for `[[slug]]` wikilinks (page→page)
+    // and `(../sources/<stem>.md)` markdown links (page→source) and
+    // emit edges where the target exists in the node set.
+    let mut edges: Vec<GraphEdge> = Vec::new();
+    for (source, body) in &bodies {
+        for target in extract_wikilink_targets(body) {
+            if !nodes.contains_key(&target) {
+                continue;
+            }
+            if &target == source {
+                continue;
+            }
+            edges.push(GraphEdge {
+                source: source.clone(),
+                target,
+            });
+        }
+        if include_sources {
+            for stem in extract_source_link_targets(body) {
+                if !source_stems.contains(&stem) {
+                    continue;
+                }
+                edges.push(GraphEdge {
+                    source: source.clone(),
+                    target: format!("source:{stem}"),
+                });
+            }
+        }
+    }
+
+    // Compute node `size` = total in + out degree, used by the
+    // frontend to scale node radii.
+    for e in &edges {
+        if let Some(n) = nodes.get_mut(&e.source) {
+            n.size += 1;
+        }
+        if let Some(n) = nodes.get_mut(&e.target) {
+            n.size += 1;
+        }
+    }
+
+    Some(GraphData {
+        kms: kms_name.to_string(),
+        nodes: nodes.into_values().collect(),
+        edges,
+    })
+}
+
+/// Extract source filenames from `](../sources/<stem>.md)` markdown
+/// links — the canonical citation format produced by
+/// `linkify_citations` + the auto-generated `## Sources` section.
+/// Returns the bare stem (no path, no `.md`).
+fn extract_source_link_targets(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let needle = "](../sources/";
+    let mut search_from = 0;
+    while let Some(rel) = body[search_from..].find(needle) {
+        let abs = search_from + rel + needle.len();
+        let rest = &body[abs..];
+        let end = rest.find(')').unwrap_or(rest.len());
+        let target = &rest[..end];
+        // Strip optional `.md` suffix and any URL fragment / query.
+        let cleaned = target
+            .split(|c| c == '#' || c == '?')
+            .next()
+            .unwrap_or(target)
+            .trim_end_matches(".md");
+        if !cleaned.is_empty() && !cleaned.contains('/') && cleaned.len() <= 200 {
+            out.push(cleaned.to_string());
+        }
+        search_from = abs + end;
+    }
+    out
+}
+
+/// Walk the markdown body, return every `[[slug]]` (or `[[slug|display]]`)
+/// target as a list. Slug is the part before `|`; display is dropped
+/// (we only need the link target). Multiline / oversized brackets
+/// skipped to avoid pathological inputs.
+fn extract_wikilink_targets(body: &str) -> Vec<String> {
+    let bytes = body.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 1 < body.len() {
+        if bytes[i] == b'[' && bytes[i + 1] == b'[' {
+            if let Some(end_rel) = body[i + 2..].find("]]") {
+                let inner = &body[i + 2..i + 2 + end_rel];
+                if inner.len() <= 120 && !inner.contains('\n') {
+                    let slug = inner
+                        .split_once('|')
+                        .map(|(s, _)| s.trim().to_string())
+                        .unwrap_or_else(|| inner.trim().to_string());
+                    if !slug.is_empty() {
+                        out.push(slug);
+                    }
+                }
+                i = i + 2 + end_rel + 2;
+                continue;
+            }
+        }
+        // Advance to next char boundary.
+        let mut j = i + 1;
+        while j < body.len() && !body.is_char_boundary(j) {
+            j += 1;
+        }
+        i = j;
+    }
+    out
+}
+
+/// M6.39.9: read a file from a KMS's `pages/` or `sources/` dir
+/// for the viewer overlay. `kind` is `"page"` or `"source"`; `name`
+/// is the bare filename stem (no `.md`). Path-safety mirrors
+/// [`writable_page_path`] — the viewer is read-only, but we still
+/// don't want a crafted IPC reading `/etc/passwd` via traversal.
+pub fn read_browse_file(kms_name: &str, kind: &str, name: &str) -> Result<String> {
+    if name.is_empty()
+        || name.contains("..")
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+        || name.chars().any(|c| c.is_control())
+        || Path::new(name).is_absolute()
+    {
+        return Err(Error::Tool(format!(
+            "invalid file name '{name}' — no path separators or traversal"
+        )));
+    }
+    let kref =
+        resolve(kms_name).ok_or_else(|| Error::Tool(format!("KMS '{kms_name}' not found")))?;
+    let dir = match kind {
+        "page" => kref.pages_dir(),
+        "source" => kref.root.join("sources"),
+        other => return Err(Error::Tool(format!("invalid kind '{other}'"))),
+    };
+    let stem = name.trim_end_matches(".md");
+    let path = dir.join(format!("{stem}.md"));
+    if !path.exists() {
+        return Err(Error::Tool(format!("not found: {}", path.display())));
+    }
+    // Canonicalize both and confirm path lives inside dir — defense
+    // in depth even though the bare-name validation above already
+    // blocks `..`.
+    let canon_dir = std::fs::canonicalize(&dir)
+        .map_err(|e| Error::Tool(format!("canonicalize {}: {e}", dir.display())))?;
+    let canon_path = std::fs::canonicalize(&path)
+        .map_err(|e| Error::Tool(format!("canonicalize {}: {e}", path.display())))?;
+    if !canon_path.starts_with(&canon_dir) {
+        return Err(Error::Tool(format!(
+            "path '{}' escaped KMS root",
+            path.display()
+        )));
+    }
+    std::fs::read_to_string(&canon_path)
+        .map_err(|e| Error::Tool(format!("read {}: {e}", canon_path.display())))
 }
 
 fn remove_index_bullet(kref: &KmsRef, stem: &str) -> Result<()> {
@@ -1876,6 +2268,45 @@ mod tests {
         assert!(out.contains("KmsRead"));
     }
 
+    /// M6.39.5: pin the strong-imperative wording of the prelude.
+    /// User reported via /system inspection that even when KMS was
+    /// active and the index summary was descriptive, the LLM still
+    /// answered from training data. Pre-fix prelude said "consult
+    /// them before answering" — soft language. This test locks the
+    /// directive form so a future "smooth out the wording" refactor
+    /// can't regress it.
+    #[test]
+    fn system_prompt_section_uses_mandatory_consultation_directive() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::User).unwrap();
+        std::fs::write(k.index_path(), "# nb\n- [foo](pages/foo.md) — foo\n").unwrap();
+        let out = system_prompt_section(&["nb".into()]);
+        // MUST include the strong imperative form
+        assert!(
+            out.contains("MANDATORY"),
+            "prelude must use MANDATORY (got soft 'consult'-style wording)"
+        );
+        // MUST name the tool call sequence explicitly — `KmsSearch`
+        // first, then `KmsRead`, then answer. This is the procedure
+        // the model needs to follow.
+        assert!(out.contains("KmsSearch"));
+        assert!(out.contains("KmsRead"));
+        // MUST forbid the shortcut (answering from training when KMS
+        // could match). Without this the model rationalizes skipping
+        // ("I already know the answer").
+        let lower = out.to_ascii_lowercase();
+        assert!(
+            lower.contains("do not skip"),
+            "prelude must forbid skipping the lookup steps"
+        );
+        // MUST acknowledge the no-match fallback so the model doesn't
+        // feel boxed in when KMS genuinely has nothing.
+        assert!(
+            lower.contains("fall back to training-data knowledge"),
+            "prelude must allow training-data fallback when KMS has no hits"
+        );
+    }
+
     #[test]
     fn system_prompt_section_skips_missing() {
         let _home = scoped_home();
@@ -2043,6 +2474,92 @@ mod tests {
     }
 
     // ─── M6.25: frontmatter (BUG #9) ──────────────────────────────────────
+
+    // ─── M6.39.13: graph builder ──────────────────────────────────────────
+
+    #[test]
+    fn graph_extracts_wikilink_targets() {
+        let body = "see [[alpha]] and [[beta|Beta Display]]\nrandom [text](http://x).\n[[gamma]]";
+        let targets = extract_wikilink_targets(body);
+        assert_eq!(targets, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn graph_skips_dangling_and_self_links() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::User).unwrap();
+        write_page(
+            &k,
+            "alpha",
+            "---\ntitle: \"Alpha\"\n---\n\nlinks to [[beta]] and [[ghost]] and self [[alpha]]\n",
+        )
+        .unwrap();
+        write_page(
+            &k,
+            "beta",
+            "---\ntitle: \"Beta\"\n---\n\nback to [[alpha]]\n",
+        )
+        .unwrap();
+        let g = graph("nb", false).expect("graph");
+        let ids: Vec<_> = g.nodes.iter().map(|n| n.id.clone()).collect();
+        assert!(ids.contains(&"alpha".to_string()));
+        assert!(ids.contains(&"beta".to_string()));
+        assert!(!ids.contains(&"ghost".to_string()));
+        // alpha → beta + beta → alpha; alpha → ghost dropped (dangling);
+        // alpha → alpha dropped (self-link).
+        assert_eq!(g.edges.len(), 2);
+        let alpha = g.nodes.iter().find(|n| n.id == "alpha").unwrap();
+        assert_eq!(alpha.label, "Alpha");
+        assert_eq!(alpha.kind, GraphNodeKind::Page);
+    }
+
+    #[test]
+    fn graph_extracts_source_link_targets() {
+        let body = "see [1](../sources/foo.md) and [2](../sources/bar) and [3](../sources/baz.md#x)\n[ignore](other/path.md)";
+        let targets = extract_source_link_targets(body);
+        assert_eq!(targets, vec!["foo", "bar", "baz"]);
+    }
+
+    #[test]
+    fn graph_includes_sources_when_requested() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::User).unwrap();
+        write_page(
+            &k,
+            "alpha",
+            "---\ntitle: \"Alpha\"\n---\n\nciting [1](../sources/example-com.md) and [2](../sources/ghost-source.md)\n",
+        )
+        .unwrap();
+        // Create a sources/ archive that the page cites.
+        let sources_dir = k.root.join("sources");
+        std::fs::create_dir_all(&sources_dir).unwrap();
+        std::fs::write(
+            sources_dir.join("example-com.md"),
+            "---\ntitle: \"Example Inc.\"\n---\n\nbody\n",
+        )
+        .unwrap();
+        // Note: ghost-source.md does NOT exist on disk — should be dropped.
+
+        // Without flag: only the page node, no source nodes/edges.
+        let g_off = graph("nb", false).expect("graph");
+        assert_eq!(g_off.nodes.len(), 1);
+        assert!(g_off.edges.is_empty());
+
+        // With flag: page node + 1 source node + 1 page→source edge
+        // (the dangling ghost-source citation is dropped).
+        let g_on = graph("nb", true).expect("graph");
+        assert_eq!(g_on.nodes.len(), 2);
+        let src = g_on
+            .nodes
+            .iter()
+            .find(|n| n.kind == GraphNodeKind::Source)
+            .expect("source node");
+        assert_eq!(src.id, "source:example-com");
+        assert_eq!(src.label, "Example Inc.");
+        assert_eq!(g_on.edges.len(), 1);
+        assert_eq!(g_on.edges[0].source, "alpha");
+        assert_eq!(g_on.edges[0].target, "source:example-com");
+    }
 
     #[test]
     fn parse_frontmatter_extracts_keys_and_strips_block() {

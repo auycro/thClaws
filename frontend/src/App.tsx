@@ -8,6 +8,13 @@ import { Sidebar } from "./components/Sidebar";
 import { PlanSidebar } from "./components/PlanSidebar";
 import { GoalSidebar } from "./components/GoalSidebar";
 import { TodoSidebar } from "./components/TodoSidebar";
+import { ResearchSidebar } from "./components/ResearchSidebar";
+import {
+  KmsBrowserSidebar,
+  type ViewerTarget,
+} from "./components/KmsBrowserSidebar";
+import { KmsViewerOverlay } from "./components/KmsViewerOverlay";
+import { KmsGraphView } from "./components/KmsGraphView";
 import { SettingsModal } from "./components/SettingsModal";
 import { SettingsMenu } from "./components/SettingsMenu";
 import { InstructionsEditorModal } from "./components/InstructionsEditorModal";
@@ -339,6 +346,19 @@ export default function App() {
     useState<"global" | "folder" | null>(null);
   const closeInstructions = useCallback(() => setInstructionsScope(null), []);
 
+  // M6.39.9: KMS browser + viewer state. `browsingKms` is the
+  // KMS the user clicked the title of in the left sidebar — when
+  // set, the right-edge `KmsBrowserSidebar` mounts. `viewerTarget`
+  // is the file the user clicked inside the browser — when set,
+  // `KmsViewerOverlay` mounts over the main pane. Both clear on
+  // their respective close handlers.
+  const [browsingKms, setBrowsingKms] = useState<string | null>(null);
+  const [viewerTarget, setViewerTarget] = useState<ViewerTarget | null>(null);
+  // M6.39.13: Obsidian-style graph view of the focused KMS. Mutually
+  // exclusive with `viewerTarget` — opening one clears the other so
+  // the main pane only ever shows one KMS surface at a time.
+  const [graphKms, setGraphKms] = useState<string | null>(null);
+
   // Post-key-entry model picker (issue #13). Backend broadcasts
   // `model_picker_open` after a successful api_key_set when the
   // provider has a non-trivial catalogue. Clearing this state on
@@ -443,7 +463,16 @@ export default function App() {
         {TABS.map((tab) => (
           <button
             key={tab.id}
-            onClick={() => setActiveTab(tab.id)}
+            onClick={() => {
+              setActiveTab(tab.id);
+              // M6.39.12: switching tabs closes both the KMS viewer
+              // pane and the KMS browser sidebar — the user is moving
+              // back to "real work" (chat / terminal / files / team)
+              // and the KMS browse session is implicitly done.
+              setViewerTarget(null);
+              setBrowsingKms(null);
+              setGraphKms(null);
+            }}
             className="flex items-center gap-1.5 px-4 py-2 text-xs font-medium transition-colors"
             style={{
               color:
@@ -473,7 +502,7 @@ export default function App() {
 
       {/* Main content */}
       <div className="flex flex-1 min-h-0">
-        <Sidebar />
+        <Sidebar onBrowseKms={(name) => setBrowsingKms(name)} />
         <div className="flex-1 min-w-0 relative">
           {/* Keep every tab panel mounted AND full-sized via absolute+inset-0.
               Inactive panels get `invisible` + `pointer-events-none` so they
@@ -482,7 +511,12 @@ export default function App() {
               making the terminal un-typeable after a tab switch. */}
           {TABS.map(({ id }) => {
             const isActive = effectiveTab === id;
-            const cls = `absolute inset-0 ${isActive ? "" : "invisible pointer-events-none"}`;
+            // M6.39.9: when KMS viewer is open, hide tabs visually
+            // (they stay mounted so xterm doesn't lose state) and
+            // let the viewer's absolute-positioned pane cover them.
+            const tabsHidden =
+              !isActive || viewerTarget !== null || graphKms !== null;
+            const cls = `absolute inset-0 ${tabsHidden ? "invisible pointer-events-none" : ""}`;
             return (
               <div key={id} className={cls}>
                 {id === "terminal" && <TerminalView active={isActive} modalOpen={modalOpen} />}
@@ -492,6 +526,28 @@ export default function App() {
               </div>
             );
           })}
+          {/* KMS viewer pane (M6.39.9). When a file is open, mounts
+              over the active tab inside the same flex-1 container so
+              it feels like a tab swap rather than a modal. Tabs stay
+              mounted underneath; close button returns the user to
+              whichever tab they were on. */}
+          {viewerTarget && (
+            <KmsViewerOverlay
+              initial={viewerTarget}
+              onClose={() => setViewerTarget(null)}
+            />
+          )}
+          {/* KMS graph view (M6.39.13). Obsidian-style force-directed
+              visualization of pages + wikilinks. Stacks above the
+              tabs; clicking a node opens the viewer overlay (which
+              then sits on top of the graph). */}
+          {graphKms && !viewerTarget && (
+            <KmsGraphView
+              kmsName={graphKms}
+              onClose={() => setGraphKms(null)}
+              onOpenFile={(target) => setViewerTarget(target)}
+            />
+          )}
         </div>
         {/* Goal-state sidebar (M6.29 Phase A). Compact 240px column
             mounted to the LEFT of the plan sidebar. Renders nothing
@@ -510,6 +566,40 @@ export default function App() {
             with `null` to clear it on `/new` / `/load` of a plan-less
             session. Mounted on the right by design (Cowork pattern). */}
         <PlanSidebar />
+        {/* Research sidebar (M6.39.5). Mirrors PlanSidebar's
+            right-edge layout but shows /research pipeline progression
+            verbosely — current phase, iteration progress, score
+            history, phase log, accumulated source count. Renders
+            nothing until at least one research job has been observed
+            via `research_update`. */}
+        <ResearchSidebar />
+        {/* KMS browser sidebar (M6.39.9). Activated by clicking a
+            KMS row's title in the left sidebar. Lists pages +
+            sources; click an entry to open the viewer overlay. */}
+        {browsingKms && (
+          <KmsBrowserSidebar
+            kmsName={browsingKms}
+            onClose={() => {
+              // M6.39.12: closing the browser sidebar also closes the
+              // viewer pane underneath. The user's focus has moved
+              // away from this KMS — the viewer would just be
+              // orphaned content with no visible browser to re-open
+              // it from.
+              setBrowsingKms(null);
+              setViewerTarget(null);
+              setGraphKms(null);
+            }}
+            onOpenFile={(target) => {
+              setGraphKms(null);
+              setViewerTarget(target);
+            }}
+            onOpenGraph={(name) => {
+              setViewerTarget(null);
+              setGraphKms((cur) => (cur === name ? null : name));
+            }}
+            graphActive={graphKms === browsingKms}
+          />
+        )}
       </div>
 
       {/* Status bar */}

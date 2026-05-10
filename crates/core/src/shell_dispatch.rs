@@ -1089,6 +1089,7 @@ pub async fn dispatch(
             min_iter,
             max_iter,
             score_threshold_pct,
+            max_pages,
             budget_tokens: _,
             budget_time_secs,
         } => {
@@ -1102,6 +1103,9 @@ pub async fn dispatch(
             }
             if let Some(pct) = score_threshold_pct {
                 cfg.score_threshold = (pct as f32 / 100.0).clamp(0.0, 1.0);
+            }
+            if let Some(v) = max_pages {
+                cfg.max_pages = v;
             }
             if let Some(secs) = budget_time_secs {
                 cfg.time_budget = std::time::Duration::from_secs(secs);
@@ -2084,6 +2088,23 @@ pub async fn dispatch(
                         Err(e) => emit(events_tx, format!("/kms wrap-up --fix: {e}")),
                     }
                 }
+            }
+        }
+        SlashCommand::KmsHtml { name, .. } => {
+            // Same shape as KmsDump / KmsChallenge — handled by the
+            // turn-rewrite in shared_session.rs. This arm only fires
+            // when the KMS doesn't resolve, or when dispatch is
+            // called directly (which it shouldn't be).
+            if crate::kms::resolve(&name).is_none() {
+                emit(events_tx, format!("no KMS named '{name}'"));
+            } else {
+                emit(
+                    events_tx,
+                    format!(
+                        "/kms html {name} requires the agent loop — invoke from chat / CLI, \
+                         not via shell_dispatch::dispatch directly."
+                    ),
+                );
             }
         }
         SlashCommand::KmsMigrate { name, apply } => {

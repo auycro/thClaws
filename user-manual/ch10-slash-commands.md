@@ -97,6 +97,20 @@ tried first.
 
 See [Chapter 9](ch09-knowledge-bases-kms.md) for the full KMS concept + workflow, including the `/dream` consolidation flow.
 
+### Background research
+
+| Command | What it does |
+|---|---|
+| `/research <query>` | Spawn a background research job — multi-iteration web search + multi-page KMS write |
+| `/research [--kms NAME] [--max-pages N] [--max-iter K] [--score-threshold 0.X] [--budget-time T] <query>` | Start with overrides |
+| `/research` (or `/research list`) | List all jobs (newest first) |
+| `/research status ID` | Detailed view (phase, iteration, score) |
+| `/research show ID` | Print synthesized result in chat |
+| `/research cancel ID` | Cancel a running job; partial result discarded |
+| `/research wait ID` | Block CLI prompt until terminal (CLI-only) |
+
+See [Chapter 20](ch20-research.md) for the full pipeline + KMS layout + flag reference.
+
 ### Agent behaviour
 
 | Command | What it does |

@@ -39,7 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 9
       - uses: actions/setup-node@v5
@@ -53,7 +53,7 @@ jobs:
         run: pnpm tsc --noEmit
       - working-directory: frontend
         run: pnpm build
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: frontend-dist
           path: frontend/dist/
@@ -76,7 +76,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           name: frontend-dist
           path: frontend/dist/
@@ -107,7 +107,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           name: frontend-dist
           path: frontend/dist/
@@ -137,7 +137,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           name: frontend-dist
           path: frontend/dist/

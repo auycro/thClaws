@@ -32,7 +32,24 @@ use crate::error::{Error, Result};
 use crate::providers::Provider;
 use std::sync::Arc;
 
-const MAX_SOURCE_BODY_CHARS: usize = 1500;
+/// In-memory cap per fetched source body. Research is for gathering
+/// **complete** references — short caps defeat the purpose. 1 MB
+/// holds a long wiki article + comments + a typical 50-page PDF text
+/// extract, while still bounding pathological pages (e.g. an entire
+/// site dumped to one URL). At 30 accumulated sources × 1 MB worst
+/// case = ~30 MB peak in memory per run; comfortable for desktop.
+///
+/// Synth prompts still truncate via `snippet(body, N)` (500 chars
+/// for evaluate / 600 for write_research_page) when composing, so a
+/// large source body doesn't bloat LLM cost — only the sources/
+/// archive on disk grows.
+const MAX_SOURCE_BODY_CHARS: usize = 1_000_000;
+/// Per-fetch byte budget for `WebFetch` calls. Same 1 MB ceiling as
+/// the in-memory cap so they don't conflict. M6.39.8: HAL-backed
+/// `WebScrape` is preferred when `HAL_API_KEY` is set (returns
+/// cleaner markdown); this constant only governs the WebFetch
+/// fallback path.
+const FETCH_MAX_BYTES: u64 = 1024 * 1024;
 const SEED_SEARCH_RESULTS: u32 = 10;
 
 /// Trait abstraction over WebSearch / WebFetch so the pipeline can be
@@ -213,30 +230,28 @@ pub async fn run_with_tools(
         .await?;
     }
 
-    // ── 6. Final synthesis ──────────────────────────────────────────
+    // ── 6. Plan multi-page output ───────────────────────────────────
     check_alive(job_id, &cancel)?;
-    mgr.update_phase(job_id, "synthesizing final answer");
-    let mut synthesized = llm_calls::synthesize(
+    mgr.update_phase(job_id, "planning KMS pages");
+    let plan = llm_calls::plan_pages(
         provider.as_ref(),
         &model,
         &query,
         &sources,
+        config.max_pages,
         config.llm_timeout,
         &cancel,
     )
     .await?;
-    if !last_notes.is_empty() {
-        synthesized.push_str("\n\n---\n\n## Research notes\n\n");
-        synthesized.push_str(&last_notes);
-    }
 
-    // ── 7. KMS write ────────────────────────────────────────────────
+    // ── 7. Resolve KMS name (auto-derive slug when --kms not passed)
     check_alive(job_id, &cancel)?;
-    mgr.update_phase(job_id, "writing to KMS");
     let kms_name = match &config.kms_target {
         Some(n) => n.clone(),
         None => {
-            let slug = llm_calls::derive_topic_slug(
+            // M6.39.5: KMS name is the LLM-derived topic slug
+            // verbatim, no `research-` prefix.
+            llm_calls::derive_topic_slug(
                 provider.as_ref(),
                 &model,
                 &query,
@@ -244,19 +259,144 @@ pub async fn run_with_tools(
                 &cancel,
             )
             .await
-            .unwrap_or_else(|_| "research".into());
-            format!("research-{slug}")
+            .unwrap_or_else(|_| "research".into())
         }
     };
-    let query_slug = simple_slug(&query);
-    let outcome = kms_writer::write(
-        &kms_name,
-        &query,
-        &query_slug,
-        &kms_writer::today_str(),
-        &synthesized,
-    )?;
-    Ok(format!("{}/{}", outcome.kms_name, outcome.raw_note))
+
+    // Make sure the KMS exists before we kick off N parallel page
+    // syntheses (each will write into it).
+    let _ = kms_writer::resolve_or_create(&kms_name)?;
+
+    // ── 8. Parallel per-page synthesis ──────────────────────────────
+    check_alive(job_id, &cancel)?;
+    mgr.update_phase(
+        job_id,
+        format!("synthesizing {} pages in parallel", plan.len()),
+    );
+    let today = kms_writer::today_str();
+    // M6.39.11: simple_slug(query) used to feed the run-prefix in
+    // page filenames; now bare slugs win (frontmatter has the
+    // metadata). The variable is kept locally only if some downstream
+    // step still needs it — none currently do.
+    let _ = simple_slug(&query);
+
+    let mut page_futures = Vec::with_capacity(plan.len());
+    for page in &plan {
+        let provider_ref = provider.clone();
+        let model_owned = model.clone();
+        let query_owned = query.clone();
+        let page_owned = page.clone();
+        let plan_owned = plan.clone();
+        let sources_owned = sources.clone();
+        let cancel_owned = cancel.clone();
+        let timeout = config.llm_timeout;
+        page_futures.push(tokio::spawn(async move {
+            llm_calls::write_research_page(
+                provider_ref.as_ref(),
+                &model_owned,
+                &query_owned,
+                &page_owned,
+                &plan_owned,
+                &sources_owned,
+                timeout,
+                &cancel_owned,
+            )
+            .await
+        }));
+    }
+    let mut bodies: Vec<(usize, String)> = Vec::with_capacity(plan.len());
+    for (idx, fut) in page_futures.into_iter().enumerate() {
+        match fut.await {
+            Ok(Ok(body)) => bodies.push((idx, body)),
+            Ok(Err(e)) => return Err(e),
+            Err(join_err) => {
+                return Err(crate::error::Error::Tool(format!(
+                    "page-synth task panicked: {join_err}"
+                )));
+            }
+        }
+    }
+
+    // ── 9. Post-process + write each page ───────────────────────────
+    check_alive(job_id, &cancel)?;
+    mgr.update_phase(job_id, "writing pages to KMS");
+    let mut all_cited_indices: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut last_page_path: Option<String> = None;
+    // M6.39.7: shared (index, title, url) shape for the citation
+    // helpers (ensure_sources_section + linkify_citations). Built
+    // once per run; same for every page.
+    let sources_meta: Vec<(u32, String, String)> = sources
+        .iter()
+        .map(|s| (s.index, s.title.clone(), s.url.clone()))
+        .collect();
+    for (idx, body) in bodies {
+        let page = &plan[idx];
+        // M6.39.11: no cross-link rewriter — page filenames are bare
+        // slugs now, so `[[karpathy]]` resolves directly.
+        let mut rewritten = body;
+        if !last_notes.is_empty() && idx == 0 {
+            // Keep the iteration-evaluation notes attached to the
+            // first page as a research-context appendix. Only the
+            // first page gets it to avoid duplication across all
+            // pages from the same run.
+            rewritten.push_str("\n\n---\n\n## Research notes\n\n");
+            rewritten.push_str(&last_notes);
+        }
+        // M6.39.7: deterministically rebuild the `## Sources` section
+        // from actual `[N]` usage (LLM was inconsistent — sometimes
+        // wrote a partial section, sometimes none). Then linkify
+        // every inline `[N]` so it points at the cached source file
+        // in <kms>/sources/. Order matters: ensure_sources_section
+        // runs first so the regenerated section's `N.` numbered-list
+        // entries don't get touched by the linkifier (which only
+        // rewrites `[N]` patterns).
+        rewritten = kms_writer::ensure_sources_section(&rewritten, &sources_meta);
+        rewritten = kms_writer::linkify_citations(&rewritten, &sources_meta);
+
+        // Accumulate cited indices across all pages so sources/ is
+        // populated with every cited source from the run, not just
+        // one page's.
+        let cited = kms_writer::parse_citation_indices(&rewritten);
+        all_cited_indices.extend(cited);
+
+        let path = kms_writer::write_research_page(
+            &kms_name,
+            &page.slug,
+            &page.title,
+            &page.topic,
+            &query,
+            &today,
+            &rewritten,
+        )?;
+        if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+            last_page_path = Some(name.to_string());
+        }
+    }
+
+    // ── 10. Append run section to _summary.md ───────────────────────
+    let pages_for_summary: Vec<(String, String, String)> = plan
+        .iter()
+        .map(|p| (p.slug.clone(), p.title.clone(), p.topic.clone()))
+        .collect();
+    kms_writer::append_run_section(&kms_name, &today, &query, &pages_for_summary)?;
+
+    // ── 11. Persist cited sources to <kms>/sources/ ─────────────────
+    for s in &sources {
+        if all_cited_indices.contains(&s.index) {
+            let _ = kms_writer::write_source(
+                &kms_name, &query, &today, s.index, &s.title, &s.url, &s.body,
+            );
+        }
+    }
+
+    // result_page = filename of the last-written page so /research
+    // show <id> opens something meaningful. The summary section in
+    // _summary.md links to all pages from this run.
+    let result = match last_page_path {
+        Some(name) => format!("{kms_name}/{name}"),
+        None => format!("{kms_name}/_summary.md"),
+    };
+    Ok(result)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -344,6 +484,12 @@ pub fn production_tools() -> Arc<dyn ResearchTools> {
 pub struct ProductionTools {
     search: crate::tools::WebSearchTool,
     fetch: crate::tools::WebFetchTool,
+    /// M6.39.8: HAL-backed web scraper, used when `HAL_API_KEY` is
+    /// set. Returns clean Markdown directly from HAL's headless-browser
+    /// scrape — far better archive quality than WebFetch's HTML→
+    /// Markdown conversion. Falls back to `WebFetchTool` when the key
+    /// isn't available or the call fails.
+    scrape: crate::tools::WebScrapeTool,
 }
 
 impl ProductionTools {
@@ -351,6 +497,7 @@ impl ProductionTools {
         Self {
             search: crate::tools::WebSearchTool::default(),
             fetch: crate::tools::WebFetchTool::new(),
+            scrape: crate::tools::WebScrapeTool::new(),
         }
     }
 }
@@ -376,16 +523,65 @@ impl ResearchTools for ProductionTools {
     }
     async fn fetch(&self, url: &str) -> Result<String> {
         use crate::tools::Tool;
-        // 8 KB cap per page is a budget tradeoff: the LLM gets enough
-        // body to verify claims, but the source list doesn't blow up
-        // the synthesis prompt across 30+ accumulated sources.
+        // M6.39.8: HAL-first with WebFetch fallback. Research is for
+        // gathering complete references — truncation defeats the
+        // purpose, and HAL's scrape returns better-structured markdown
+        // than WebFetch's HTML conversion. Try HAL when its key is
+        // available; on failure or absence, fall back to WebFetch.
+        if hal_key_available() {
+            match self.scrape.call(serde_json::json!({"url": url})).await {
+                Ok(json_str) => {
+                    if let Some(markdown) = extract_hal_content(&json_str) {
+                        return Ok(markdown);
+                    }
+                    // HAL returned but parse failed — fall through to
+                    // WebFetch rather than silently surfacing the JSON
+                    // envelope as the source body.
+                }
+                Err(_) => {
+                    // HAL failed (rate limit, network, etc.) — fall
+                    // through to WebFetch. Best-effort archive: the
+                    // synth prompt only needs SOMETHING; sources/ is
+                    // a useful-but-secondary cache.
+                }
+            }
+        }
+        // WebFetch path: pass FETCH_MAX_BYTES as the byte budget.
+        // Synth prompts further truncate via `snippet(body, N)`, so
+        // larger fetched bodies don't bloat LLM cost. Sources/
+        // archive gets the full markdown.
         self.fetch
             .call(serde_json::json!({
                 "url": url,
-                "max_bytes": 8192,
+                "max_bytes": FETCH_MAX_BYTES,
             }))
             .await
     }
+}
+
+/// Check whether `HAL_API_KEY` is set + non-empty in the live process
+/// env. Pulled out of `fetch` so the same logic is testable.
+fn hal_key_available() -> bool {
+    std::env::var("HAL_API_KEY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Extract the `content` field (Markdown) out of HAL's
+/// `/scrape/v1/url` JSON response. The `WebScrapeTool` returns the
+/// full envelope as pretty-printed JSON; we want just the markdown
+/// for the sources/ archive. Returns `None` if the JSON doesn't have
+/// a `content` field — caller falls back to WebFetch.
+fn extract_hal_content(json_str: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let content = v.get("content").and_then(serde_json::Value::as_str)?;
+    if content.trim().is_empty() {
+        return None;
+    }
+    // Optionally prepend the title as an H1 so the source file has a
+    // nice header. HAL's content sometimes already includes it; keep
+    // it simple and just return content verbatim.
+    Some(content.to_string())
 }
 
 /// Parse `WebSearchTool`'s Markdown output back into structured hits.
@@ -602,10 +798,12 @@ mod tests {
             "1. subtopic-c\n2. subtopic-d",
             // iter 2 evaluate (high score → stop)
             "score: 0.85\ncovered",
-            // synthesize
-            "Final answer [1] [2]\n\n## Sources\n[1] https://a.example\n[2] https://b.example",
+            // M6.39.6: plan_pages — single-page plan to keep test small
+            r#"[{"slug":"main","title":"Main","topic":"top-level","source_indices":[1,2]}]"#,
             // derive_topic_slug
             "test-topic",
+            // write_research_page (one page)
+            "Main page abstract [1].\n\n## Body\nMore here [2].\n\n## Sources\n[1] https://a.example\n[2] https://b.example",
         ]));
         let tools = Arc::new(MockTools::new(
             vec![
@@ -632,6 +830,7 @@ mod tests {
             score_threshold: 0.75,
             subtopics_per_iter: 2,
             fetch_top_n: 1,
+            max_pages: 7,
             llm_timeout: std::time::Duration::from_secs(5),
             time_budget: std::time::Duration::from_secs(60),
             kms_target: None,
@@ -649,10 +848,17 @@ mod tests {
         )
         .await
         .unwrap();
-        // 2 iterations × evaluate + first iteration extract_subtopics
-        // + iter 1 extract_next + synthesize + derive_slug = 6 calls
-        assert_eq!(provider.call_count(), 6);
-        assert!(outcome.contains("research-test-topic"));
+        // M6.39.5: KMS name is the LLM-derived slug verbatim, no
+        // `research-` prefix. The mock provider returns "test-topic"
+        // as its derive_topic_slug response.
+        assert!(
+            outcome.starts_with("test-topic/"),
+            "outcome should be `<slug>/<filename>.md`, got: {outcome}"
+        );
+        assert!(
+            !outcome.contains("research-test-topic"),
+            "KMS name should not be prefixed with `research-`, got: {outcome}"
+        );
         assert!(outcome.ends_with(".md"));
     }
 
@@ -666,8 +872,10 @@ mod tests {
             "score: 0.95\nlooks complete", // evaluate (iter 1) — high but floor blocks
             "1. topic-c\n2. topic-d",      // extract_next_subtopics
             "score: 0.95\nstill complete", // evaluate (iter 2) — now passes
-            "Synth [1]",                   // synthesize
-            "topic",                       // derive_topic_slug
+            // M6.39.6: plan_pages — single-page plan
+            r#"[{"slug":"main","title":"Main","topic":"top","source_indices":[1]}]"#,
+            "topic",       // derive_topic_slug
+            "Body [1].\n", // write_research_page (1 page)
         ]));
         let tools = Arc::new(MockTools::new(
             vec![vec![hit("S", "https://s.example")]; 5],
@@ -679,13 +887,14 @@ mod tests {
             score_threshold: 0.75,
             subtopics_per_iter: 2,
             fetch_top_n: 1,
+            max_pages: 7,
             llm_timeout: std::time::Duration::from_secs(5),
             time_budget: std::time::Duration::from_secs(60),
             kms_target: None,
         };
         let cancel = CancelToken::new();
         let (id, _) = manager().register("query".into(), &cfg);
-        run_with_tools(
+        let outcome = run_with_tools(
             &id,
             "query".into(),
             cfg,
@@ -696,9 +905,10 @@ mod tests {
         )
         .await
         .unwrap();
-        // 5 = subtopics + eval-1 + next-subtopics + eval-2 + synthesize + slug
-        // (slug runs because kms_target was None)
-        assert_eq!(provider.call_count(), 6);
+        // Hard floor honored — both iterations ran even though iter 1 score was high.
+        let v = manager().get(&id).unwrap();
+        assert_eq!(v.iterations_done, 2);
+        assert!(outcome.starts_with("topic/"));
     }
 
     /// Hard ceiling enforcement: low score for many iterations, loop
@@ -713,8 +923,9 @@ mod tests {
             canned.push("1. more-a\n2. more-b"); // next subtopics
         }
         canned.pop(); // last iteration doesn't get next-subtopics call (loop exits after eval)
-        canned.push("Synth"); // synthesize
-        canned.push("topic"); // slug
+        canned.push(r#"[{"slug":"x","title":"X","topic":"t","source_indices":[1]}]"#); // plan_pages
+        canned.push("topic"); // derive_topic_slug
+        canned.push("Body [1].\n"); // write_research_page (1 page)
         let provider = Arc::new(MockProvider::new(canned));
         let tools = Arc::new(MockTools::new(
             vec![vec![hit("S", "https://s.example")]; 10],
@@ -726,6 +937,7 @@ mod tests {
             score_threshold: 0.75,
             subtopics_per_iter: 2,
             fetch_top_n: 1,
+            max_pages: 7,
             llm_timeout: std::time::Duration::from_secs(5),
             time_budget: std::time::Duration::from_secs(60),
             kms_target: None,
@@ -773,11 +985,12 @@ mod tests {
     async fn empty_next_subtopics_breaks_loop() {
         let _g = scoped_home();
         let provider = Arc::new(MockProvider::new(vec![
-            "1. a\n2. b",                       // extract initial
-            "score: 0.4\nincomplete but stuck", // eval (iter 1)
-            "",                                 // next subtopics — empty
-            "Final synth",                      // synthesize
-            "slug",                             // derive_topic_slug
+            "1. a\n2. b",                                                     // extract initial
+            "score: 0.4\nincomplete but stuck",                               // eval (iter 1)
+            "", // next subtopics — empty
+            r#"[{"slug":"x","title":"X","topic":"t","source_indices":[1]}]"#, // plan_pages
+            "slug", // derive_topic_slug
+            "Final synth body [1].\n", // write_research_page
         ]));
         let tools = Arc::new(MockTools::new(
             vec![vec![hit("S", "https://s.example")]; 5],
@@ -789,6 +1002,7 @@ mod tests {
             score_threshold: 0.9,
             subtopics_per_iter: 2,
             fetch_top_n: 1,
+            max_pages: 7,
             llm_timeout: std::time::Duration::from_secs(5),
             time_budget: std::time::Duration::from_secs(60),
             kms_target: None,
@@ -818,9 +1032,26 @@ mod tests {
     }
 
     #[test]
-    fn accumulate_truncates_long_bodies() {
+    fn accumulate_keeps_bodies_up_to_max_cap() {
+        // M6.39.7: cap is now 100 KB so sources/ archive files have
+        // meaningful content, not 8 KB / 1500 chars of fragment.
+        // Bodies under the cap are kept intact; ones over get
+        // truncated with `…`.
         let mut sources = Vec::new();
-        let big_body = "x".repeat(10_000);
+        let under_cap = "x".repeat(10_000);
+        accumulate(
+            &mut sources,
+            vec![SearchHit {
+                title: "under".into(),
+                url: "https://under.example".into(),
+                snippet: under_cap.clone(),
+            }],
+            None,
+        );
+        assert_eq!(sources[0].body, under_cap, "under-cap body untouched");
+        assert!(!sources[0].body.ends_with('…'));
+        // Now an over-cap body to confirm truncation still kicks in.
+        let big_body = "y".repeat(MAX_SOURCE_BODY_CHARS + 5_000);
         accumulate(
             &mut sources,
             vec![SearchHit {
@@ -830,8 +1061,10 @@ mod tests {
             }],
             None,
         );
-        assert!(sources[0].body.len() <= MAX_SOURCE_BODY_CHARS + 4); // + 4 for "…" UTF-8
-        assert!(sources[0].body.ends_with('…'));
+        // The big-body source is the second one we appended.
+        let big = sources.iter().find(|s| s.title == "big").unwrap();
+        assert!(big.body.len() <= MAX_SOURCE_BODY_CHARS + 4); // + 4 for "…" UTF-8
+        assert!(big.body.ends_with('…'));
     }
 
     #[test]
@@ -868,6 +1101,70 @@ mod tests {
         // Smoke test only — actual search/fetch require network +
         // configured keys, exercised via end-to-end manual testing.
         let _t = production_tools();
+    }
+
+    /// M6.39.8: HAL-key detection helper. The fetch path checks this
+    /// to decide between HAL `WebScrape` (preferred when key is set)
+    /// and `WebFetch` (fallback).
+    #[test]
+    fn hal_key_available_reflects_env() {
+        let prev = std::env::var("HAL_API_KEY").ok();
+
+        std::env::remove_var("HAL_API_KEY");
+        assert!(!hal_key_available(), "no var → unavailable");
+
+        std::env::set_var("HAL_API_KEY", "");
+        assert!(!hal_key_available(), "empty var → unavailable");
+
+        std::env::set_var("HAL_API_KEY", "   ");
+        assert!(!hal_key_available(), "whitespace-only var → unavailable");
+
+        std::env::set_var("HAL_API_KEY", "hal_realkey");
+        assert!(hal_key_available(), "non-empty → available");
+
+        match prev {
+            Some(v) => std::env::set_var("HAL_API_KEY", v),
+            None => std::env::remove_var("HAL_API_KEY"),
+        }
+    }
+
+    /// M6.39.8: parser for HAL's `/scrape/v1/url` envelope. The
+    /// pipeline pulls just the `content` markdown out — the full
+    /// envelope (title, url, metadata, scraped_at) wraps it but
+    /// research only wants the body for sources/.
+    #[test]
+    fn extract_hal_content_pulls_markdown_field() {
+        // Build the envelope at runtime so escape sequences are real.
+        let envelope = serde_json::json!({
+            "url": "https://example.com",
+            "title": "Example",
+            "content": "# Example\n\nFull markdown body here.",
+            "metadata": {},
+            "scraped_at": "2026-05-09T10:00:00Z"
+        })
+        .to_string();
+        let extracted = extract_hal_content(&envelope).unwrap();
+        assert_eq!(extracted, "# Example\n\nFull markdown body here.");
+    }
+
+    #[test]
+    fn extract_hal_content_returns_none_on_empty_content() {
+        let envelope = serde_json::json!({"content": ""}).to_string();
+        assert!(extract_hal_content(&envelope).is_none());
+        let envelope_ws = serde_json::json!({"content": "   \n  "}).to_string();
+        assert!(extract_hal_content(&envelope_ws).is_none());
+    }
+
+    #[test]
+    fn extract_hal_content_returns_none_on_missing_field() {
+        let envelope = r#"{"url": "x", "title": "t"}"#;
+        assert!(extract_hal_content(envelope).is_none());
+    }
+
+    #[test]
+    fn extract_hal_content_returns_none_on_bad_json() {
+        assert!(extract_hal_content("not json").is_none());
+        assert!(extract_hal_content("").is_none());
     }
 
     #[test]

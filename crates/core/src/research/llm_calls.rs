@@ -56,6 +56,27 @@ pub struct Evaluation {
     pub notes: String,
 }
 
+/// M6.39.6: one row of the page plan returned by [`plan_pages`].
+/// LLM groups accumulated sources into a small number of these
+/// (entity / concept / comparison / how-to pages); the pipeline
+/// then writes one KMS page per row, parallel-synthesized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PagePlan {
+    /// Filesystem-safe slug, used as the page filename's stem and as
+    /// the cross-link target (`[[slug]]`). Lowercase ASCII alphanum
+    /// + hyphens.
+    pub slug: String,
+    /// Human-readable title, also used as link display text by
+    /// default in `[[slug|title]]`.
+    pub title: String,
+    /// 1-2 sentence description of what this page covers — feeds
+    /// the per-page synth prompt + becomes the index summary.
+    pub topic: String,
+    /// Citation indices (1-based) to include in this page. A source
+    /// can appear in multiple pages.
+    pub source_indices: Vec<u32>,
+}
+
 // ── Public API ───────────────────────────────────────────────────────
 
 /// Generate the first round of subtopics from a broad query + seed
@@ -126,6 +147,60 @@ pub async fn evaluate(
     let raw = oneshot(provider, model, prompt, timeout, cancel).await?;
     let (score, notes) = parse_score_and_notes(&raw);
     Ok(Evaluation { score, notes })
+}
+
+/// M6.39.6: plan a multi-page KMS write from accumulated sources.
+/// LLM groups sources into ≤ `max_pages` coherent topics (entity,
+/// concept, comparison, how-to, etc). Returns the page list ordered
+/// however the LLM emitted; the pipeline writes them as siblings
+/// inside the same research run with cross-links.
+///
+/// Falls back to a single "synthesis" page when JSON parsing fails —
+/// the loop never aborts on bad LLM output.
+pub async fn plan_pages(
+    provider: &dyn Provider,
+    model: &str,
+    query: &str,
+    sources: &[ResearchSource],
+    max_pages: u32,
+    timeout: Duration,
+    cancel: &CancelToken,
+) -> Result<Vec<PagePlan>> {
+    let prompt = build_plan_pages_prompt(query, sources, max_pages);
+    let raw = oneshot(provider, model, prompt, timeout, cancel).await?;
+    let plan = parse_page_plan(&raw, max_pages, sources.len() as u32);
+    if plan.is_empty() {
+        // Permissive fallback — produce a single page with all
+        // sources so the pipeline always has something to write.
+        Ok(vec![PagePlan {
+            slug: "synthesis".into(),
+            title: format!("Synthesis: {}", trim_for_title(query, 60)),
+            topic: format!("Combined research synthesis for: {query}"),
+            source_indices: (1..=sources.len() as u32).collect(),
+        }])
+    } else {
+        Ok(plan)
+    }
+}
+
+/// Synthesize one page from a multi-page plan. The LLM is told what
+/// other pages exist (so it can cross-link with `[[slug]]` syntax),
+/// what this page covers, and which sources to draw on. Returns the
+/// markdown body verbatim — the pipeline post-processes cross-links
+/// before writing to disk.
+pub async fn write_research_page(
+    provider: &dyn Provider,
+    model: &str,
+    query: &str,
+    this_page: &PagePlan,
+    all_pages: &[PagePlan],
+    sources: &[ResearchSource],
+    timeout: Duration,
+    cancel: &CancelToken,
+) -> Result<String> {
+    let prompt = build_write_research_page_prompt(query, this_page, all_pages, sources);
+    let raw = oneshot(provider, model, prompt, timeout, cancel).await?;
+    Ok(raw.trim().to_string())
 }
 
 /// Final markdown report synthesizing accumulated sources into a
@@ -245,6 +320,125 @@ fn build_evaluate_prompt(query: &str, sources: &[ResearchSource]) -> String {
          - What's missing or under-supported\n\
          - Specific subtopics worth searching next\n\n\
          Be honest about uncertainty — if claims aren't well-verified, say so and score lower.",
+    );
+    s
+}
+
+fn build_plan_pages_prompt(query: &str, sources: &[ResearchSource], max_pages: u32) -> String {
+    let mut s = String::new();
+    s.push_str(&format!(
+        "Original research query: {query}\n\n\
+         Accumulated sources ({} total):\n",
+        sources.len()
+    ));
+    for r in sources {
+        s.push_str(&format!(
+            "[{}] {} ({})\n   {}\n\n",
+            r.index,
+            r.title,
+            r.url,
+            snippet(&r.body, 300)
+        ));
+    }
+    s.push_str(&format!(
+        "Plan a KMS page layout that captures these findings.\n\n\
+         **Page count is a CEILING, not a target.** {} pages maximum — but \
+         output FEWER if the material doesn't naturally split that many ways. \
+         Forcing pages to fill a quota produces thin, repetitive pages that \
+         hurt the KMS more than they help. Common honest counts:\n\
+         - Narrow factual question → 1 page is fine (just one concept)\n\
+         - One entity with light surrounding context → 1-2 pages\n\
+         - Topic with a few distinct facets → 3-4 pages\n\
+         - Broad topic with multiple entities + comparisons → up to {0}\n\n\
+         Each page must cover ONE coherent thing. Pick the shape that fits:\n\
+         - **Entity** page: a person, organization, paper, product (slug = the entity name)\n\
+         - **Concept** page: a single idea / definition / mechanism\n\
+         - **Comparison** page: X vs Y\n\
+         - **How-to / Pattern** page: a procedure, recipe, or design pattern\n\
+         - **Timeline** page: chronological events\n\n\
+         Reject thin pages: if a candidate page would have <3 sources or \
+         repeats material covered better by another page in the plan, drop \
+         it. Granular pages with cross-links beat one mega-page; thin pages \
+         padded to hit a count are worse than either.\n\n\
+         Slug rules:\n\
+         - Lowercase ASCII alphanumeric + hyphens (`a-z`, `0-9`, `-`)\n\
+         - 2-5 words ideally\n\
+         - Stable: an entity gets the same slug across runs (e.g. `andrej-karpathy`)\n\n\
+         Output ONE JSON array, no commentary, no markdown code fence:\n\n\
+         [\n  \
+           {{\"slug\": \"...\", \"title\": \"...\", \"topic\": \"...\", \"source_indices\": [1, 3, 7]}},\n  \
+           ...\n\
+         ]\n\n\
+         A source can appear in multiple pages if relevant. `topic` is \
+         1-2 sentences describing what the page covers — it becomes the \
+         KMS index summary so make it informative.",
+        max_pages
+    ));
+    s
+}
+
+fn build_write_research_page_prompt(
+    query: &str,
+    this_page: &PagePlan,
+    all_pages: &[PagePlan],
+    sources: &[ResearchSource],
+) -> String {
+    let mut s = String::new();
+    s.push_str(&format!(
+        "You are writing ONE page in a multi-page research output for the \
+         original query: {query}\n\n\
+         === This page ===\n\
+         Slug: {}\n\
+         Title: {}\n\
+         Covers: {}\n\n",
+        this_page.slug, this_page.title, this_page.topic
+    ));
+    if all_pages.len() > 1 {
+        s.push_str(
+            "=== Other pages in this run (cross-link with `[[slug]]` or `[[slug|display]]`) ===\n",
+        );
+        for p in all_pages {
+            if p.slug == this_page.slug {
+                continue;
+            }
+            s.push_str(&format!("- [[{}]] — {} — {}\n", p.slug, p.title, p.topic));
+        }
+        s.push('\n');
+    }
+    let cited: std::collections::HashSet<u32> = this_page.source_indices.iter().copied().collect();
+    s.push_str("=== Sources to use (cite as [N]) ===\n");
+    for r in sources {
+        if !cited.contains(&r.index) {
+            continue;
+        }
+        s.push_str(&format!(
+            "[{}] {} ({})\n   {}\n\n",
+            r.index,
+            r.title,
+            r.url,
+            snippet(&r.body, 600)
+        ));
+    }
+    s.push_str(
+        "Write the page body as Markdown:\n\
+         - **Lead with a 1-2 sentence ABSTRACT** as the very first prose line, \
+         BEFORE any `##` subtopic headings, before any list bullets, before any \
+         blockquotes. The abstract names the topic + key finding in one self-\
+         contained sentence. It becomes the KMS index summary; make it informative.\n\
+         - Do NOT start with a heading (no `# Title` / `## Overview`) — start \
+         directly with prose.\n\
+         - After the abstract, use `##` headings to organize subtopics.\n\
+         - Inline `[N]` citations after every factual claim.\n\
+         - Cross-link to OTHER PAGES with `[[slug]]` or `[[slug|display text]]` \
+         when this page mentions an entity / concept that has its own page in \
+         the list above. Don't force it — only link when the reference is \
+         genuinely useful to a future reader.\n\
+         - **Do NOT write a `## Sources` section yourself** — the pipeline \
+         appends a canonical Sources section automatically based on which \
+         `[N]` you cited, so any manual one would be replaced. Just use `[N]` \
+         inline citations and stop.\n\
+         - Answer in the same language as the original query.\n\n\
+         Output ONLY the markdown body — no preamble, no JSON, no commentary.",
     );
     s
 }
@@ -481,6 +675,104 @@ fn snippet(body: &str, max: usize) -> String {
     }
 }
 
+fn trim_for_title(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars - 1).collect();
+    out.push('…');
+    out
+}
+
+/// Parse a `[ {...}, {...} ]`-shaped JSON page plan out of the LLM's
+/// response. The LLM is told to emit ONE JSON array, no markdown code
+/// fence, but real models do all sorts of things — wrap in ```json
+/// fences, prepend "Here's the plan:", emit nested arrays. This
+/// function:
+/// 1. Finds the first `[` and last `]` in the response.
+/// 2. Tries to parse that slice as JSON.
+/// 3. If parse fails, returns empty (caller falls back to single page).
+/// 4. For each entry, normalizes slug (sanitize), title (trim),
+///    source_indices (filter to range 1..=source_count, dedupe).
+/// 5. Drops entries with empty slug AFTER normalization, or with
+///    no source_indices.
+/// 6. Caps total page count at `max_pages`.
+fn parse_page_plan(raw: &str, max_pages: u32, source_count: u32) -> Vec<PagePlan> {
+    use serde::Deserialize;
+    let Some(start) = raw.find('[') else {
+        return Vec::new();
+    };
+    let Some(end) = raw.rfind(']') else {
+        return Vec::new();
+    };
+    if end <= start {
+        return Vec::new();
+    }
+    let slice = &raw[start..=end];
+
+    #[derive(Deserialize)]
+    struct RawPage {
+        #[serde(default)]
+        slug: String,
+        #[serde(default)]
+        title: String,
+        #[serde(default)]
+        topic: String,
+        #[serde(default)]
+        source_indices: Vec<u32>,
+    }
+    let parsed: Vec<RawPage> = match serde_json::from_str(slice) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut out: Vec<PagePlan> = Vec::new();
+    let mut seen_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for p in parsed {
+        let slug = sanitize_slug(&p.slug);
+        if slug.is_empty() || slug == "research" {
+            // sanitize_slug returns "research" as a fallback for
+            // unparseable input; that's not a real entity, skip.
+            continue;
+        }
+        if !seen_slugs.insert(slug.clone()) {
+            // LLM emitted duplicate slug — skip second occurrence.
+            continue;
+        }
+        let title = if p.title.trim().is_empty() {
+            slug.clone()
+        } else {
+            p.title.trim().to_string()
+        };
+        let topic = if p.topic.trim().is_empty() {
+            String::new()
+        } else {
+            p.topic.trim().to_string()
+        };
+        // Filter source_indices to valid 1-based range; dedupe.
+        let mut indices: Vec<u32> = p
+            .source_indices
+            .into_iter()
+            .filter(|i| *i >= 1 && *i <= source_count)
+            .collect();
+        indices.sort_unstable();
+        indices.dedup();
+        if indices.is_empty() {
+            continue;
+        }
+        out.push(PagePlan {
+            slug,
+            title,
+            topic,
+            source_indices: indices,
+        });
+        if out.len() >= max_pages as usize {
+            break;
+        }
+    }
+    out
+}
+
 // ── Provider oneshot wrapper ────────────────────────────────────────
 
 /// Drive a single LLM call to completion: build a `StreamRequest` with
@@ -688,6 +980,140 @@ mod tests {
     #[test]
     fn snippet_passes_through_short_strings() {
         assert_eq!(snippet("short", 100), "short");
+    }
+
+    // ── plan_pages prompt directives ───────────────────────────────
+
+    /// M6.39.6: pin the "ceiling not target" framing of max_pages so a
+    /// future "smooth out the wording" refactor can't regress to the
+    /// original "Output N pages" form. User reported the LLM was
+    /// over-splitting topics to fill the quota — page count must be
+    /// honest about source density, not a target.
+    #[test]
+    fn plan_pages_prompt_treats_max_as_ceiling_not_target() {
+        let sources = vec![ResearchSource {
+            index: 1,
+            title: "T".into(),
+            url: "https://x.example".into(),
+            body: "b".into(),
+        }];
+        let prompt = build_plan_pages_prompt("q", &sources, 5);
+        let lower = prompt.to_ascii_lowercase();
+        assert!(
+            lower.contains("ceiling, not a target"),
+            "prompt must frame max_pages as a ceiling"
+        );
+        assert!(
+            lower.contains("output fewer"),
+            "prompt must explicitly permit fewer pages"
+        );
+        // "Reject thin pages" rule guards against quota-padding.
+        assert!(
+            lower.contains("reject thin pages"),
+            "prompt must forbid thin pages padded to hit count"
+        );
+        // The numeric ceiling is still mentioned (was 5 in this test).
+        assert!(prompt.contains("5 pages maximum"));
+    }
+
+    // ── plan_pages JSON parser ─────────────────────────────────────
+
+    #[test]
+    fn parse_page_plan_basic() {
+        let raw = r#"[
+            {"slug": "concept", "title": "Concept", "topic": "Core idea", "source_indices": [1, 2]},
+            {"slug": "karpathy", "title": "Karpathy", "topic": "About him", "source_indices": [3]}
+        ]"#;
+        let plan = parse_page_plan(raw, 7, 5);
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].slug, "concept");
+        assert_eq!(plan[0].source_indices, vec![1, 2]);
+        assert_eq!(plan[1].slug, "karpathy");
+    }
+
+    #[test]
+    fn parse_page_plan_strips_markdown_fence() {
+        // Real models often wrap JSON in ```json ... ``` despite the
+        // "no code fence" instruction. The first `[` and last `]`
+        // anchor the parse, so the fence prefix/suffix is harmless.
+        let raw = "Here's the plan:\n```json\n[{\"slug\":\"foo\",\"title\":\"Foo\",\"topic\":\"a\",\"source_indices\":[1]}]\n```\nDone.";
+        let plan = parse_page_plan(raw, 7, 5);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].slug, "foo");
+    }
+
+    #[test]
+    fn parse_page_plan_caps_at_max_pages() {
+        let raw = r#"[
+            {"slug":"a","title":"A","topic":"","source_indices":[1]},
+            {"slug":"b","title":"B","topic":"","source_indices":[1]},
+            {"slug":"c","title":"C","topic":"","source_indices":[1]},
+            {"slug":"d","title":"D","topic":"","source_indices":[1]}
+        ]"#;
+        let plan = parse_page_plan(raw, 2, 5);
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].slug, "a");
+        assert_eq!(plan[1].slug, "b");
+    }
+
+    #[test]
+    fn parse_page_plan_filters_invalid_source_indices() {
+        // Sources have indices 1..=3; LLM emits 5 (out of range)
+        // and 0 (invalid). Both filtered.
+        let raw = r#"[
+            {"slug":"a","title":"A","topic":"","source_indices":[1, 0, 5, 2]}
+        ]"#;
+        let plan = parse_page_plan(raw, 7, 3);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].source_indices, vec![1, 2]);
+    }
+
+    #[test]
+    fn parse_page_plan_dedupes_slugs() {
+        let raw = r#"[
+            {"slug":"foo","title":"Foo","topic":"","source_indices":[1]},
+            {"slug":"foo","title":"Foo Again","topic":"","source_indices":[2]}
+        ]"#;
+        let plan = parse_page_plan(raw, 7, 3);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].title, "Foo");
+    }
+
+    #[test]
+    fn parse_page_plan_drops_pages_with_no_sources() {
+        let raw = r#"[
+            {"slug":"a","title":"A","topic":"","source_indices":[]},
+            {"slug":"b","title":"B","topic":"","source_indices":[1]}
+        ]"#;
+        let plan = parse_page_plan(raw, 7, 3);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].slug, "b");
+    }
+
+    #[test]
+    fn parse_page_plan_returns_empty_on_bad_json() {
+        assert!(parse_page_plan("totally not json", 7, 3).is_empty());
+        assert!(parse_page_plan("", 7, 3).is_empty());
+        assert!(parse_page_plan("[ malformed ]", 7, 3).is_empty());
+    }
+
+    #[test]
+    fn parse_page_plan_normalizes_slug() {
+        // sanitize_slug lowercases + kebab-cases
+        let raw =
+            r#"[{"slug":"Andrej Karpathy","title":"Karpathy","topic":"","source_indices":[1]}]"#;
+        let plan = parse_page_plan(raw, 7, 3);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].slug, "andrej-karpathy");
+    }
+
+    #[test]
+    fn parse_page_plan_skips_unparseable_slug_fallback() {
+        // sanitize_slug returns "research" for non-ASCII-only input;
+        // that's a meaningless fallback, not a real page topic.
+        let raw = r#"[{"slug":"ค้นหา","title":"X","topic":"","source_indices":[1]}]"#;
+        let plan = parse_page_plan(raw, 7, 3);
+        assert!(plan.is_empty());
     }
 
     /// M6.39.5: pin the synthesize prompt's "lead with abstract"

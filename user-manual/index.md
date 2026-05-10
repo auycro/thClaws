@@ -27,8 +27,9 @@ teams.
 | 16 | [Plugins](ch16-plugins.md) |
 | 17 | [Agent teams](ch17-agent-teams.md) |
 | 19 | [Scheduling](ch19-scheduling.md) |
+| 20 | [Background research (`/research`)](ch20-research.md) |
 
-> **Part II — Case studies (chapters 18, 20–24)** — applied walkthroughs
+> **Part II — Case studies (chapters 21–24)** — applied walkthroughs
 > for building real projects with thClaws (static sites, Node.js apps,
 > AI agents, deploying to Agentic Press) are in active development and
 > will be added to this manual as each is reviewed and ready.

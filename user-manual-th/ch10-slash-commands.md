@@ -98,6 +98,20 @@ Slash commands คือ control plane ของ thClaws พิมพ์ `/` ต
 
 แนวคิดและเวิร์กโฟลว์ KMS ฉบับเต็มอยู่ใน [บทที่ 9](ch09-knowledge-bases-kms.md) รวมถึง flow ของ `/dream`
 
+### Background research
+
+| คำสั่ง | ทำอะไร |
+|---|---|
+| `/research <query>` | spawn งาน research background — multi-iteration web search + multi-page KMS write |
+| `/research [--kms NAME] [--max-pages N] [--max-iter K] [--score-threshold 0.X] [--budget-time T] <query>` | เริ่มพร้อม override |
+| `/research` (หรือ `/research list`) | list ทุก job (newest first) |
+| `/research status ID` | detail (phase, iteration, score) |
+| `/research show ID` | print synthesized result ใน chat |
+| `/research cancel ID` | cancel job ที่รัน; partial result ทิ้ง |
+| `/research wait ID` | block CLI prompt จน terminal (CLI-only) |
+
+ดู [บทที่ 20](ch20-research.md) สำหรับ pipeline ฉบับเต็ม + KMS layout + flag reference
+
 ### พฤติกรรม Agent
 
 | Command | ทำอะไร |
