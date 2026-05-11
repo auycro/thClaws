@@ -113,10 +113,12 @@ pub enum ProviderKind {
     OpenAICompat,
     DeepSeek,
     ThaiLLM,
+    Nvidia,
+    Minimax,
 }
 ```
 
-17 variants. `ALL: &'static [Self]` lists them in display order for the Settings UI. Every helper method below (`name`, `default_model`, `endpoint_env`, `default_endpoint`, `endpoint_user_configurable`, `api_key_env`, `resolve_alias_for_provider`) is a `match` over the full enum — adding a variant means updating every method, and the compiler enforces it.
+19 variants. `ALL: &'static [Self]` lists them in display order for the Settings UI. Every helper method below (`name`, `default_model`, `endpoint_env`, `default_endpoint`, `endpoint_user_configurable`, `api_key_env`, `resolve_alias_for_provider`) is a `match` over the full enum — adding a variant means updating every method, and the compiler enforces it.
 
 ### Catalogue table
 
@@ -136,6 +138,8 @@ pub enum ProviderKind {
 | `OpenAICompat` | OpenAI Chat | `oai/gpt-4o-mini` | `oai/` | `OPENAI_COMPAT_API_KEY` | `OPENAI_COMPAT_BASE_URL` | localhost:8000/v1 | yes |
 | `DeepSeek` | OpenAI Chat | `deepseek-v4-flash` | `deepseek-` | `DEEPSEEK_API_KEY` | `DEEPSEEK_BASE_URL` | api.deepseek.com/v1 | no |
 | `ThaiLLM` | OpenAI Chat | `thaillm/OpenThaiGPT-ThaiLLM-8B-Instruct-v7.2` | `thaillm/` | `THAILLM_API_KEY` | `THAILLM_BASE_URL` | thaillm.or.th/api/v1 | no |
+| `Nvidia` | OpenAI Chat | `nvidia/nvidia/nemotron-3-super-120b-a12b` | `nvidia/` | `NVIDIA_API_KEY` | `NVIDIA_BASE_URL` | integrate.api.nvidia.com/v1 | no |
+| `Minimax` | OpenAI Chat | `minimax/MiniMax-M2` | `minimax/` | `MINIMAX_API_KEY` | `MINIMAX_BASE_URL` | api.minimax.io/v1 | no |
 | `Gemini` | Google Gemini | `gemini-2.5-flash` | `gemini-`/`gemma-` | `GEMINI_API_KEY` | — | generativelanguage.googleapis.com (fixed) | no |
 | `Ollama` | Ollama NDJSON | `ollama/llama3.2` | `ollama/` | none | `OLLAMA_BASE_URL` | http://localhost:11434 | yes |
 | `OllamaCloud` | Ollama NDJSON | `ollama-cloud/deepseek-v4-flash` | `ollama-cloud/` | `OLLAMA_CLOUD_API_KEY` | — | ollama.com (fixed) | no |

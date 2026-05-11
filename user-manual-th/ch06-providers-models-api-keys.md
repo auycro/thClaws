@@ -21,6 +21,12 @@ thClaws คุยกับ **provider ได้ทั้งหมดสิบส
 | DashScope | `qwen-*`, `qwq-*` | `DASHSCOPE_API_KEY` | Qwen ของ Alibaba; caching อัตโนมัติ |
 | DeepSeek | `deepseek-*` | `DEEPSEEK_API_KEY` (+ `DEEPSEEK_BASE_URL`) | สาย V4: `deepseek-v4-flash`, `deepseek-v4-pro` ส่วน alias เดิม `deepseek-chat` / `deepseek-reasoner` ยังใช้ได้ในระดับ wire |
 | ThaiLLM (สวทช.) | `thaillm/*` | `THAILLM_API_KEY` | aggregator ที่ `thaillm.or.th` รวม model 8B ภาษาไทยสี่ตัว (OpenThaiGPT, Typhoon-S, Pathumma, THaLLE) มี alias (case-insensitive): `openthaigpt`, `typhoon`, `pathumma`, `thalle` |
+| Z.ai | `zai/*` | `ZAI_API_KEY` (+ `ZAI_BASE_URL`) | Endpoint GLM Coding Plan ที่ `api.z.ai` ค่า default `zai/glm-4.6` ตัวล่าสุด `zai/glm-5.1` (context 202K) เพิ่มใน v0.8.5 ใช้ `ZAI_BASE_URL` override สำหรับ BigModel SKU ที่ `open.bigmodel.cn` |
+| MiniMax | `minimax/*` | `MINIMAX_API_KEY` (+ `MINIMAX_BASE_URL`) | Endpoint สากลที่ `api.minimax.io` รุ่น: `minimax/MiniMax-M2` (200K/131K — flagship, default), `minimax/MiniMax-M1` (context 1M), `minimax/abab7-chat-preview` ผู้ใช้แพลตฟอร์มจีน (`api.minimax.chat`) ต้อง override `MINIMAX_BASE_URL` (auth scheme ต่างกัน — YMMV) เพิ่มใน v0.8.5 |
+| Ollama Cloud | `ollama-cloud/*` | `OLLAMA_CLOUD_API_KEY` | Catalog Ollama แบบ hosted (Kimi, GPT-OSS, DeepSeek, Llama ฯลฯ) เป็น OpenAI-compatible ที่ `ollama.com/v1` |
+| NVIDIA NIM | `nvidia/*` | `NVIDIA_API_KEY` (+ `NVIDIA_BASE_URL`) | NVIDIA hosted inference ที่ `integrate.api.nvidia.com/v1` ครอบคลุม Nemotron, Llama, DeepSeek, GLM และอื่น ๆ — prefix `nvidia/` route ทุกตัว ระบบจะตัด prefix ก่อนยิง wire ใช้ env var override สำหรับ on-prem NIM |
+| LMStudio | `lmstudio/*` | — (local) | LMStudio server บน local ที่ `localhost:1234/v1` (OpenAI-compatible) ไม่ต้อง auth model ตามที่โหลดไว้ในแอป LMStudio |
+| Azure AI Foundry | `azure/<deployment>` | `AZURE_AI_FOUNDRY_API_KEY` (+ `AZURE_AI_FOUNDRY_ENDPOINT`) | Deployment Azure แบบ Anthropic-Messages-shaped ใส่ `<deployment>` ตามชื่อใน Azure ไม่มี default (ตั้งต่อ subscription) |
 
 ค่าเริ่มต้นครั้งแรกคือ `claude-sonnet-4-6` เปลี่ยนได้ด้วย
 `--model` ที่ command line หรือบันทึกลง `settings.json`

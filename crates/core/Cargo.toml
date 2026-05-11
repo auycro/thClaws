@@ -1,9 +1,20 @@
 [package]
 name = "thclaws-core"
-version = "0.8.5"
+version = "0.8.7"
 edition = "2021"
 description = "thClaws — native Rust AI agent workspace with CLI and desktop GUI."
 license = "MIT OR Apache-2.0"
+
+# M6.40: Windows MSI installer config consumed by `cargo-wix`. Tells
+# the WiX build which crate target binary to wrap (`thclaws`, not
+# `thclaws-cli`/etc) so the .wxs `$(var.CargoTargetBinDir)\thclaws.exe`
+# placeholder resolves to the GUI build. CI invokes:
+#   cargo wix --no-build --bin thclaws --target x86_64-pc-windows-msvc \
+#             --output dist/<archive>.msi
+# after `cargo build --release --features gui`.
+[package.metadata.wix]
+name = "thClaws"
+no-build = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

@@ -223,6 +223,16 @@ async fn main() {
     load_dotenv();
     let _ = Sandbox::init();
 
+    // M6.45 / #79-followup: warn if there are additional thclaws
+    // copies elsewhere on PATH. On Windows pairs with the MSI's
+    // Part="first" PATH addition (which makes the new install win
+    // PATH-search regardless of older entries) — this surfaces the
+    // duplicates so the user can clean them up. On macOS/Linux,
+    // catches version mismatch (e.g. /usr/local/bin/thclaws +
+    // /opt/homebrew/bin/thclaws after a brew migration). Not gated
+    // on any mode (CLI / GUI / --serve / --print).
+    warn_about_stale_binaries();
+
     // Org policy file enforcement (Enterprise Edition foundation).
     // Runs before CLI parse so a fail-closed refusal happens identically
     // whether the user invoked GUI, CLI, or print mode. Open-core builds
@@ -660,4 +670,76 @@ fn run_schedule_subcommand(cmd: ScheduleCmd) -> i32 {
             }
         }
     }
+}
+
+/// M6.45 / #79-followup: scan PATH for additional thclaws copies
+/// and warn the user. Cross-platform: Windows looks for `thclaws.exe`,
+/// Mac/Linux for `thclaws`; PATH is split via `std::env::split_paths`
+/// which handles `;` (Windows) vs `:` (Unix) correctly.
+///
+/// On Windows the MSI's `Part="first"` PATH addition guarantees the
+/// new install wins PATH-search — this function is informational,
+/// nudging the user to clean up stale copies (e.g. the manual
+/// `C:\tools\thclaws.exe` from before the installer existed).
+///
+/// On macOS / Linux there's no installer-side PATH manipulation so
+/// PATH order is whatever the user set — the warning catches version
+/// mismatch when multiple manual / brew installs coexist (e.g.
+/// `/usr/local/bin/thclaws` + `/opt/homebrew/bin/thclaws`).
+fn warn_about_stale_binaries() {
+    #[cfg(windows)]
+    const BIN_NAME: &str = "thclaws.exe";
+    #[cfg(not(windows))]
+    const BIN_NAME: &str = "thclaws";
+    #[cfg(windows)]
+    const RM_HINT: &str = "del \"<path-above>\"";
+    #[cfg(not(windows))]
+    const RM_HINT: &str = "rm <path-above>";
+
+    let Ok(current_exe) = std::env::current_exe() else {
+        return;
+    };
+    let current_canon = std::fs::canonicalize(&current_exe).ok();
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return;
+    };
+
+    let mut duplicates: Vec<std::path::PathBuf> = Vec::new();
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(BIN_NAME);
+        if !candidate.is_file() {
+            continue;
+        }
+        let canon = match std::fs::canonicalize(&candidate) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        // Skip if same file as we're running (covers symlinks too —
+        // a symlink in /usr/local/bin pointing at the .app bundle
+        // binary canonicalizes to the same path as current_exe).
+        if let Some(curr) = &current_canon {
+            if &canon == curr {
+                continue;
+            }
+        }
+        if !duplicates.iter().any(|p| p == &canon) {
+            duplicates.push(canon);
+        }
+    }
+    if duplicates.is_empty() {
+        return;
+    }
+    eprintln!(
+        "\x1b[33m[thclaws] warning: {} additional {} install(s) found on PATH:\x1b[0m",
+        duplicates.len(),
+        BIN_NAME
+    );
+    eprintln!("  running:  {}", current_exe.display());
+    for d in &duplicates {
+        eprintln!("  also at:  {}", d.display());
+    }
+    eprintln!(
+        "\x1b[33m[thclaws] only the first one on PATH is invoked when you type `thclaws`. The other copies still take ~17 MB each.\nTo clean up:  {}\x1b[0m",
+        RM_HINT
+    );
 }

@@ -93,9 +93,10 @@ tried first.
 | `/kms use NAME` | Attach a KMS to this project's chats |
 | `/kms off NAME` | Detach a KMS |
 | `/kms show NAME` | Print the KMS's `index.md` |
+| `/kms html NAME [OUT]` | Generate a single-file interactive HTML site from a KMS (v0.8.5+). Agent reads the KMS via tools, designs components, writes `<OUT>/index.html` (default `./<NAME>-site/`) in your workspace |
 | `/dream [FOCUS]` | Consolidate the project's KMS by mining recent sessions (GUI-only, dispatches a built-in side-channel agent) |
 
-See [Chapter 9](ch09-knowledge-bases-kms.md) for the full KMS concept + workflow, including the `/dream` consolidation flow.
+See [Chapter 9](ch09-knowledge-bases-kms.md) for the full KMS concept + workflow, including the `/kms html` HTML export, graph view, and the `/dream` consolidation flow.
 
 ### Background research
 

@@ -600,6 +600,53 @@ Subagents and slash commands write specific patterns into your KMS. When you fin
 | Stub page in `pages/<alias>.md` ending with `_Replace this stub with a curated summary..._` | `/kms ingest` (file/URL/PDF) | Raw source landed in `sources/<alias>.<ext>`; this stub points at it. Enrich via natural prompting or `KmsWrite`. |
 | `## [date] verb \| <alias>` line in `log.md` | All KMS write operations | Append-only change log. Greppable: `grep "^## \[" log.md \| tail -20` for recent activity. |
 
+## Browse, graph, and HTML export (v0.8.5+)
+
+KMS gained three browse-time surfaces in v0.8.5 — all in the Desktop GUI, none change the underlying file format.
+
+### KMS browser sidebar
+
+Click the title of any KMS in the left sidebar (not the checkbox) and a 260-px panel slides in on the right edge listing every page and source archive. Clicking a file opens the in-app viewer over the main content tab. Tabs underneath stay mounted so xterm / chat state is preserved. Closing the browser, switching tabs, or hitting `ESC` returns you to the active tab.
+
+The viewer renders Markdown via `marked`, with custom CSS for editorial-style typography: heading borders, accent-tinted blockquotes, bordered tables with zebra stripes, and three link styles — external (solid underline), internal `[[wikilinks]]` (dotted underline + accent pill), and inline citation chips `[N]` (small rounded pill).
+
+### Obsidian-style graph view
+
+The browser sidebar has a "Graph View" button above the page list. Clicking it replaces the main pane with a force-directed graph: pages are circles, `[[wikilinks]]` are edges, and an "Include sources" checkbox (default on) adds source archives as muted diamond nodes connected to the pages that cite them.
+
+- Drag empty space to pan; mouse wheel to zoom around the cursor.
+- Drag a node to reposition it — it pins to the mouse, neighbors react via spring forces.
+- Click a node to open the file in the viewer.
+- Hover highlights the node + its connected neighbors; everything else dims.
+- Force simulation auto-stops once the layout settles (annealed damping; cap ~3 s).
+
+### `/kms html NAME [OUT]` — single-file interactive site
+
+Generates a self-contained HTML site from a KMS's pages and writes it to your workspace (default `./<NAME>-site/index.html`). Unlike the in-app viewer, this is a **derived artifact** you can share, commit to git, host on S3, or hand to colleagues — it has no thClaws dependency.
+
+The agent runs a three-phase workflow:
+
+1. **Explore** — `KmsRead` an index/manifest if one exists, then `KmsSearch` to enumerate page slugs. Reads 4–8 representative pages to understand the content style. Source files stay closed by default — citations alone don't justify reading.
+2. **Design components** — sketches a component vocabulary in chat as plain prose: site shell, page reader, navigation, citation chip, wikilink chip, etc. Picks design tokens (typography, accent color, dark mode). Prints the sketch so you can ⌃C if it's going off course.
+3. **Assemble** — reads remaining pages, writes one `index.html` containing inlined `<style>`, inlined `<script>` with hash-routing for multi-view (`#/`, `#/page/<slug>`), and a JSON data island with every page body + frontmatter. Citations render as plain `[N]` markers; pages are the substance of the site.
+
+Hard rules the prompt enforces:
+
+- Single file. No external CSS/JS, no CDN, no `fetch`. Double-click-to-open works offline.
+- Pages are primary content; source bodies are NOT embedded.
+- Multi-view via hash routing so deep links work.
+- Plain HTML + CSS + vanilla JS — no frameworks.
+
+Customize the output dir with the second positional argument:
+
+```
+/kms html llm-wiki              # → ./llm-wiki-site/index.html
+/kms html llm-wiki ../shareable # → ../shareable/index.html (relative to cwd)
+/kms html llm-wiki /tmp/site    # → /tmp/site/index.html
+```
+
+The agent uses your active session model (commonly Opus / GPT-4.1 / Sonnet 4.6 — long-context models work best because the agent embeds every page body in the JSON island).
+
 ## Scaling limits and future direction
 
 KMS is intentionally embedding-free:

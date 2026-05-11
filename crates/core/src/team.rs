@@ -1264,7 +1264,11 @@ impl Tool for SpawnTeammateTool {
             "properties": {
                 "name": {"type": "string", "description": "Agent name (from TeamCreate)"},
                 "prompt": {"type": "string", "description": "Initial task/instructions"},
-                "cwd": {"type": "string", "description": "Working directory"}
+                "cwd": {"type": "string", "description": "Working directory"},
+                "model": {
+                    "type": "string",
+                    "description": "Optional model override for this teammate (e.g. 'gpt-4o', 'openrouter/anthropic/claude-sonnet-4-6', 'minimax/MiniMax-M2'). Lets a single team mix providers — e.g. lead on Anthropic, researcher on Gemini, coder on OpenAI. Requires the corresponding API key to be configured (`/api-key set <provider>` or env var); SpawnTeammate pre-flights and refuses if the key is missing. Falls back to the persistent agent-def model (`.thclaws/agents/<name>.md` frontmatter) when not set, then to the lead session's default."
+                }
             },
             "required": ["name", "prompt"]
         })
@@ -1276,6 +1280,43 @@ impl Tool for SpawnTeammateTool {
         let name = crate::tools::req_str(&input, "name")?;
         let prompt = crate::tools::req_str(&input, "prompt")?;
         let cwd = input.get("cwd").and_then(Value::as_str);
+        // Trim + drop empty so an LLM passing `"model": ""` (or only
+        // whitespace) is treated as "not specified" and falls through
+        // to agent_def / config default rather than tripping the
+        // "doesn't map to any known provider" pre-flight error.
+        let runtime_model = input
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        // M6.44 / #79: pre-flight auth check for cross-provider spawn.
+        // If the runtime model maps to a provider whose API key isn't
+        // configured (neither keychain nor env var), bail before any
+        // side effects (mailbox init, worktree creation, subprocess
+        // launch). The teammate would otherwise spawn, fail at first
+        // turn with a 401, and exit silently — frustrating to debug.
+        if let Some(ref m) = runtime_model {
+            if let Some(kind) = crate::providers::ProviderKind::detect(m) {
+                if !kind.has_key_available() {
+                    let env = kind
+                        .api_key_env()
+                        .map(|e| format!(" (env var: {e})"))
+                        .unwrap_or_default();
+                    return Err(Error::Tool(format!(
+                        "SpawnTeammate model '{m}' routes to provider '{}'{env} but no API key is configured for that provider. \
+                         Run `/api-key set {}` (CLI) or set the env var, then retry.",
+                        kind.name(),
+                        kind.name()
+                    )));
+                }
+            } else {
+                return Err(Error::Tool(format!(
+                    "SpawnTeammate model '{m}' doesn't map to any known provider — check the model id (e.g. 'gpt-4o', 'claude-sonnet-4-6', 'minimax/MiniMax-M2')"
+                )));
+            }
+        }
 
         // M6.34 TEAM1: reject before any side effects (worktree creation,
         // file writes, subprocess spawn). Pre-fix `name = "../foo"` would
@@ -1353,18 +1394,14 @@ impl Tool for SpawnTeammateTool {
             shell_escape(&team_dir),
         );
 
-        // Agent def model override. Resolution rules:
-        //   - Full model id (contains a dash, e.g. "claude-sonnet-4-6",
-        //     "gpt-4o"): pass through as-is.
-        //   - Short alias (e.g. "sonnet", "opus", "flash"): resolve within
-        //     the project's CURRENT provider via resolve_alias_for_provider.
-        //     This keeps the team on the user's chosen provider — without it,
-        //     the global resolve_alias would surprise-switch a teammate to
-        //     native Anthropic even if the project is on OpenRouter.
-        //   - Alias that doesn't fit the current provider (e.g. "sonnet"
-        //     when provider=ollama): warn and skip — fall back to the
-        //     teammate's default config resolution.
-        if let Some(def) = agent_def {
+        // Model override resolution — precedence:
+        //   1. SpawnTeammate input `model:` (per-spawn explicit choice,
+        //      pre-flighted for auth above) — wins
+        //   2. Agent def `model:` frontmatter from .thclaws/agents/<name>.md
+        //   3. Lead session config default (no flag)
+        if let Some(ref m) = runtime_model {
+            agent_cmd.push_str(&format!(" --model {}", shell_escape(m)));
+        } else if let Some(def) = agent_def {
             if let Some(ref model) = def.model {
                 if model.contains('-') {
                     // M6.34 TEAM2: escape — model strings from agent_def

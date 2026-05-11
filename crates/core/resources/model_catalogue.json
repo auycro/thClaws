@@ -2697,6 +2697,18 @@
           "source": "https://platform.minimaxi.com/document/abab",
           "verified_at": "2026-05-10"
         },
+        "minimax/MiniMax-M2.7": {
+          "context": 204800,
+          "max_output": 131072,
+          "source": "https://platform.minimaxi.com/document (specs assumed = M2 baseline; #79)",
+          "verified_at": "2026-05-11"
+        },
+        "minimax/MiniMax-M2.5": {
+          "context": 204800,
+          "max_output": 131072,
+          "source": "https://platform.minimaxi.com/document (specs assumed = M2 baseline; #79)",
+          "verified_at": "2026-05-11"
+        },
         "minimax/MiniMax-M2": {
           "context": 204800,
           "max_output": 131072,

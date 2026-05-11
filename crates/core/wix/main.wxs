@@ -1,0 +1,170 @@
+<?xml version="1.0" encoding="windows-1252"?>
+<!--
+  WiX 3.x installer source for thClaws (M6.40 - Windows MSI + DigiCert
+  KeyLocker code signing, Phase 1).
+
+  Built via cargo-wix in CI after the release binary has already
+  been compiled and signed. The signed thclaws.exe is then wrapped
+  in this MSI and the MSI itself is re-signed before upload.
+
+  ## Identifiers
+
+   * Upgrade code (UPGRADECODE) - never change. Stable across every
+     version forever. Lets Windows Installer recognise that a new
+     MSI is an in-place upgrade of an existing install rather than
+     a side-by-side product.
+   * Product code (Product/@Id) - auto-generated per-version via *
+     so cargo-wix substitutes a fresh GUID for every build.
+   * Component GUIDs - auto-generated via * as well; safe because
+     each component has a single keypath file.
+
+  ## What this installer does
+
+  1. Drops thclaws.exe into C:\Program Files\thClaws\bin\
+  2. Adds bin\ to the per-machine PATH so users can invoke thclaws
+     from any shell after install
+  3. Creates a Start Menu shortcut to thclaws.exe
+  4. Registers in Programs and Features for clean uninstall
+
+  Per-machine install (requires Admin) is intentional - matches
+  what most CLI tools (gh, node, python) on Windows do, and lets a
+  single install serve every user on the box.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product
+      Name="thClaws"
+      Manufacturer="thClaws"
+      Id="*"
+      UpgradeCode="1E7AF441-9BFD-40B3-A3B6-72F3D4C42313"
+      Language="1033"
+      Codepage="1252"
+      Version="$(var.Version)">
+
+    <Package
+        Id="*"
+        Keywords="Installer"
+        Description="thClaws — native Rust AI agent workspace"
+        Manufacturer="thClaws"
+        InstallerVersion="450"
+        Languages="1033"
+        Compressed="yes"
+        InstallScope="perMachine"
+        SummaryCodepage="1252" />
+
+    <MajorUpgrade
+        Schedule="afterInstallInitialize"
+        DowngradeErrorMessage="A newer version of thClaws is already installed. Uninstall it first if you really want to downgrade." />
+
+    <Media Id="1" Cabinet="media1.cab" EmbedCab="yes" DiskPrompt="CD-ROM #1" />
+    <Property Id="DiskPrompt" Value="thClaws Installation" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder" Name="PFiles">
+        <Directory Id="APPLICATIONFOLDER" Name="thClaws">
+          <Directory Id="Bin" Name="bin">
+            <Component Id="Path" Guid="*">
+              <!-- Per-machine PATH addition. Component KeyPath cannot
+                   be a Directory when Guid="*" (WiX LGHT0230), so we
+                   add a tiny RegistryValue under HKLM\Software\thClaws
+                   as the keypath. Uninstall drops both the registry
+                   entry and the PATH addition. -->
+              <RegistryValue
+                  Root="HKLM"
+                  Key="Software\thClaws"
+                  Name="path_installed"
+                  Type="integer"
+                  Value="1"
+                  KeyPath="yes" />
+              <!-- Part="first" prepends the install dir to PATH so a
+                   plain `thclaws` command always resolves to THIS
+                   MSI install, even when the user previously copied
+                   thclaws.exe into a custom dir already on PATH (e.g.
+                   C:\tools\). Without this, the stale binary won at
+                   PATH-search time and the new MSI install effectively
+                   sat unused. The app itself still warns about
+                   duplicates so the user can clean them up. -->
+              <Environment
+                  Id="PATH"
+                  Name="PATH"
+                  Value="[Bin]"
+                  Permanent="no"
+                  Part="first"
+                  Action="set"
+                  System="yes" />
+            </Component>
+            <Component Id="binary0" Guid="*">
+              <File
+                  Id="exe0"
+                  Name="thclaws.exe"
+                  DiskId="1"
+                  Source="$(var.CargoTargetBinDir)\thclaws.exe"
+                  KeyPath="yes" />
+            </Component>
+          </Directory>
+        </Directory>
+      </Directory>
+
+      <Directory Id="ProgramMenuFolder" Name="Programs">
+        <Directory Id="ApplicationProgramsFolder" Name="thClaws">
+          <Component Id="ApplicationShortcut" Guid="*">
+            <!-- Working directory MUST NOT be Bin (= C:\Program Files\
+                 thClaws\bin\) — that's read-only for non-admin users
+                 and the GUI's startup writes session/config files
+                 relative to cwd, causing a silent SIGTERM on launch.
+                 PersonalFolder = %USERPROFILE%\Documents which every
+                 user can write to. The user can also override via
+                 right-click → Properties → "Start in" if they prefer
+                 a different default workspace. -->
+            <Shortcut
+                Id="ApplicationStartMenuShortcut"
+                Name="thClaws"
+                Description="thClaws — AI agent workspace (GUI)"
+                Target="[Bin]thclaws.exe"
+                WorkingDirectory="PersonalFolder" />
+            <Shortcut
+                Id="UninstallShortcut"
+                Name="Uninstall thClaws"
+                Description="Uninstall thClaws"
+                Target="[System64Folder]msiexec.exe"
+                Arguments="/x [ProductCode]" />
+            <RemoveFolder Id="CleanupShortcut" On="uninstall" />
+            <RegistryValue
+                Root="HKCU"
+                Key="Software\thClaws"
+                Name="installed"
+                Type="integer"
+                Value="1"
+                KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature
+        Id="Binaries"
+        Title="Application"
+        Description="Installs the thClaws binary and adds it to PATH."
+        Level="1"
+        ConfigurableDirectory="APPLICATIONFOLDER"
+        AllowAdvertise="no"
+        Display="expand"
+        Absent="disallow">
+      <ComponentRef Id="binary0" />
+      <ComponentRef Id="Path" />
+      <ComponentRef Id="ApplicationShortcut" />
+    </Feature>
+
+    <SetProperty Id="ARPINSTALLLOCATION" Value="[APPLICATIONFOLDER]" After="CostFinalize" />
+
+    <Property Id="ARPHELPLINK" Value="https://github.com/thClaws/thClaws" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/thClaws/thClaws" />
+    <Property Id="ARPNOREPAIR" Value="yes" Secure="yes" />
+
+    <!-- WixUI_Minimal = single-page install dialog. Skips the EULA
+         step (which would require wix/License.rtf) and the per
+         feature tree. Right shape for a CLI tool; if we want a
+         proper EULA flow later, switch to WixUI_FeatureTree and
+         add License.rtf. -->
+    <UIRef Id="WixUI_Minimal" />
+  </Product>
+</Wix>

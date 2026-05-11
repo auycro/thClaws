@@ -21,6 +21,12 @@ chip in the sidebar (Desktop GUI, v0.7.2+).
 | DashScope | `qwen-*`, `qwq-*` | `DASHSCOPE_API_KEY` | Alibaba Qwen; automatic caching |
 | DeepSeek | `deepseek-*` | `DEEPSEEK_API_KEY` (+ `DEEPSEEK_BASE_URL`) | V4 line: `deepseek-v4-flash`, `deepseek-v4-pro`. Older aliases `deepseek-chat` / `deepseek-reasoner` still work as wire-level aliases |
 | ThaiLLM (NSTDA) | `thaillm/*` | `THAILLM_API_KEY` | Aggregator at `thaillm.or.th` for four 8B Thai-tuned models (OpenThaiGPT, Typhoon-S, Pathumma, THaLLE). Aliases (case-insensitive): `openthaigpt`, `typhoon`, `pathumma`, `thalle` |
+| Z.ai | `zai/*` | `ZAI_API_KEY` (+ `ZAI_BASE_URL`) | GLM Coding Plan endpoint at `api.z.ai`. Default `zai/glm-4.6`; latest `zai/glm-5.1` (202K context) added in v0.8.5. Override `ZAI_BASE_URL` for the general BigModel SKU at `open.bigmodel.cn` |
+| MiniMax | `minimax/*` | `MINIMAX_API_KEY` (+ `MINIMAX_BASE_URL`) | International endpoint at `api.minimax.io`. Models: `minimax/MiniMax-M2` (200K/131K — flagship, default), `minimax/MiniMax-M1` (1M context), `minimax/abab7-chat-preview`. China-platform users on `api.minimax.chat` need to override `MINIMAX_BASE_URL` (different auth scheme — YMMV). Added in v0.8.5 |
+| Ollama Cloud | `ollama-cloud/*` | `OLLAMA_CLOUD_API_KEY` | Hosted Ollama catalog (Kimi, GPT-OSS, DeepSeek, Llama, etc.). OpenAI-compatible at `ollama.com/v1` |
+| NVIDIA NIM | `nvidia/*` | `NVIDIA_API_KEY` (+ `NVIDIA_BASE_URL`) | NVIDIA hosted inference at `integrate.api.nvidia.com/v1`. Catalog spans Nemotron, Llama, DeepSeek, GLM and more — the `nvidia/` prefix routes everything; the outer prefix is stripped on the wire. Override the env var for on-prem NIM deployments |
+| LMStudio | `lmstudio/*` | — (local) | LMStudio's local OpenAI-compatible server at `localhost:1234/v1`. No auth. Models follow whatever's loaded in the LMStudio app |
+| Azure AI Foundry | `azure/<deployment>` | `AZURE_AI_FOUNDRY_API_KEY` (+ `AZURE_AI_FOUNDRY_ENDPOINT`) | Anthropic-Messages-shaped Azure deployments. `<deployment>` is your Azure-side deployment name (no defaults — set per subscription) |
 
 The default on first run is `claude-sonnet-4-6`; change it with
 `--model` on the command line or persist in `settings.json`.

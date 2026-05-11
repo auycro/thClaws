@@ -598,6 +598,53 @@ subagent และ slash command เขียน pattern เฉพาะลง K
 | stub page ใน `pages/<alias>.md` ลงท้ายด้วย `_Replace this stub with a curated summary..._` | `/kms ingest` (file/URL/PDF) | source ดิบไปอยู่ที่ `sources/<alias>.<ext>`; stub นี้ชี้กลับไป enrich ผ่าน prompting ตามปกติหรือ `KmsWrite` |
 | บรรทัด `## [date] verb \| <alias>` ใน `log.md` | ทุกการ write KMS | change log แบบ append-only grep ได้: `grep "^## \[" log.md \| tail -20` ดู activity ล่าสุด |
 
+## Browse, graph และ HTML export (v0.8.5+)
+
+KMS เพิ่ม 3 surface สำหรับ browse-time ใน v0.8.5 — ทั้งหมดอยู่ใน Desktop GUI ไม่กระทบไฟล์ format เดิม
+
+### KMS browser sidebar
+
+คลิกชื่อ KMS ใน sidebar ด้านซ้าย (ไม่ใช่ checkbox) จะมี panel ขนาด 260 px เลื่อนเข้ามาทางขวาแสดง page และ source archive ทั้งหมด คลิกไฟล์เปิด in-app viewer ทับ tab หลัก Tab ที่อยู่ใต้ยังถูก mount อยู่ จะ preserve state ของ xterm / chat ได้ ปิด browser, สลับ tab, หรือกด `ESC` จะกลับมาที่ tab เดิม
+
+Viewer render Markdown ผ่าน `marked` พร้อม CSS แบบเอกสาร: heading ขีดเส้นใต้, blockquote tint accent, table มี border + zebra stripes, link 3 แบบ — external (underline solid), `[[wikilinks]]` ภายใน (dotted underline + accent pill), citation chip `[N]` (pill เล็ก rounded)
+
+### Graph view สไตล์ Obsidian
+
+Browser sidebar มีปุ่ม "Graph View" เหนือ list page คลิกแล้วจะแทน main pane ด้วย force-directed graph: page เป็นวงกลม, `[[wikilinks]]` เป็น edges, checkbox "Include sources" (default on) เพิ่ม source archive เป็น diamond node สีจางที่เชื่อมกับ page ที่อ้างถึง
+
+- ลาก empty space เพื่อ pan; mouse wheel zoom รอบ cursor
+- ลาก node ย้ายตำแหน่ง — pin กับ mouse, neighbors ตอบสนองด้วย spring forces
+- คลิก node เปิดไฟล์ใน viewer
+- Hover ไฮไลต์ node + neighbors ที่เชื่อม, อย่างอื่น dim
+- Force simulation auto-stop เมื่อ layout settle (annealed damping; cap ~3 วินาที)
+
+### `/kms html NAME [OUT]` — single-file interactive site
+
+สร้าง HTML site แบบ self-contained จาก page ของ KMS เขียนลง workspace (default `./<NAME>-site/index.html`) ต่างจาก in-app viewer ตรงที่นี่เป็น **derived artifact** ที่แชร์, commit git, host บน S3, หรือส่งให้เพื่อนได้ — ไม่ต้อง depend thClaws
+
+Agent ทำงาน 3 phase:
+
+1. **Explore** — `KmsRead` index/manifest ถ้ามี แล้ว `KmsSearch` enumerate page slug. อ่าน 4–8 page ตัวแทนเพื่อเข้าใจ style เนื้อหา. ไฟล์ source ปิดเป็น default — citation อย่างเดียวไม่พอเป็นเหตุผลให้อ่าน
+2. **Design components** — sketch component vocabulary ใน chat เป็น prose: site shell, page reader, navigation, citation chip, wikilink chip ฯลฯ. เลือก design tokens (typography, accent color, dark mode). Print sketch ออกมาเพื่อให้ ⌃C ได้ถ้าออกนอกทาง
+3. **Assemble** — อ่าน page ที่เหลือ, เขียน `index.html` หนึ่งไฟล์ที่มี `<style>` + `<script>` inline พร้อม hash routing สำหรับ multi-view (`#/`, `#/page/<slug>`) และ JSON data island ที่มี body + frontmatter ทุก page. Citation render เป็น plain `[N]` marker; page คือ substance ของ site
+
+Hard rules ใน prompt:
+
+- ไฟล์เดียว. ไม่มี external CSS/JS, ไม่มี CDN, ไม่มี `fetch`. Double-click เปิดได้ offline
+- Page เป็น primary content; source body ไม่ฝัง
+- Multi-view ผ่าน hash routing เพื่อให้ deep link ใช้ได้
+- Plain HTML + CSS + vanilla JS — ไม่มี framework
+
+ปรับ output dir ผ่าน positional argument ที่ 2:
+
+```
+/kms html llm-wiki              # → ./llm-wiki-site/index.html
+/kms html llm-wiki ../shareable # → ../shareable/index.html (relative กับ cwd)
+/kms html llm-wiki /tmp/site    # → /tmp/site/index.html
+```
+
+Agent ใช้ session model ปัจจุบัน (Opus / GPT-4.1 / Sonnet 4.6 ใช้ดี — long-context model ทำงานดีกว่าเพราะ agent ฝัง body ทุก page ใน JSON island)
+
 ## ขีดจำกัดการ scale และทิศทางในอนาคต
 
 KMS ตั้งใจให้ไม่มี embeddings โดย

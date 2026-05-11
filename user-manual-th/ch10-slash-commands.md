@@ -94,9 +94,10 @@ Slash commands คือ control plane ของ thClaws พิมพ์ `/` ต
 | `/kms use NAME` | ผูก KMS เข้ากับการสนทนาของโปรเจกต์นี้ |
 | `/kms off NAME` | ถอด KMS ออก |
 | `/kms show NAME` | พิมพ์ `index.md` ของ KMS ออกมา |
+| `/kms html NAME [OUT]` | สร้าง HTML site แบบ single-file ที่ interactive จาก KMS (v0.8.5+) Agent อ่าน KMS ผ่าน tools, ออกแบบ component, แล้วเขียน `<OUT>/index.html` (default `./<NAME>-site/`) ลง workspace |
 | `/dream [FOCUS]` | Consolidate KMS ของโปรเจกต์โดย mine session ล่าสุด (GUI-only, dispatch built-in side-channel agent) |
 
-แนวคิดและเวิร์กโฟลว์ KMS ฉบับเต็มอยู่ใน [บทที่ 9](ch09-knowledge-bases-kms.md) รวมถึง flow ของ `/dream`
+แนวคิดและเวิร์กโฟลว์ KMS ฉบับเต็มอยู่ใน [บทที่ 9](ch09-knowledge-bases-kms.md) รวมถึง `/kms html` สำหรับ HTML export, graph view, และ flow ของ `/dream`
 
 ### Background research
 

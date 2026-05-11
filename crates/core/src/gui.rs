@@ -455,6 +455,31 @@ pub fn run_gui_with_serve(config: crate::server::ServeConfig) {
 }
 
 fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
+    // M6.42: Pin WebView2's user data folder to %LOCALAPPDATA% before
+    // any wry init. The WebView2 Runtime checks this env var when
+    // creating its environment; without it, wry falls back to a
+    // `<exe>.WebView2/` sibling dir next to thclaws.exe. That sibling
+    // path is read-only when the MSI installs into C:\Program Files\,
+    // making the GUI silently SIGTERM on first launch (the binary
+    // itself runs fine — `thclaws --cli` works — but wry's webview
+    // creation fails when it can't write the user data folder). The
+    // folder is created lazily by WebView2; we just point at a
+    // writable location and let it populate.
+    #[cfg(windows)]
+    {
+        let local = std::env::var("LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let data_dir = local.join("thclaws").join("WebView2");
+        let _ = std::fs::create_dir_all(&data_dir);
+        // SAFETY: `set_var` is only unsafe in multi-threaded contexts;
+        // we're single-threaded here at process start before any tokio
+        // runtime / wry thread pool exists.
+        unsafe {
+            std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &data_dir);
+        }
+    }
+
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
@@ -645,6 +670,14 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
         .unwrap_or(false);
     // Windows (WebView2) exposes custom protocols as `http://<scheme>.<host>`;
     // mac/Linux use the raw `<scheme>://<host>` form.
+    //
+    // M6.43: We tried `with_html` and `file://` workarounds for an
+    // Intel macOS 13 blank-page bug — both regressed Apple Silicon
+    // worse than they fixed Intel. The custom scheme path works on
+    // macOS 15+ (any arch) and on Apple Silicon at all recent
+    // versions. Drop pre-15 macOS support (LSMinimumSystemVersion
+    // = 15.0 in the .dmg packaging step) instead of fighting
+    // WKWebView's older module-script restrictions.
     #[cfg(windows)]
     let start_url = "http://thclaws.localhost/";
     #[cfg(not(windows))]

@@ -26,6 +26,21 @@ jobs:
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
+    # M6.40: gate this job behind the `release` GitHub Environment so
+    # the DigiCert KeyLocker secrets only unlock for runs that pass
+    # the environment's protection rules (recommended: required
+    # reviewer + branch/tag restriction to `v*`). The environment
+    # also scopes the secrets — they're not visible to any other
+    # workflow or job, even within the same repo. See dev-com/099
+    # in the workspace for setup steps.
+    environment: release
+    # Surface DigiCert KeyLocker secret presence at job level so
+    # `if: env.SM_API_KEY != ''` gating in Windows steps works (you
+    # can't reference `secrets.*` directly inside `if:` expressions).
+    # Empty/missing secrets evaluate to "" so the signing steps cleanly
+    # skip when keys aren't configured (e.g. on forks / first-run).
+    env:
+      SM_API_KEY: ${{ secrets.SM_API_KEY }}
     strategy:
       fail-fast: false
       matrix:
@@ -60,7 +75,7 @@ jobs:
 
     steps:
       - name: Checkout tag
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
 
@@ -83,23 +98,23 @@ jobs:
             librsvg2-dev
 
       - name: Install Rust toolchain (${{ matrix.target }})
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo registry + target
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: .
           key: ${{ matrix.target }}
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@91ab88e2619ed1f46221f0ba42d1492c02baf788 # v6
         with:
           version: 9
 
       - name: Install Node
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: '20'
           cache: 'pnpm'
@@ -135,36 +150,290 @@ jobs:
             sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
           fi
 
+      # ── Windows code signing (DigiCert KeyLocker) ──────────────────────
+      # M6.40: optional. Runs only when DigiCert KeyLocker secrets are
+      # configured on the repo. Without them, the binary + MSI ship
+      # unsigned (SmartScreen will warn until they earn reputation).
+      # Required secrets — set under repo Settings → Secrets and
+      # variables → Actions:
+      #   SM_API_KEY                 — DigiCert API key
+      #   SM_CLIENT_CERT_FILE_B64    — base64-encoded PKCS#12 client auth cert
+      #   SM_CLIENT_CERT_PASSWORD    — password for the PKCS#12 cert
+      #   SM_CERT_FINGERPRINT        — SHA1 thumbprint of the signing cert (uppercase, no spaces)
+      # SM_HOST is hardcoded to https://one.digicert.com — the public
+      # KeyLocker tenant. Override below if you're on a regional shard.
+      #
+      # Install pattern mirrors JimmySoftware/pinn-ai-2's working setup:
+      # download `smtools-windows-x64.msi` directly from KeyLocker
+      # using the API key as auth, install silently, add to PATH,
+      # then write the client cert + env vars for signtool.
+      - name: Set up DigiCert KeyLocker
+        if: matrix.os == 'windows' && env.SM_API_KEY != ''
+        shell: pwsh
+        env:
+          SM_API_KEY: ${{ secrets.SM_API_KEY }}
+          SM_CLIENT_CERT_FILE_B64: ${{ secrets.SM_CLIENT_CERT_FILE_B64 }}
+          SM_CLIENT_CERT_PASSWORD: ${{ secrets.SM_CLIENT_CERT_PASSWORD }}
+          SM_HOST: https://one.digicert.com
+        run: |
+          curl.exe -X GET "https://one.digicert.com/signingmanager/api-ui/v1/releases/smtools-windows-x64.msi/download" `
+            -H "x-api-key:$($env:SM_API_KEY)" -o smtools.msi
+          msiexec /i smtools.msi /quiet /qn
+          Start-Sleep -Seconds 5
+          echo "C:\Program Files\DigiCert\DigiCert One Signing Manager Tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $b64 = $env:SM_CLIENT_CERT_FILE_B64 -replace '\s','' -replace '[^A-Za-z0-9+/=]',''
+          $certBytes = [Convert]::FromBase64String($b64)
+          [System.IO.File]::WriteAllBytes("C:\sm_client_cert.p12", $certBytes)
+          echo "SM_CLIENT_CERT_FILE=C:\sm_client_cert.p12" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "SM_CLIENT_CERT_PASSWORD=$env:SM_CLIENT_CERT_PASSWORD" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "SM_API_KEY=$env:SM_API_KEY" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "SM_HOST=https://one.digicert.com" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Verify KeyLocker connectivity
+        if: matrix.os == 'windows' && env.SM_API_KEY != ''
+        shell: pwsh
+        run: smctl healthcheck
+
+      - name: Sign Windows binary
+        if: matrix.os == 'windows' && env.SM_API_KEY != ''
+        shell: cmd
+        env:
+          SM_CERT_FINGERPRINT: ${{ secrets.SM_CERT_FINGERPRINT }}
+        run: |
+          smctl sign --fingerprint %SM_CERT_FINGERPRINT% --input "target\${{ matrix.target }}\release\thclaws.exe"
+          smctl sign verify --input "target\${{ matrix.target }}\release\thclaws.exe"
+
+      - name: Install WiX 3.11 (ARM64 runner only)
+        # windows-2022 image ships WiX 3.11 pre-installed; the
+        # windows-11-arm image does NOT, so we install it explicitly.
+        # The official WiX 3 installer is x86 — runs on Windows ARM64
+        # via Microsoft's x86-on-ARM emulation. Adds ~30s to the ARM
+        # build but lets us ship MSI for both architectures.
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314.exe"
+          $installer = "$env:TEMP\wix314.exe"
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          # /quiet runs the bundled WiX 3.14 (3.11 successor on the
+          # 3.x line) installer with no prompts. /norestart suppresses
+          # the post-install reboot offer (we don't need a reboot for
+          # standalone MSI build tools).
+          Start-Process -FilePath $installer -ArgumentList "/quiet","/norestart" -Wait
+          # Add WiX bin to PATH for this job's subsequent steps.
+          $wixBin = "${env:ProgramFiles(x86)}\WiX Toolset v3.14\bin"
+          if (-not (Test-Path $wixBin)) {
+            $wixBin = "$env:ProgramFiles\WiX Toolset v3.14\bin"
+          }
+          echo $wixBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Write-Host "Added WiX bin to PATH: $wixBin"
+
+      - name: Install cargo-wix
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          cargo install cargo-wix --version "^0.3" --locked
+
       - name: Package (windows)
         if: matrix.os == 'windows'
         shell: pwsh
         run: |
           $version = "${{ steps.tag.outputs.name }}"
           $name = "thclaws-$version-${{ matrix.target }}"
+          $repoRoot = $PWD.Path
           New-Item -Force -ItemType Directory dist | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/thclaws.exe" "dist/thclaws.exe"
+
+          # Build the MSI from the (possibly signed) binary.
+          # cargo-wix doesn't accept --manifest-path; it has to run
+          # from inside the crate dir (it discovers Cargo.toml via
+          # cwd). Workspace target/ stays at $repoRoot so cargo-wix
+          # finds the binary fine. Output path needs to be absolute
+          # since cwd is now crates/core.
+          #
+          # cargo-wix exports `var.Version` from Cargo.toml
+          # automatically — passing `-dVersion=...` ourselves causes
+          # candle CNDL0288 (variable redeclaration). The MSI version
+          # therefore tracks Cargo.toml exactly.
+          $wixArch = if ('${{ matrix.target }}' -eq 'aarch64-pc-windows-msvc') { 'arm64' } else { 'x64' }
+          Push-Location crates/core
+          cargo wix `
+            --target ${{ matrix.target }} `
+            --no-build `
+            --nocapture `
+            --output "$repoRoot/dist/$name.msi" `
+            -C "-arch" -C "$wixArch"
+          Pop-Location
+
+          # Zip the bare exe alongside the MSI.
           Compress-Archive -Path dist/thclaws.exe -DestinationPath "dist/$name.zip" -Force
           Remove-Item dist/thclaws.exe
-          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
-          Set-Content "dist/$name.zip.sha256" "$hash  $name.zip"
+
+      - name: Sign Windows MSI
+        if: matrix.os == 'windows' && env.SM_API_KEY != ''
+        shell: cmd
+        # smctl reads SM_HOST / SM_API_KEY / SM_CLIENT_CERT_FILE /
+        # SM_CLIENT_CERT_PASSWORD from $GITHUB_ENV (set by the
+        # "Set up DigiCert KeyLocker" step) — we only add the
+        # fingerprint here for the `--fingerprint` flag.
+        env:
+          SM_CERT_FINGERPRINT: ${{ secrets.SM_CERT_FINGERPRINT }}
+        run: |
+          for %%f in (dist\*.msi) do (
+            smctl sign --fingerprint %SM_CERT_FINGERPRINT% --input "%%f"
+            smctl sign verify --input "%%f"
+          )
+
+      - name: Hash Windows artifacts
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          Get-ChildItem dist/*.zip,dist/*.msi | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            Set-Content "$($_.FullName).sha256" "$hash  $($_.Name)"
+          }
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: thclaws-${{ matrix.target }}
           path: dist/*
 
+  # ── macOS Universal DMG (M6.41) ─────────────────────────────────────────
+  # Builds a universal (arm64 + x86_64) thClaws.app wrapped in a .dmg
+  # with a drag-to-/Applications symlink. Reuses the per-arch binaries
+  # the build matrix already produced — no re-build, just lipo merge.
+  #
+  # Phase 1 ships UNSIGNED. Apple Gatekeeper will warn on first launch
+  # ("cannot verify developer") and the user has to right-click → Open
+  # or System Settings → "Open Anyway". An ad-hoc codesign (sign with
+  # `-` identity, no cert) is still applied — without it, modern Apple
+  # Silicon kernels SIGKILL the binary on launch with "killed: 9"
+  # before the user even sees the Gatekeeper prompt. Ad-hoc signing
+  # is free and satisfies the hardened-runtime check.
+  #
+  # Phase 2 (when Apple Developer cert is available, $99/yr): swap the
+  # ad-hoc sign for a real Developer ID Application sign + notarize +
+  # staple. Same gating pattern as the DigiCert flow on Windows —
+  # `if: env.AC_API_KEY != ''` opt-in.
+  macos-dmg:
+    name: macos-universal-dmg
+    needs: build
+    runs-on: macos-14
+    environment: release
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: echo "name=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Download per-arch macOS artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: artifacts
+          pattern: thclaws-*-apple-darwin
+
+      - name: Build universal .app + .dmg
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.tag.outputs.name }}"
+          SHORT_VERSION="${VERSION#v}"
+          NAME="thclaws-${VERSION}-universal-apple-darwin"
+
+          # Extract per-arch binaries from the .tar.gz artifacts
+          mkdir -p extracted
+          tar -xzf "artifacts/thclaws-aarch64-apple-darwin/thclaws-${VERSION}-aarch64-apple-darwin.tar.gz" -C extracted
+          mv extracted/thclaws extracted/thclaws-arm64
+          tar -xzf "artifacts/thclaws-x86_64-apple-darwin/thclaws-${VERSION}-x86_64-apple-darwin.tar.gz" -C extracted
+          mv extracted/thclaws extracted/thclaws-x86_64
+
+          # lipo into a fat binary the kernel picks the right slice from at exec time
+          mkdir -p "thclaws.app/Contents/MacOS"
+          lipo -create extracted/thclaws-arm64 extracted/thclaws-x86_64 \
+               -output "thclaws.app/Contents/MacOS/thclaws"
+          chmod +x "thclaws.app/Contents/MacOS/thclaws"
+
+          # Generate Info.plist. Kept minimal — bundle ID matches the
+          # public repo namespace so future Sparkle / auto-update can
+          # find a stable identity.
+          cat > "thclaws.app/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>thclaws</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.thclaws.thclaws</string>
+              <key>CFBundleName</key>
+              <string>thClaws</string>
+              <key>CFBundleDisplayName</key>
+              <string>thClaws</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>${SHORT_VERSION}</string>
+              <key>CFBundleVersion</key>
+              <string>${SHORT_VERSION}</string>
+              <key>LSMinimumSystemVersion</key>
+              <string>15.0</string>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+
+          # Ad-hoc codesign so the kernel's hardened runtime check
+          # passes on Apple Silicon. No cert required for `-` identity.
+          codesign --force --deep --sign - "thclaws.app"
+
+          # Stage for DMG: .app + Applications symlink for drag-to-install
+          mkdir -p dmg-staging
+          cp -R "thclaws.app" "dmg-staging/"
+          ln -s /Applications "dmg-staging/Applications"
+
+          mkdir -p dist
+          # Explicit -size 200m: hdiutil's auto-size (srcfolder + 12%
+          # padding) is too tight for the universal binary (~37 MB
+          # binary × 2 copies for .app + staging + filesystem
+          # overhead → "No space left on device" on the mounted
+          # sparse image). 200 MB is comfortably more than we need
+          # and gets compressed away by UDZO into a ~37 MB final dmg.
+          hdiutil create \
+            -volname "thClaws" \
+            -srcfolder "dmg-staging" \
+            -size 200m \
+            -ov \
+            -format UDZO \
+            "dist/${NAME}.dmg"
+
+          shasum -a 256 "dist/${NAME}.dmg" > "dist/${NAME}.dmg.sha256"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: thclaws-macos-universal-dmg
+          path: dist/*
+
   release:
     name: Publish release
-    needs: build
+    needs: [build, macos-dmg]
     runs-on: ubuntu-22.04
+    # Inherits the same `release` environment as the build job so
+    # the GitHub Releases publish only happens after the same
+    # protection rules pass.
+    environment: release
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
           fetch-depth: 0
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: dist
           merge-multiple: true
@@ -173,7 +442,7 @@ jobs:
         run: ls -la dist
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: dist/*
