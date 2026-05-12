@@ -34,7 +34,7 @@ When the same name exists in both scopes, the **project** version wins.
 <kms_root>/
 ├── index.md       ← table of contents, one line per page. The agent reads this every turn.
 ├── log.md         ← append-only change log (humans + agent write here)
-├── SCHEMA.md      ← optional: prose shape rules for pages
+├── SCHEMA.md      ← optional: prose shape rules for pages (KmsWrite reads this)
 ├── manifest.json  ← schema version + optional frontmatter requirements (see "Schema versioning")
 ├── pages/         ← individual wiki pages, one per topic
 │   ├── auth-flow.md
@@ -44,6 +44,47 @@ When the same name exists in both scopes, the **project** version wins.
 ```
 
 `/kms new` seeds all of the above with minimal starter content so you can start writing immediately.
+
+## Canonical page shape
+
+Every page goes through `KmsWrite`, which expects this YAML frontmatter and stamps a uniform header above the body:
+
+```yaml
+---
+title: Human-readable title           # falls back to the filename when missing
+topic: One-line description           # rendered as Description: …; omitted line if missing
+sources: ["https://…", "memory"]      # REQUIRED — provenance (URLs, session-XYZ, memory, or [] for opinion)
+category: optional grouping
+tags: [optional, free-form]
+---
+
+(body content — KmsWrite injects the # title / Description / --- block above when you don't write your own)
+```
+
+On disk the final shape becomes:
+
+```
+---
+title: …
+topic: …
+sources: […]
+created: 2026-05-11
+updated: 2026-05-11
+verified: 2026-05-11                  # stamped by /research; manual KmsWrite leaves it absent
+---
+
+# {title}
+Description: {topic}
+---
+
+(body)
+```
+
+**Provenance discipline** — `sources:` is the answer to the "LLM-Wiki bakes in organised persistent mistakes" critique. `KmsWrite` warns when the frontmatter is present but missing `sources:`, and `KmsRead` later prepends a `[note: this page has no verification record]` banner. Use explicit `sources: []` for opinion / convention pages with no external source — it's a deliberate acknowledgement, not an omission.
+
+**Freshness** — pages with `verified:` older than 90 days get a `[note: this page was last verified N days ago — sources may have drifted; re-verify before citing as current fact]` banner on every `KmsRead`. The `/research` pipeline stamps `verified: today` on every page it writes; manual `KmsWrite` callers can stamp it too when they've actually re-checked a source.
+
+**Existing pages stay** — pre-existing pages without the canonical header are not migrated automatically. Re-write through `KmsWrite` (e.g. via `/dream` consolidation, `/kms reconcile`, or a manual rewrite request) to bring them into the new shape.
 
 ## Adding content: capture and ingest
 
@@ -464,13 +505,14 @@ auth-flow:12:Bearer tokens expire after 15 minutes
 api-conventions:34:Always include "Authorization: Bearer <token>"
 ```
 
-### `KmsWrite`, `KmsAppend`, `KmsDelete`
+### `KmsWrite`, `KmsAppend`, `KmsDelete`, `KmsCreate`
 
-The mutation surface used by the agent (and by the `/dream` consolidator below). All three require approval by default.
+The mutation surface used by the agent (and by the `/dream` consolidator below). Always-on — registered regardless of whether any KMS is currently attached, so `/dream` and other side-channel agents can bootstrap an audit-log KMS from a zero state. Each requires approval by default except `KmsCreate` (idempotent + name-validated, same risk profile as `SessionRename`).
 
-- `KmsWrite(kms, page, content)` — create-or-replace a page. Preserves YAML frontmatter, bumps `updated:`, refreshes the `index.md` bullet, appends a `wrote | <page>` entry to `log.md`.
+- `KmsWrite(kms, page, content)` — create-or-replace a page. Preserves YAML frontmatter, bumps `updated:`, refreshes the `index.md` bullet, appends a `wrote | <page>` entry to `log.md`. Auto-injects the `# {title}\nDescription: {topic}\n---` block when the body doesn't lead with a `# heading`. Warns when `sources:` frontmatter is missing.
 - `KmsAppend(kms, page, content)` — extend a page in place. Faster than `KmsWrite` for incremental updates (logs, journal entries, accumulated notes). Bumps `updated:` if the page has frontmatter.
 - `KmsDelete(kms, page)` — remove a page, prune its `index.md` bullet, append `deleted | <page>` to `log.md`. Used during consolidation to retire duplicates or stale entries.
+- `KmsCreate(name, scope)` — ensure a KMS exists. Idempotent: returns the existing ref if already present, otherwise seeds the directory tree (`pages/`, `sources/`, `index.md`, `log.md`, `SCHEMA.md`, `manifest.json`). Used by `/dream`'s Pass 4 to bootstrap the dedicated `dreams` audit KMS before writing the run summary.
 
 Page names are validated path-segments — no separators, no traversal, and the reserved names `index`, `log`, `SCHEMA` cannot be used as a page name (they're managed by the KMS itself).
 
@@ -493,22 +535,31 @@ You can also run these on a schedule via [Chapter 19's pre-packaged presets](ch1
 After a few weeks of work, your KMS accumulates duplicates: two pages on the same topic that drifted apart, an old entry contradicted by something you said yesterday, insights from sessions that never made it into a page. **`/dream`** is the slash command that fixes that — it dispatches a built-in `dream` agent as a side channel that consolidates the project's KMS in the background while you keep working.
 
 ```
-/dream                 # consolidate everything
+/dream                 # consolidate the 10 most recent sessions
+/dream --all           # consolidate every session under .thclaws/sessions/
 /dream auth            # bias the consolidation toward "auth"
+/dream --all auth      # combine the two
 /agents                # see the active dream + when it started
 /agent cancel <id>     # stop a dream that's wandering
 ```
 
 `/dream` is GUI-only (it needs the chat surface to render the side bubble). The dream agent runs concurrently with main, so you can keep prompting your main agent while it works.
 
+The **Background agents sidebar** (see [chapter 4](ch04-desktop-gui-tour.md#right-edge-sidebars-contextual)) shows the dream live: agent name, elapsed time, last tool call, and (on completion) a hint pointing at the summary page.
+
 #### What it does
 
-The dream agent runs four passes:
+The dream agent runs **five** passes:
 
-1. **Survey** — reads the active KMS list (from its system prompt) and the `index.md` of each KMS to enumerate existing pages.
-2. **Read sessions** — `Glob`s the 10 most recently modified files under `.thclaws/sessions/*.jsonl` and reads them. Each session is a JSONL of message events; the agent skims for stable facts the user worked through that aren't already in KMS.
-3. **Consolidate** — for each insight, it `KmsSearch`es the relevant KMS first; if a page covers the topic, it `KmsAppend`s rather than creating a new page. If two pages overlap heavily, it merges via `KmsWrite` and `KmsDelete`s the duplicate.
-4. **Summarize** — writes a `dream-YYYY-MM-DD.md` page in the project KMS listing every change (pages added, updated, deleted, plus skipped insights and reasons). This is your audit trail.
+1. **Survey + skip-already-dreamed** — reads the active KMS list and each `index.md`, then looks up the most recent prior `dream-` summary in the dedicated `dreams` KMS. Sessions whose recorded `last_message_at` ≥ current file mtime are skipped (no new chat content since last dream) and listed in the run summary's "Skipped" section.
+2. **Read sessions + auto-rename** — reads each surviving session JSONL. Sessions still carrying the auto-generated `sess-XXXXXXXX` title get a meaningful one-line title proposed and applied via `SessionRename`. Skips ephemera (ad-hoc bug fixes already in git, transient task state) and looks for stable facts the user revealed or confirmed.
+3. **Consolidate** — for each insight, picks the right **active KMS** (e.g. project conventions in `project-knowledge`, personal preferences in `personal-notes`); `KmsSearch`es that active KMS first; if a page covers the topic, prefer `KmsAppend` over creating a new page. If two pages overlap heavily, merge via `KmsWrite` and `KmsDelete` the duplicate. New / merged pages get the canonical shape (`title:` + `topic:` + `sources:`). **All Pass 3 writes land in active KMSes — never in `dreams`.** If no active KMS is attached, Pass 3 is skipped and the agent jumps to Pass 4.
+4. **Targeted reconcile (Pass 3b)** — walks back through every page modified in Pass 3 (all in active KMSes) and rewrites them with a `## History` section when internal contradictions are detected. Scoped to pages this run touched — full-vault sweeps are the job of `/kms reconcile`. Same KMS-targeting rule: rewrites stay in the same active KMS the page came from.
+5. **Summarize** — writes a SINGLE `dream-YYYY-MM-DD.md` audit page in the dedicated **`dreams`** KMS (NEVER an active KMS). This is the **only** page that ever lands in `dreams` — knowledge pages from Pass 3 / Pass 3b are already in their active KMSes. The summary carries a Sessions-processed table that the next dream's Pass 1 reads to skip already-processed work.
+
+**Two-way invariant** — Pass 3 + 3b write to active KMSes only (never `dreams`); Pass 4 writes to `dreams` only (never active KMSes). Pass 1 may *read* both (looking up prior summaries in `dreams`; reading active-KMS indices). The prompt has a "Common mistakes to avoid" section enumerating the failure patterns the model has historically slipped into (knowledge pages mis-routed to `dreams`, summary mis-routed to an active KMS, cross-vault merges).
+
+The `dreams` KMS is auto-created (project-scope) on the first `/dream` invocation by the dispatch path; `KmsCreate({name: "dreams", scope: "project"})` is also called by the dream agent itself at the start of Pass 4 as defense-in-depth (idempotent — no-op when the KMS already exists).
 
 ```
 ❯ /dream

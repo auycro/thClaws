@@ -45,6 +45,47 @@ Use case:
 
 `/kms new` จะสร้างทุกอย่างข้างบนให้พร้อมเนื้อหา starter เล็ก ๆ เพื่อให้คุณเริ่มเขียนต่อได้ทันที
 
+## Canonical page shape
+
+ทุกหน้าจะถูก write ผ่าน `KmsWrite` ซึ่งคาดหวัง YAML frontmatter ในรูปแบบนี้ แล้วจะ inject header ที่เป็นมาตรฐานทับด้านบนของ body:
+
+```yaml
+---
+title: ชื่อหน้าที่อ่านออก       # ใส่ไม่ครบ → fallback ใช้ชื่อไฟล์
+topic: บรรยายในบรรทัดเดียว     # render เป็น Description: …; ขาดบรรทัดนี้ก็ถูก omit
+sources: ["https://…", "memory"]  # **บังคับ** — provenance (URLs, session-XYZ, memory, หรือ [] สำหรับ opinion)
+category: หมวดหมู่ (optional)
+tags: [optional, free-form]
+---
+
+(เนื้อหา body — KmsWrite จะ inject # title / Description / --- block เองถ้า body ไม่ขึ้นต้นด้วย # heading)
+```
+
+หลังเขียนเสร็จ shape จริงบน disk จะเป็น:
+
+```
+---
+title: …
+topic: …
+sources: […]
+created: 2026-05-11
+updated: 2026-05-11
+verified: 2026-05-11                  # stamp เฉพาะตอน /research เขียน; manual KmsWrite ไม่ใส่
+---
+
+# {title}
+Description: {topic}
+---
+
+(body)
+```
+
+**Provenance discipline** — `sources:` เป็นคำตอบของ critique "LLM-Wiki ฝัง hallucination ถาวร". `KmsWrite` warn เมื่อ frontmatter มีอยู่แต่ขาด `sources:` และ `KmsRead` ครั้งถัดไปจะ prepend banner `[note: this page has no verification record]`. หน้าที่เป็น opinion / convention ไม่มี external source → ใส่ `sources: []` ชัดเจน (เป็นการ ack ไม่ใช่ขาด)
+
+**Freshness** — หน้าที่ `verified:` เก่ากว่า 90 วันจะได้ banner `[note: this page was last verified N days ago — sources may have drifted; re-verify before citing as current fact]` ทุกครั้งที่ `KmsRead`. `/research` stamp `verified: today` ให้ทุกหน้าที่เขียน; manual `KmsWrite` ก็ใส่ได้เองเมื่อได้ verify จริง
+
+**ไฟล์เก่าไม่ migrate อัตโนมัติ** — หน้าที่มีอยู่ก่อนหน้านี้ที่ไม่มี canonical header จะคงรูปเดิมจนกว่าจะถูก rewrite ผ่าน `KmsWrite` (เช่น `/dream` consolidation, `/kms reconcile`, หรือเขียนใหม่ด้วยมือ)
+
 ## การเพิ่มเนื้อหา: capture และ ingest
 
 มีสามวิธีที่เพิ่มเนื้อหาเข้า KMS เรียงจาก "ให้ agent คิดเอง" ไปจน "บอก agent ตรง ๆ ว่าต้องทำอะไร" เลือกตามจังหวะที่คุณอยู่
@@ -462,13 +503,14 @@ auth-flow:12:Bearer tokens expire after 15 minutes
 api-conventions:34:Always include "Authorization: Bearer <token>"
 ```
 
-### `KmsWrite`, `KmsAppend`, `KmsDelete`
+### `KmsWrite`, `KmsAppend`, `KmsDelete`, `KmsCreate`
 
-Surface สำหรับ mutate KMS ที่ agent (และ `/dream` consolidator ด้านล่าง) ใช้ ทั้งสามตัวต้องการ approval โดย default
+Surface สำหรับ mutate KMS ที่ agent (และ `/dream` consolidator ด้านล่าง) ใช้ Always-on — register ใน registry ตลอด ไม่ว่ามี KMS active หรือไม่ ทำให้ `/dream` กับ side-channel agent ตัวอื่น bootstrap audit-log KMS จากศูนย์ได้ ทุกตัวยกเว้น `KmsCreate` ต้อง approval (KmsCreate idempotent + name-validated, risk เท่ากับ `SessionRename`)
 
-- `KmsWrite(kms, page, content)` — สร้างหรือเขียนทับ page รักษา YAML frontmatter ไว้, bump `updated:`, อัปเดต bullet ใน `index.md`, append `wrote | <page>` เข้า `log.md`
+- `KmsWrite(kms, page, content)` — สร้างหรือเขียนทับ page รักษา YAML frontmatter ไว้, bump `updated:`, อัปเดต bullet ใน `index.md`, append `wrote | <page>` เข้า `log.md`. Auto-inject `# {title}\nDescription: {topic}\n---` block ถ้า body ไม่ขึ้นด้วย `# heading` Warn เมื่อ frontmatter ขาด `sources:`
 - `KmsAppend(kms, page, content)` — ต่อท้าย page ที่มีอยู่ เร็วกว่า `KmsWrite` สำหรับการอัปเดตทีละนิด (log, journal, accumulating notes) bump `updated:` ถ้า page มี frontmatter
 - `KmsDelete(kms, page)` — ลบ page, ตัด bullet ออกจาก `index.md`, append `deleted | <page>` ใน `log.md` ใช้ตอน consolidate เพื่อปลด page ที่ซ้ำหรือล้าสมัย
+- `KmsCreate(name, scope)` — ensure ว่า KMS มีอยู่ Idempotent: return ref เดิมถ้ามีแล้ว ถ้ายังไม่มีก็ seed directory tree (pages/, sources/, index.md, log.md, SCHEMA.md, manifest.json) `/dream` Pass 5 ใช้ตัวนี้ bootstrap `dreams` KMS ก่อนเขียน summary
 
 ชื่อ page จะถูก validate เป็น path-segment — ไม่มี separator, ไม่มี traversal, และชื่อสงวน `index`, `log`, `SCHEMA` ใช้เป็นชื่อ page ไม่ได้ (KMS เป็นคนจัดการเอง)
 
@@ -491,22 +533,31 @@ Surface สำหรับ mutate KMS ที่ agent (และ `/dream` consol
 หลังจากทำงานไปไม่กี่สัปดาห์ KMS จะมี duplicate สะสม: page สอง page ที่พูดเรื่องเดียวกันแต่เนื้อหาไหลออกจากกัน, ข้อมูลเก่าที่ขัดกับสิ่งที่คุณพูดเมื่อวาน, insight จาก session ที่ไม่เคยถูกบันทึกเป็น page **`/dream`** คือ slash command ที่แก้ปัญหานี้ — มัน dispatch built-in `dream` agent เป็น side channel ซึ่ง consolidate KMS ของ project ใน background ขณะที่คุณทำงานอื่นต่อได้
 
 ```
-/dream                 # consolidate ทุกอย่าง
+/dream                 # consolidate 10 session ล่าสุด
+/dream --all           # consolidate ทุก session ใน .thclaws/sessions/
 /dream auth            # ให้ bias ไปทาง topic "auth"
+/dream --all auth      # รวมกัน
 /agents                # ดู dream ที่ active + เริ่มเมื่อไหร่
 /agent cancel <id>     # หยุด dream ที่ออกนอกเรื่อง
 ```
 
 `/dream` ใช้ได้เฉพาะใน GUI (ต้องใช้ chat surface ในการ render side bubble) dream agent รันแบบ concurrent กับ main คุณจึงสั่ง main ต่อได้ระหว่าง dream ทำงาน
 
+**Background agents sidebar** (ดู[บทที่ 4](ch04-desktop-gui-tour.md#sidebar-ขวา-context-sensitive)) จะแสดง dream live: ชื่อ agent, เวลาที่ผ่าน, tool ที่เรียกล่าสุด, และ (ตอนจบ) hint ชี้ไปหน้า summary
+
 #### มันทำอะไร
 
-dream agent รัน 4 pass:
+dream agent รัน **5 pass:**
 
-1. **Survey** — อ่านรายการ active KMS (จาก system prompt ของตัวเอง) และ `index.md` ของแต่ละ KMS เพื่อ enumerate page ที่มีอยู่
-2. **Read sessions** — `Glob` หา 10 ไฟล์ล่าสุดใน `.thclaws/sessions/*.jsonl` แล้วอ่าน แต่ละ session คือ JSONL ของ message events; agent สแกนหาข้อเท็จจริงที่เสถียรซึ่ง user ได้สรุปไว้แล้วแต่ยังไม่อยู่ใน KMS
-3. **Consolidate** — สำหรับแต่ละ insight, มันจะ `KmsSearch` ใน KMS ที่เกี่ยวข้องก่อน; ถ้ามี page ครอบคลุม topic อยู่แล้ว จะ `KmsAppend` แทนการสร้างใหม่ ถ้า page สองตัว overlap หนัก จะ merge ผ่าน `KmsWrite` แล้ว `KmsDelete` ตัวที่ซ้ำ
-4. **Summarize** — เขียน page `dream-YYYY-MM-DD.md` ใน project KMS ลิสต์ทุกการเปลี่ยนแปลง (page ที่เพิ่ม, อัปเดต, ลบ, รวมถึง insight ที่ข้ามและเหตุผล) นี่คือ audit trail ของคุณ
+1. **Survey + skip-already-dreamed** — อ่านรายการ active KMS + ของ `index.md` แต่ละตัว แล้วเปิด summary `dream-` ล่าสุดใน `dreams` KMS (dedicated audit-log KMS) เพื่อหาว่า session ไหน process ไปแล้ว Session ที่ `last_message_at` ≥ file mtime ปัจจุบัน → skip + list ใน "Skipped" section ของ summary
+2. **Read sessions + auto-rename** — อ่าน session JSONL ที่รอด Pass 1 Session ที่ยังเป็น auto-title `sess-XXXXXXXX` → propose meaningful title (≤70 chars) แล้วเรียก `SessionRename` Skip ephemera (bug fix เล็กน้อยที่อยู่ใน git แล้ว, transient task) หา stable fact ที่ user สรุปไว้
+3. **Consolidate** — สำหรับแต่ละ insight เลือก **active KMS** ที่ตรง topic (เช่น project convention → `project-knowledge`, preference ส่วนตัว → `personal-notes`); `KmsSearch` ใน active KMS นั้น; ถ้ามี page → `KmsAppend` แทน create ถ้า 2 page overlap หนัก → merge ผ่าน `KmsWrite` + `KmsDelete` ตัวซ้ำ. Page ใหม่/merged ได้ canonical shape (`title:` + `topic:` + `sources:`). **Pass 3 ทุก write ลง active KMS — ไม่ใช่ `dreams`** ถ้าไม่มี active KMS → skip Pass 3, ข้ามไป Pass 4 เลย
+4. **Targeted reconcile (Pass 3b)** — walk back ทุก page ที่ modify ใน Pass 3 (อยู่ใน active KMSes ทั้งหมด) หา internal contradiction ใน page นั้นๆ → rewrite ด้วย `## History` section. Scope แค่ page ที่ run นี้แตะ — full-vault sweep เป็นงาน `/kms reconcile`. Rewrite ยังคงอยู่ใน active KMS เดิม
+5. **Summarize** — เขียน **page เดียว** `dream-YYYY-MM-DD.md` ลงใน **`dreams` KMS** (ไม่ใช่ active KMS) นี่คือ page เดียวที่ลง `dreams` ทุก knowledge page จาก Pass 3 / Pass 3b อยู่ใน active KMSes แล้ว. Summary มี Sessions-processed table ที่ Pass 1 ของ dream ครั้งถัดไปจะอ่าน → รู้ว่า session ไหน process ไปแล้ว
+
+**Two-way invariant** — Pass 3 + 3b เขียน active KMS เท่านั้น (ไม่ใช่ `dreams`); Pass 4 เขียน `dreams` เท่านั้น (ไม่ใช่ active KMS). Pass 1 อ่านทั้งคู่ได้ (หา prior summary ใน `dreams`, อ่าน index ของ active KMSes) Prompt มี "Common mistakes to avoid" section enumerate failure pattern ที่ model เคยพลาด (knowledge page mis-route ไป `dreams`, summary mis-route ไป active KMS, cross-vault merge)
+
+`dreams` KMS ถูก auto-create (project-scope) ตอน `/dream` ครั้งแรกโดย dispatch path; `KmsCreate({name: "dreams", scope: "project"})` ถูกเรียกใน Pass 4 อีกครั้งโดย agent เป็น defense-in-depth (idempotent — no-op ถ้ามีอยู่แล้ว)
 
 ```
 ❯ /dream

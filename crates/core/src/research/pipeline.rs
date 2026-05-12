@@ -122,7 +122,10 @@ pub async fn run_with_tools(
     )
     .await?;
 
-    let mut last_score: Option<f32> = None;
+    // last_score is now strictly per-iteration (recorded after each
+    // evaluate then never read across iterations — the iter-start
+    // broadcast passes `None` directly). last_notes still leaks past
+    // the loop (used in the post-loop plan_pages pass).
     let mut last_notes = String::new();
 
     // ── 3. Iteration loop ───────────────────────────────────────────
@@ -177,7 +180,14 @@ pub async fn run_with_tools(
                 );
             }
         }
-        mgr.record_iteration(job_id, iter, sources.len() as u32, last_score);
+        // Iter-start broadcast: this iter hasn't been evaluated yet
+        // so we explicitly pass `None`, clearing any stale last_score
+        // from the previous iter. The post-evaluate record_iteration
+        // below carries this iter's real score. Without this, the
+        // frontend per-iter history showed iter N labelled with iter
+        // N-1's score (the broadcast snapshot at iter-start has
+        // iterations_done=N and last_score=previous_eval).
+        mgr.record_iteration(job_id, iter, sources.len() as u32, None);
 
         // ── 4. Evaluate ─────────────────────────────────────────────
         check_alive(job_id, &cancel)?;
@@ -194,7 +204,7 @@ pub async fn run_with_tools(
             &cancel,
         )
         .await?;
-        last_score = Some(eval.score);
+        let last_score = Some(eval.score);
         last_notes = eval.notes.clone();
         mgr.record_iteration(job_id, iter, sources.len() as u32, last_score);
 
@@ -357,7 +367,56 @@ pub async fn run_with_tools(
         // populated with every cited source from the run, not just
         // one page's.
         let cited = kms_writer::parse_citation_indices(&rewritten);
-        all_cited_indices.extend(cited);
+        all_cited_indices.extend(cited.iter().copied());
+
+        // Verify pass — addresses the "LLM Wiki bakes in organised
+        // persistent mistakes" critique. Each generated page is
+        // audited against its cited sources before being written to
+        // the KMS. Flagged claims (Partial / Unsupported /
+        // NoCitation) get appended as a `## Verification` section
+        // and the per-page `verification_score` lands in
+        // frontmatter so readers / future verify passes can sort
+        // pages by trustworthiness. Soft-failure: a verifier error
+        // logs + records score=None rather than blowing up the
+        // research run.
+        let cited_sources: Vec<llm_calls::ResearchSource> = sources
+            .iter()
+            .filter(|s| cited.contains(&s.index))
+            .cloned()
+            .collect();
+        let verification_score = if cited_sources.is_empty() {
+            // Nothing cited → nothing to verify. Skip the LLM call
+            // and write the page without a score (rather than
+            // stamping a misleading 0.0).
+            None
+        } else {
+            check_alive(job_id, &cancel)?;
+            mgr.update_phase(job_id, format!("verifying page {}/{}", idx + 1, plan.len()));
+            match llm_calls::verify_page(
+                provider.as_ref(),
+                &model,
+                &rewritten,
+                &cited_sources,
+                config.llm_timeout,
+                &cancel,
+            )
+            .await
+            {
+                Ok(report) => {
+                    if let Some(section) = report.render_flagged_section() {
+                        rewritten.push_str(&section);
+                    }
+                    Some(report.score)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[research] verify pass failed for {}: {e} — writing page without verification record",
+                        page.slug
+                    );
+                    None
+                }
+            }
+        };
 
         let path = kms_writer::write_research_page(
             &kms_name,
@@ -367,6 +426,7 @@ pub async fn run_with_tools(
             &query,
             &today,
             &rewritten,
+            verification_score,
         )?;
         if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
             last_page_path = Some(name.to_string());

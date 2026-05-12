@@ -31,6 +31,19 @@ pub struct AppConfig {
     /// Anthropic extended-thinking token budget. `None` or 0 → disabled.
     pub thinking_budget: Option<u32>,
 
+    /// Per-chunk idle timeout (seconds) applied to every streaming
+    /// provider's `byte_stream.next()` await. If the provider goes
+    /// silent for this long mid-stream the response is aborted with
+    /// an actionable error ("stream idle for Ns — try again") so the
+    /// UI doesn't hang silently until the user force-quits.
+    /// Default 120 s — generous for research / long-reasoning turns
+    /// where the model can legitimately pause mid-stream. The original
+    /// constant (PR #81 / #83) was 30 s, which proved too tight for
+    /// `/research` workloads + slow Anthropic Opus / GPT-5 reasoning.
+    /// Set to `0` to fall back to the compile-time default of 120 s.
+    #[serde(default = "default_stream_chunk_timeout_secs")]
+    pub stream_chunk_timeout_secs: u64,
+
     /// Search engine for WebSearch tool: "auto" (default), "tavily", "brave", "duckduckgo".
     pub search_engine: String,
 
@@ -135,6 +148,12 @@ pub struct AppConfig {
     pub translator_subagent_model: Option<String>,
 }
 
+/// Default stream-chunk idle timeout. Used by `serde(default = ...)`
+/// for backward-compat with settings files that pre-date the field.
+fn default_stream_chunk_timeout_secs() -> u64 {
+    120
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         AppConfig {
@@ -148,6 +167,7 @@ impl Default for AppConfig {
             // 10K thinking budget suits the "design a small component"
             // class of task without burning budget on trivial edits.
             thinking_budget: Some(10000),
+            stream_chunk_timeout_secs: default_stream_chunk_timeout_secs(),
             search_engine: "auto".to_string(),
             allowed_tools: None,
             disallowed_tools: None,

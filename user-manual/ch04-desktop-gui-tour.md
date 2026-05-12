@@ -35,6 +35,27 @@ When a key is saved via Settings, the dot flips to green and the active model ma
 
 **Inline model picker** (v0.7.2+): clicking the Provider row opens a search-as-you-type dropdown listing every model the catalogue knows about, grouped by provider, plus any local Ollama models discovered live via `/api/tags`. Click a row to switch — the change persists to `.thclaws/settings.json` and the active provider rebuilds in place (same path as `/model`). Esc or click-outside dismisses without changing.
 
+### Right-edge sidebars (contextual)
+
+The right side of the window hosts a set of context-sensitive sidebars that appear only when their feature is in use. Each is a fixed-width 260 px column with a chevron tab to collapse/restore and an `X` to dismiss.
+
+| Sidebar | Trigger | Purpose |
+|---|---|---|
+| **Goal** | `/goal start` active | Shows current goal + iteration budget + token consumption — see [chapter 19](ch19-scheduling.md) |
+| **Todo** | `TodoWrite` called | Live checklist from `.thclaws/todos.md` — see [chapter 18](ch18-plan-mode.md) |
+| **Plan** | Plan mode active | Step-by-step plan with approve / cancel / skip controls |
+| **Research** | `/research` running or recent | Iteration progress, score history, phase log — see [chapter 20](ch20-research.md) |
+| **Background agents** | `/dream` / `/agent` / `/translator` running | Live elapsed time + last tool call for every side-channel agent; auto-prunes finished entries after 5 min — covered below |
+| **KMS browser** | Click a KMS row's title in the left sidebar | Lists pages + sources; click an entry to open the viewer overlay |
+
+When several are active at once they stack right-to-left in this order: Goal → Todo → Plan → Research → Background agents → KMS browser. Any combination is fine.
+
+**Background agents sidebar** — the inline chat bubble for a `/dream` (or any side-channel run) can scroll out of view during a long run; this sidebar is the persistent "is it still running?" answer. Each running entry shows ◉ + agent name + live elapsed time (1 s tick); when an agent finishes you see ✓ + total duration + (for `/dream`) a `→ dream-YYYY-MM-DD` hint pointing at the summary page. Errors show ✗ + the first line of the error. Finished/errored entries linger for 5 min so you can read the outcome.
+
+When the panel is dismissed but agents are still running, the collapsed chevron tab glows in the accent color so you don't forget about the work in flight. Click the chevron to bring the panel back.
+
+**KMS browser sidebar** — opens when you click a KMS title in the left sidebar. The file currently open in the viewer overlay is highlighted with an accent-colored left border, tinted background, and bold weight, so you can see at a glance which entry in the listing maps to what's on screen. The highlight is scoped to the currently-browsed KMS — opening a file from KMS-A while you have KMS-B's browser open does not light up a same-named entry in KMS-B.
+
 ### Tab bar
 
 Four main tabs, plus the settings gear on the right.

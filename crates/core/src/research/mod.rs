@@ -5,7 +5,7 @@
 //! 2. asks the LLM to extract subtopics from query + seed
 //! 3. iterates: parallel search per subtopic → fetch top-3 → accumulate
 //! 4. asks the LLM to score completeness (0.0-1.0) + free-form notes
-//! 5. if score < threshold (default 0.75) and iter < max, generate
+//! 5. if score < threshold (default 0.80) and iter < max, generate
 //!    next-round subtopics from notes, loop
 //! 6. on exit (score reached / max_iter / cancel), synthesize markdown
 //!    with `[N]` citations, write to KMS as a timestamped note + update
@@ -88,7 +88,7 @@ pub struct JobConfig {
     /// Maximum iterations regardless of score. Hard ceiling. Default 8.
     pub max_iter: u32,
     /// LLM-reported completeness score that ends the loop early
-    /// (between `min_iter` and `max_iter`). Range 0.0-1.0. Default 0.75.
+    /// (between `min_iter` and `max_iter`). Range 0.0-1.0. Default 0.80.
     pub score_threshold: f32,
     /// Subtopics per iteration. Default 4 — balances breadth vs cost.
     pub subtopics_per_iter: u32,
@@ -115,7 +115,7 @@ impl Default for JobConfig {
         Self {
             min_iter: 2,
             max_iter: 8,
-            score_threshold: 0.75,
+            score_threshold: 0.80,
             subtopics_per_iter: 4,
             fetch_top_n: 3,
             max_pages: 7,
@@ -271,9 +271,17 @@ impl ResearchManager {
             let mut g = j.write().unwrap();
             g.view.iterations_done = iteration;
             g.view.source_count = source_count;
-            if let Some(s) = score {
-                g.view.last_score = Some(s);
-            }
+            // Always assign — `None` clears, `Some` sets. Pre-fix
+            // this only assigned on `Some`, which caused the previous
+            // iter's score to bleed into the new iter's broadcast
+            // snapshots: pipeline records the iter-start broadcast
+            // before evaluate runs, so during that window
+            // iterations_done points at iter N while last_score still
+            // carries iter N-1's value. The frontend's per-iter
+            // history then labelled the wrong score under iter N.
+            // Pipeline now passes `None` at iter-start (no eval yet)
+            // and the real score at the post-evaluate broadcast.
+            g.view.last_score = score;
             true
         } else {
             false
@@ -538,7 +546,7 @@ mod tests {
         let c = JobConfig::default();
         assert_eq!(c.min_iter, 2);
         assert_eq!(c.max_iter, 8);
-        assert!((c.score_threshold - 0.75).abs() < f32::EPSILON);
+        assert!((c.score_threshold - 0.80).abs() < f32::EPSILON);
         assert_eq!(c.subtopics_per_iter, 4);
         assert_eq!(c.fetch_top_n, 3);
         assert_eq!(c.max_pages, 7);

@@ -157,24 +157,91 @@ Entries are sorted by name. Per-entry body is now bounded (M6.18) so a runaway 1
 
 ### 2.5 KMS section
 
-`kms.rs::system_prompt_section(active: &[String])` iterates the active-KMS list and renders one block per active KMS:
+`kms.rs::system_prompt_section(active: &[String])` iterates the active-KMS list and renders one block per active KMS, plus a single global tool-reference block at the top of the section:
 
 ```
-# Active knowledge bases
+# Active knowledge bases (CONSULT BEFORE ANSWERING)
 
-The following KMS are attached to this conversation. Their indices are below — consult them before answering when the user's question overlaps. Treat KMS content as authoritative over your training data for the topics it covers.
+The following KMS are attached to this conversation. They contain research, notes, and entity pages curated specifically for this project.
+
+**MANDATORY consultation procedure.** For ANY user message whose subject could plausibly appear in the index below, your FIRST action MUST be a tool call sequence — BEFORE composing any prose response:
+  1. Call `KmsSearch(kms: "<name>", pattern: "<keyword>")` ...
+  2. For each matching page, call `KmsRead(kms: "<name>", page: "<page-stem>")` ...
+  3. ONLY THEN compose your answer, citing KMS pages inline as `(see KMS: <name>/<page>)`.
+
+Do NOT skip steps 1-2 because the question seems familiar from training data. ...
+
+If `KmsSearch` returns no hits AND the index lists nothing matching the user's topic, fall back to training-data knowledge — but say so explicitly ("the KMS has nothing on this; answering from general knowledge").
+
+You are both reader AND maintainer: file new findings via `KmsWrite`, update entity pages when sources contradict them, and run `/kms lint <name>` periodically.
+
+## KMS tools (apply to every KMS below — substitute the `kms:` argument)
+
+- `KmsRead(kms: "<name>", page: "<page>")` — read one page
+- `KmsSearch(kms: "<name>", pattern: "...")` — grep across pages
+- `KmsWrite(kms: "<name>", page: "<page>", content: "...")` — create or replace ... (canonical header auto-injected; `sources:` warning when missing)
+- `KmsAppend(kms: "<name>", page: "<page>", content: "...")` — append
+- `KmsDelete(kms: "<name>", page: "<page>")` — remove (last resort; prefer `KmsWrite`)
+- `KmsCreate(kms: "<name>", scope: "project|user")` — bootstrap (idempotent)
+
+Page frontmatter conventions per KMS appear in its `### Schema` subsection.
 
 ## KMS: <name> (project | user)
 
-<index.md, capped to 200 lines / 25 KB via truncate_for_prompt — M6.18 BUG M7>
+### Schema
+<SCHEMA.md, capped to 100 lines / 5 KB via read_text_capped>
 
-To read a specific page, call `KmsRead(kms: "<name>", page: "<page>")`.
-To grep all pages, call `KmsSearch(kms: "<name>", pattern: "...")`.
+### Index
+<categorized or raw index.md, 200 lines / 25 KB cap>
 ```
 
 Empty active list → empty string (composer skips the section).
 
+**Tool reference globalised (audit finding B).** Pre-fix the per-KMS block carried its own `### Tools` subsection (~250 bytes each), duplicating identical content with only the `kms: "<name>"` argument differing. The single global `## KMS tools` block sits between the MANDATORY procedure and the per-KMS subsections, saving ~200 bytes per additional attached KMS. Also surfaces `KmsCreate` which was previously discoverable only via the registry — `/dream` bootstrap workflows now show up in the system prompt.
+
+**Schema concision (audit finding C).** `kms::create` previously seeded `SCHEMA.md` with two fenced-code examples (input shape + "Final on-disk shape"). The on-disk example is inert for the model — `KmsWrite` stamps it automatically. The template now carries only the input shape, saving ~300 bytes per KMS rendered into the prompt. Existing KMSes keep their old SCHEMA.md (no migration; human-editable).
+
 `KmsRef::read_index` defends against symlink exfil (`index.md → /etc/passwd`); `page_path` rejects path traversal, absolute paths, control chars, symlink trickery. See [`marketplace.md`](marketplace.md) §6 for the org-policy gate that limits which KMS allowlist URLs the user can install.
+
+### 2.5.5 External services section
+
+`shared_session.rs::services_prompt_section()` renders a small capability index immediately after the KMS section. Always non-empty (WebSearch is the always-on floor — DuckDuckGo backend works without any API key):
+
+```
+# External services
+
+- **HAL Public API** (key set). `WebFetch` now runs **both** a HAL headless-browser scrape **and** a plain HTTP GET in parallel on every call, returning a single combined response with each section clearly labelled (`[via HAL …]` then `[via plain HTTP GET …]`). … Reach directly for `WebScrape` only when you need advanced HAL parameters … Use `YouTubeTranscript` for video captions ...
+- **Web search**. `WebSearch` returns titles, URLs, and snippets from the live web — currently Tavily (best quality). Auto-picks the best available backend at call time: Tavily → Brave → DuckDuckGo. ... Reach for this instead of `Bash` + `curl` for any web lookup.
+```
+
+The HAL bullet is conditional on `std::env::var("HAL_API_KEY")` being non-empty (whitespace-only counts as unset — `staleness_warning`-style normalisation). The WebSearch bullet always renders; the backend hint string varies by which keys are set:
+
+| `TAVILY_API_KEY` | `BRAVE_SEARCH_API_KEY` | Hint |
+|---|---|---|
+| set | _any_ | "currently Tavily (best quality)" |
+| unset | set | "currently Brave" |
+| unset | unset | "currently DuckDuckGo (no key set — paste a Tavily or Brave key in Settings for better results)" |
+
+**Motivation (audit finding).** `tool_defs()` already filters `WebScrape` / `YouTubeTranscript` by `requires_env`, so the schemas reach the model when `HAL_API_KEY` is set. But the model — even Claude — has to *notice* an unfamiliar tool name in a 25-entry tools-param list. Pre-fix the model defaulted to `WebFetch` for everything (the name it recognises from training data) and never reached for HAL-backed tools even though they were technically visible. WebSearch had the same problem: the model would shell out via `Bash` + `curl` instead of calling `WebSearch`. The Services section names them explicitly with one-line "when to pick" hints, dislodging both habits.
+
+### 2.5.6 Document & spreadsheet generation section
+
+`shared_session.rs::documents_prompt_section()` renders unconditionally — its tools (`DocxCreate` / `DocxRead` / `XlsxCreate` / `XlsxRead` / `PptxCreate` / `PptxRead` / `PdfCreate` / `PdfRead`) are unconditionally registered in `ToolRegistry::with_builtins`, so the prompt section's only job is discoverability:
+
+```
+# Document & spreadsheet generation
+
+When the user asks to create or read Word docs, Excel sheets, PowerPoint decks, or PDFs, reach for these native tools instead of shelling out to Python libraries. They are bundled (no setup on the user's machine), embed Noto Sans Thai (mixed Thai/Latin renders correctly), and produce predictable output.
+
+- **DocxCreate** / **DocxRead** — Word `.docx`. ...
+- **XlsxCreate** / **XlsxRead** — Excel `.xlsx`. ...
+- **PptxCreate** / **PptxRead** — PowerPoint `.pptx`. ...
+- **PdfCreate** / **PdfRead** — PDF. ...
+
+Use these for the matching format every time. Do NOT call generic `Read` on `.docx` / `.xlsx` / `.pptx` / `.pdf` — it returns raw bytes the model can't parse; the dedicated `*Read` tool extracts to model-readable text.
+```
+
+Pre-fix the model defaulted to `Bash` + `python-docx` / `openpyxl` / `python-pptx` / `reportlab` when asked to "make a PDF" — those depend on the user's Python env (often broken), are slow, and produce inconsistent output. The section explicitly nudges toward the native bundled tools.
 
 ### 2.6 Team grounding
 

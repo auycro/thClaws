@@ -144,7 +144,7 @@ pub async fn spawn_side_channel(
     let events_tx_for_task = events_tx.clone();
     let cancel_for_task = cancel.clone();
 
-    let join = tokio::spawn(async move {
+    let inner = tokio::spawn(async move {
         // Stream events as the child runs, forwarding to chat surface.
         let stream = agent.run_turn(prompt);
         let mut stream = Box::pin(stream);
@@ -205,6 +205,52 @@ pub async fn spawn_side_channel(
         // Always remove from registry on exit, regardless of outcome.
         if let Ok(mut reg) = registry().lock() {
             reg.remove(&id_for_task);
+        }
+    });
+
+    // Watchdog. The inner task's body emits Done/Error and cleans the
+    // registry on its own — but only if it reaches that code. A panic
+    // inside the agent loop (or the provider it polls) unwinds the
+    // task and tokio converts that into `Err(JoinError::Panic)` on the
+    // JoinHandle. Without this watchdog the sidebar would show the
+    // agent as "running forever" and the registry entry would leak.
+    // The watchdog awaits the inner task, detects abnormal exits, and
+    // emits a `SideChannelError` + removes the registry entry so the
+    // UI converges to the ✗ state and `/agents` listings stay clean.
+    let id_for_watchdog = id.clone();
+    let events_tx_for_watchdog = events_tx.clone();
+    let join = tokio::spawn(async move {
+        match inner.await {
+            Ok(()) => {
+                // Normal path — inner already emitted Done/Error and
+                // removed itself from the registry. Nothing for the
+                // watchdog to do.
+            }
+            Err(je) => {
+                let err_msg = if je.is_panic() {
+                    let payload = je.into_panic();
+                    let panic_msg = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic payload".to_string());
+                    format!("agent panicked: {panic_msg}")
+                } else if je.is_cancelled() {
+                    // Tokio-level abort (e.g. runtime shutdown). The
+                    // inner task didn't get to emit. Treat as error so
+                    // the UI doesn't stick on "running".
+                    "tokio task aborted".to_string()
+                } else {
+                    "tokio task ended unexpectedly".to_string()
+                };
+                let _ = events_tx_for_watchdog.send(ViewEvent::SideChannelError {
+                    id: id_for_watchdog.clone(),
+                    error: err_msg,
+                });
+                if let Ok(mut reg) = registry().lock() {
+                    reg.remove(&id_for_watchdog);
+                }
+            }
         }
     });
 
@@ -388,6 +434,103 @@ mod tests {
         assert!(
             !reg.contains_key(&id),
             "channel should be removed from registry on exit"
+        );
+    }
+
+    /// Provider whose `stream()` panics on first invocation — used to
+    /// drive the watchdog code path. The panic happens after
+    /// spawn_side_channel returns (inside the inner tokio task), so
+    /// the function call itself succeeds and the SideChannelError
+    /// surfaces asynchronously via the broadcast channel.
+    struct PanicProvider;
+
+    #[async_trait]
+    impl Provider for PanicProvider {
+        async fn stream(&self, _req: StreamRequest) -> CrateResult<EventStream> {
+            panic!("intentional test panic from provider.stream");
+        }
+    }
+
+    struct PanicFactory;
+
+    #[async_trait]
+    impl AgentFactory for PanicFactory {
+        async fn build(
+            &self,
+            _prompt: &str,
+            _agent_def: Option<&AgentDef>,
+            _child_depth: usize,
+        ) -> Result<Agent> {
+            Ok(Agent::new(
+                Arc::new(PanicProvider),
+                crate::tools::ToolRegistry::new(),
+                "stub",
+                "system",
+            )
+            .with_approver(Arc::new(AutoApprover))
+            .with_max_iterations(2))
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_emits_error_on_panic() {
+        if let Ok(mut r) = registry().lock() {
+            r.clear();
+        }
+
+        // Suppress the default panic hook for the duration of this
+        // test so the intentional panic doesn't print a noisy
+        // backtrace to the test output. The runtime still catches it
+        // and reports via JoinError::Panic; we just don't need the
+        // stderr noise.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let (events_tx, mut events_rx) = broadcast::channel(64);
+        let factory = Arc::new(PanicFactory);
+        let agent_defs = crate::agent_defs::AgentDefsConfig {
+            agents: vec![AgentDef {
+                name: "translator".into(),
+                max_iterations: 1,
+                ..AgentDef::default()
+            }],
+        };
+        let id = spawn_side_channel(
+            "translator".into(),
+            "boom".into(),
+            factory,
+            agent_defs,
+            events_tx,
+        )
+        .await
+        .expect("spawn ok — panic happens inside task, not at spawn time");
+
+        // Watchdog should fire a SideChannelError within ~1s.
+        let mut saw_error = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            let res =
+                tokio::time::timeout(std::time::Duration::from_millis(200), events_rx.recv()).await;
+            if let Ok(Ok(ViewEvent::SideChannelError { id: i, error })) = res {
+                if i == id && error.contains("panicked") {
+                    saw_error = true;
+                    break;
+                }
+            }
+        }
+
+        // Restore the panic hook before any assertion can fail so the
+        // test harness's own panic reporting works correctly.
+        std::panic::set_hook(prev_hook);
+
+        assert!(saw_error, "watchdog should emit SideChannelError on panic");
+
+        // Registry should be empty after the watchdog cleans up.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let reg = registry().lock().unwrap();
+        assert!(
+            !reg.contains_key(&id),
+            "watchdog should remove registry entry after a panicked task"
         );
     }
 

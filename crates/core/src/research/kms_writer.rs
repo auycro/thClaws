@@ -449,8 +449,19 @@ pub fn write_research_page(
     query: &str,
     today: &str,
     body: &str,
+    verification_score: Option<f32>,
 ) -> Result<std::path::PathBuf> {
     let kref = resolve_or_create_kms(kms_name)?;
+    // `verified: <today>` is stamped on every research page so the
+    // KmsRead staleness check has a baseline. `verification_score`
+    // (when present) records the fraction of factual claims the
+    // verify pass rated `Supported` — readers can sort or filter on
+    // it. Skip the field when verification didn't run so we don't
+    // misleadingly stamp a 0.0 score on pages that weren't audited.
+    let verify_line = match verification_score {
+        Some(score) => format!("verification_score: {:.2}\n", score),
+        None => String::new(),
+    };
     let composed = format!(
         "---\n\
          title: \"{}\"\n\
@@ -460,7 +471,8 @@ pub fn write_research_page(
          topic: \"{}\"\n\
          created: {today}\n\
          updated: {today}\n\
-         ---\n\n\
+         verified: {today}\n\
+         {verify_line}---\n\n\
          {}\n",
         escape_yaml_string(page_title),
         page_slug,
@@ -940,6 +952,7 @@ mod tests {
             "what is OBON",
             "2026-05-09",
             "Andrej Karpathy is a researcher [1].\n\n## Background\n\nMore here.",
+            Some(0.95),
         )
         .unwrap();
         assert!(

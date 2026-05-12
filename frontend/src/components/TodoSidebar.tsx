@@ -31,14 +31,24 @@ const STATUS_COLOR: Record<TodoStatus, string> = {
 };
 
 export function TodoSidebar() {
-  /// `null` = no envelope received yet (sidebar suppressed); empty array
-  /// = explicit "no todos" (sidebar collapses to chevron tab so the
-  /// user can confirm the list is empty rather than wondering whether
-  /// it's broken). Distinct from PlanSidebar which always hides on
-  /// null because plan-mode is opt-in; TodoWrite is informal so we
-  /// want a visible "still empty" affordance once any update has
-  /// landed.
-  const [todos, setTodos] = useState<TodoItem[] | null>(null);
+  /// Empty array initial state (pre-fix: `null`). The original `null`
+  /// design suppressed the sidebar entirely until the first
+  /// `chat_todo_update` envelope arrived — meant to avoid a half-
+  /// second flash on session boot before the worker's hydration
+  /// broadcast landed. Bug: the worker fires the boot
+  /// `TodoUpdate(read_todos_from_disk(cwd))` event before
+  /// `gui.rs::spawn_event_translator` has subscribed to the broadcast
+  /// channel (the worker spawns first; the translator a couple lines
+  /// later). Tokio's broadcast channel doesn't retain messages for
+  /// late subscribers, so the boot event is silently dropped and
+  /// `todos` stays `null` forever — the sidebar never appears even
+  /// after the model calls TodoWrite later in the session (subsequent
+  /// fires arrive, but `todos === null` only becomes `[]` then immediately
+  /// `[items]`, and the user only notices the first time the model
+  /// uses it on a multi-step task, not on every session). Starting at
+  /// `[]` sidesteps the race: we always render the empty-state panel
+  /// from mount; live envelopes patch in whenever they arrive.
+  const [todos, setTodos] = useState<TodoItem[]>([]);
   const [dismissed, setDismissed] = useState(false);
 
   useEffect(() => {
@@ -56,18 +66,12 @@ export function TodoSidebar() {
   }, []);
 
   const counts = useMemo(() => {
-    if (!todos) return { done: 0, in_progress: 0, total: 0 };
     return {
       done: todos.filter((t) => t.status === "completed").length,
       in_progress: todos.filter((t) => t.status === "in_progress").length,
       total: todos.length,
     };
   }, [todos]);
-
-  /// Suppress the sidebar entirely until the first envelope arrives —
-  /// this avoids a half-second flash on session boot before the
-  /// hydration broadcast lands.
-  if (todos === null) return null;
 
   /// Empty + dismissed → don't even show the chevron tab. There's
   /// nothing to peek at, and the user has already opted out of seeing

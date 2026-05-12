@@ -816,6 +816,15 @@ impl Agent {
         self.history.lock().expect("history lock").clone()
     }
 
+    /// Borrow the underlying provider. Used by the worker to call
+    /// `Provider::provider_session_id` after each turn so any
+    /// captured server-side session UUID can be persisted to the
+    /// thClaws session JSONL for resume-across-restart support
+    /// (`anthropic-agent` SDK only — other providers return `None`).
+    pub fn provider(&self) -> &Arc<dyn Provider> {
+        &self.provider
+    }
+
     pub fn clear_history(&self) {
         self.history.lock().expect("history lock").clear();
     }

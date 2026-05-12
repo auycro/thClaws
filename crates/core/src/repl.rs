@@ -558,6 +558,12 @@ pub enum SlashCommand {
     /// hint pointing at the desktop tab.
     Dream {
         focus: String,
+        /// `--all` flag — process every `.jsonl` session file rather
+        /// than the default last-10 cap. Heavier but catches insights
+        /// from older sessions when the user hasn't `/dream`-ed in a
+        /// while. Also widens the targeted-reconciliation scope (Pass
+        /// 3b inside dream.md) to every page Pass 3 touched.
+        all_sessions: bool,
     },
     Unknown(String),
 }
@@ -802,7 +808,7 @@ fn parse_schedule_preset_subcommand(args: &str) -> SlashCommand {
 ///   --kms <name>           — explicit KMS target (default: auto-derive)
 ///   --min-iter N           — hard floor (default 2)
 ///   --max-iter K           — hard ceiling (default 8)
-///   --score-threshold 0.X  — early-stop threshold (default 0.75)
+///   --score-threshold 0.X  — early-stop threshold (default 0.80)
 ///   --budget-tokens N      — token budget (informational; deferred)
 ///   --budget-time SEC      — wall-clock budget seconds (default 900)
 fn parse_research_subcommand(args: &str) -> SlashCommand {
@@ -1346,9 +1352,23 @@ pub fn parse_slash(input: &str) -> Option<SlashCommand> {
         "schedule" | "sched" => parse_schedule_subcommand(args),
         "agent" => parse_agent_subcommand(args),
         "agents" => SlashCommand::AgentsList,
-        "dream" => SlashCommand::Dream {
-            focus: args.to_string(),
-        },
+        "dream" => {
+            // Parse `--all` flag (order-insensitive). Anything else is
+            // the focus topic. `/dream auth --all` and `/dream --all
+            // auth` both work.
+            let mut focus_parts: Vec<&str> = Vec::new();
+            let mut all_sessions = false;
+            for tok in args.split_whitespace() {
+                match tok {
+                    "--all" => all_sessions = true,
+                    other => focus_parts.push(other),
+                }
+            }
+            SlashCommand::Dream {
+                focus: focus_parts.join(" "),
+                all_sessions,
+            }
+        }
         // Parse-time alias: `/translate xxx` → `/agent translator xxx`.
         // Same dispatch path as /agent, so behavior, permissions, and
         // settings.json model overrides (translator_subagent_model)
@@ -3336,18 +3356,28 @@ pub async fn run_print_mode(config: AppConfig, prompt: &str, verbose: bool) -> R
     }
 
     let mut tool_registry = ToolRegistry::with_builtins();
-    if !config.kms_active.is_empty() {
-        tool_registry.register(Arc::new(crate::tools::KmsReadTool));
-        tool_registry.register(Arc::new(crate::tools::KmsSearchTool));
-        // M6.25 BUG #1: write tools alongside read tools.
-        tool_registry.register(Arc::new(crate::tools::KmsWriteTool));
-        tool_registry.register(Arc::new(crate::tools::KmsAppendTool));
-        tool_registry.register(Arc::new(crate::tools::KmsDeleteTool));
-    }
+    // KMS tools always-on (pre-fix this was gated by
+    // `!kms_active.is_empty()`, but /dream's side-channel agent
+    // inherits this registry and needs KmsCreate/KmsWrite to
+    // bootstrap its `dreams` audit KMS even when the user hasn't
+    // run `/kms use ...` yet). Same reasoning as shared_session.rs.
+    tool_registry.register(Arc::new(crate::tools::KmsReadTool));
+    tool_registry.register(Arc::new(crate::tools::KmsSearchTool));
+    // M6.25 BUG #1: write tools alongside read tools.
+    tool_registry.register(Arc::new(crate::tools::KmsWriteTool));
+    tool_registry.register(Arc::new(crate::tools::KmsAppendTool));
+    tool_registry.register(Arc::new(crate::tools::KmsDeleteTool));
+    // KmsCreate for /dream's `dreams` audit-log KMS bootstrap.
+    tool_registry.register(Arc::new(crate::tools::KmsCreateTool));
     // M6.26 BUG #1: Memory tools always-on (model can create first entry).
     tool_registry.register(Arc::new(crate::tools::MemoryReadTool));
     tool_registry.register(Arc::new(crate::tools::MemoryWriteTool));
     tool_registry.register(Arc::new(crate::tools::MemoryAppendTool));
+    // M6.46: SessionRename — primarily for the dream subagent so it
+    // can re-title sessions while mining them. Registered always-on
+    // because tool filtering happens via per-agent allow-lists, not
+    // here.
+    tool_registry.register(Arc::new(crate::tools::SessionRenameTool));
     let (_mcp_clients, _mcp_summary) =
         load_mcp_servers(&config.mcp_servers, &mut tool_registry).await;
 
@@ -3428,6 +3458,12 @@ pub async fn run_print_mode(config: AppConfig, prompt: &str, verbose: bool) -> R
 /// Interactive REPL. Reads from stdin via `rustyline`, streams assistant
 /// output live, handles slash commands. Runs until `/quit`, EOF, or Ctrl-C.
 pub async fn run_repl(mut config: AppConfig) -> Result<()> {
+    // Push the configured stream-chunk timeout into the providers'
+    // global atomic. Same hook the GUI/serve worker uses at boot —
+    // ensures CLI users get the configurable timeout too (default
+    // 120s, override via `stream_chunk_timeout_secs` in settings.json).
+    crate::providers::set_stream_chunk_timeout_secs(config.stream_chunk_timeout_secs);
+
     let cwd = std::env::current_dir()?;
     let ctx = ProjectContext::discover(&cwd)?;
     let memory_store = MemoryStore::default_path().map(MemoryStore::new);
@@ -3461,18 +3497,25 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
     // Build the tool registry once, with built-ins + task tools + MCP tools.
     // Override WebSearch with the configured engine (with_builtins uses "auto").
     let mut tool_registry = ToolRegistry::with_builtins();
-    if !config.kms_active.is_empty() {
-        tool_registry.register(Arc::new(crate::tools::KmsReadTool));
-        tool_registry.register(Arc::new(crate::tools::KmsSearchTool));
-        // M6.25 BUG #1: write tools alongside read tools.
-        tool_registry.register(Arc::new(crate::tools::KmsWriteTool));
-        tool_registry.register(Arc::new(crate::tools::KmsAppendTool));
-        tool_registry.register(Arc::new(crate::tools::KmsDeleteTool));
-    }
+    // KMS tools always-on (pre-fix this was gated by
+    // `!kms_active.is_empty()`, but /dream's side-channel agent
+    // inherits this registry and needs KmsCreate/KmsWrite to
+    // bootstrap its `dreams` audit KMS even when the user hasn't
+    // run `/kms use ...` yet). Same reasoning as shared_session.rs.
+    tool_registry.register(Arc::new(crate::tools::KmsReadTool));
+    tool_registry.register(Arc::new(crate::tools::KmsSearchTool));
+    // M6.25 BUG #1: write tools alongside read tools.
+    tool_registry.register(Arc::new(crate::tools::KmsWriteTool));
+    tool_registry.register(Arc::new(crate::tools::KmsAppendTool));
+    tool_registry.register(Arc::new(crate::tools::KmsDeleteTool));
+    // KmsCreate for /dream's `dreams` audit-log KMS bootstrap.
+    tool_registry.register(Arc::new(crate::tools::KmsCreateTool));
     // M6.26 BUG #1: Memory tools always-on (model can create first entry).
     tool_registry.register(Arc::new(crate::tools::MemoryReadTool));
     tool_registry.register(Arc::new(crate::tools::MemoryWriteTool));
     tool_registry.register(Arc::new(crate::tools::MemoryAppendTool));
+    // M6.46: SessionRename — for dream + power-user manual rename.
+    tool_registry.register(Arc::new(crate::tools::SessionRenameTool));
     if config.search_engine != "auto" {
         tool_registry.register(Arc::new(crate::tools::WebSearchTool::new(
             &config.search_engine,
@@ -3810,6 +3853,15 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
             };
             if let Some(s) = loaded {
                 agent.set_history(s.messages.clone());
+                // Rehydrate the provider-side session id so the SDK
+                // subprocess resumes its server-side conversation
+                // on the first `--resume <uuid>` call instead of
+                // starting fresh. Mirrors shared_session.rs's load
+                // path — without this, CLI `/resume` lost SDK
+                // history the same way GUI /load did pre-fix.
+                agent
+                    .provider()
+                    .set_provider_session_id(s.provider_session_id.clone());
                 session = s;
                 println!(
                     "{COLOR_DIM}resumed session {} ({} messages){COLOR_RESET}",
@@ -4976,6 +5028,9 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                             match loaded_result {
                                 Ok(loaded) => {
                                     agent.set_history(loaded.messages.clone());
+                                    agent.provider().set_provider_session_id(
+                                        loaded.provider_session_id.clone(),
+                                    );
                                     session = loaded;
                                     // M6.20 BUG M2 + M3: clear yolo
                                     // flag and reset permission mode
@@ -7820,8 +7875,8 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         );
                     }
                 }
-                SlashCommand::Dream { focus } => {
-                    let _ = focus;
+                SlashCommand::Dream { focus, all_sessions } => {
+                    let _ = (focus, all_sessions);
                     #[cfg(feature = "gui")]
                     {
                         println!(
@@ -8048,6 +8103,28 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     lead_log!("{COLOR_RESET}\n{COLOR_YELLOW}error: {e}{COLOR_RESET}\n");
                     break;
                 }
+            }
+        }
+    }
+
+    // Discard-on-exit for sessions the user never engaged with —
+    // same rule as the GUI worker (see shared_session.rs near
+    // `SessionEnd` for the rationale). A fresh CLI launch mints a
+    // session whose JSONL header lands on disk on first event;
+    // exiting without a single message leaves an empty file that
+    // shows up in the sidebar / `--resume last` flow as a
+    // confusing ghost entry.
+    if session.messages.is_empty() && session.title.is_none() {
+        if let Some(ref store) = session_store {
+            match store.delete(&session.id) {
+                Ok(()) => eprintln!(
+                    "{COLOR_DIM}[session] discarded empty session {} on exit{COLOR_RESET}",
+                    session.id
+                ),
+                Err(e) => eprintln!(
+                    "{COLOR_YELLOW}[session] could not discard empty session {}: {e}{COLOR_RESET}",
+                    session.id
+                ),
             }
         }
     }
@@ -9609,12 +9686,14 @@ mod tests {
             parse_slash("/dream auth"),
             Some(SlashCommand::Dream {
                 focus: "auth".into(),
+                all_sessions: false,
             }),
         );
         assert_eq!(
             parse_slash("/dream consolidate the marketplace KMS"),
             Some(SlashCommand::Dream {
                 focus: "consolidate the marketplace KMS".into(),
+                all_sessions: false,
             }),
         );
     }
@@ -9627,6 +9706,34 @@ mod tests {
             parse_slash("/dream"),
             Some(SlashCommand::Dream {
                 focus: String::new(),
+                all_sessions: false,
+            }),
+        );
+    }
+
+    #[test]
+    fn parse_slash_dream_all_flag() {
+        // `/dream --all` sets the flag, empty focus.
+        assert_eq!(
+            parse_slash("/dream --all"),
+            Some(SlashCommand::Dream {
+                focus: String::new(),
+                all_sessions: true,
+            }),
+        );
+        // Order-insensitive: focus + flag in either order.
+        assert_eq!(
+            parse_slash("/dream --all auth"),
+            Some(SlashCommand::Dream {
+                focus: "auth".into(),
+                all_sessions: true,
+            }),
+        );
+        assert_eq!(
+            parse_slash("/dream auth --all"),
+            Some(SlashCommand::Dream {
+                focus: "auth".into(),
+                all_sessions: true,
             }),
         );
     }

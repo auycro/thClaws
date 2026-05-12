@@ -314,9 +314,48 @@ pub fn create(name: &str, scope: KmsScope) -> Result<KmsRef> {
     )?;
     std::fs::write(
         kref.schema_path(),
-        "# Schema\n\nDescribe the shape of pages in this KMS — required\n\
-         sections, naming conventions, cross-link style. Both you and the\n\
-         agent read this before editing pages.\n",
+        // Concise schema template (audit finding C): the previous
+        // version duplicated the "Final on-disk shape" example, which
+        // the model never needs to author (the tool stamps it on
+        // write). Showing only the input shape saves ~300 bytes per
+        // KMS in the system prompt. Human authors editing this file
+        // directly can extend it with project-specific conventions.
+        "# Schema\n\n\
+         Describe the shape of pages in this KMS — required sections, naming\n\
+         conventions, cross-link style.\n\
+         \n\
+         ## Canonical page shape\n\
+         \n\
+         Write frontmatter + body. `title:`, `topic:`, and `sources:` are\n\
+         the three keys every page should carry. `KmsWrite` auto-injects\n\
+         the `# {title}` / `Description: {topic}` / `---` header block\n\
+         between the frontmatter and the body when the body doesn't\n\
+         already start with a `# heading`.\n\
+         \n\
+         ```\n\
+         ---\n\
+         title: Human-readable title\n\
+         topic: One-line description of what this page covers\n\
+         sources: [\"https://…\", \"session-XYZ\", \"memory\"]   # required: provenance\n\
+         category: optional grouping for the index\n\
+         tags: [optional, free-form]\n\
+         ---\n\
+         \n\
+         (body content)\n\
+         ```\n\
+         \n\
+         `sources:` values: external URLs for web-sourced facts,\n\
+         `session-<id>` for facts learned in a chat session, `memory`\n\
+         for stable user-supplied context, or `[]` for opinion /\n\
+         convention pages that genuinely have no external source\n\
+         (still write the empty list — it's an explicit ack, not an\n\
+         omission).\n\
+         \n\
+         Pages with no `verified:` frontmatter pick up a soft warning\n\
+         when read; pages with `verified:` older than 90 days get a\n\
+         staleness banner. The research pipeline stamps `verified:` on\n\
+         every page it writes — manual `KmsWrite` callers can stamp it\n\
+         too when they've checked the source against current reality.\n",
     )?;
     let manifest = KmsManifest {
         schema_version: KMS_SCHEMA_VERSION.into(),
@@ -821,16 +860,11 @@ pub fn system_prompt_section(active: &[String]) -> String {
             block.push_str(&format!("\n### Schema\n{}\n", schema.trim()));
         }
         block.push_str(&format!("\n### Index\n{index_section}\n"));
-        block.push_str(&format!(
-            "\n### Tools\n\
-             - `KmsRead(kms: \"{name}\", page: \"<page>\")` — read one page\n\
-             - `KmsSearch(kms: \"{name}\", pattern: \"...\")` — grep across pages\n\
-             - `KmsWrite(kms: \"{name}\", page: \"<page>\", content: \"...\")` — create or replace a page\n\
-             - `KmsAppend(kms: \"{name}\", page: \"<page>\", content: \"...\")` — append to a page\n\
-             - `KmsDelete(kms: \"{name}\", page: \"<page>\")` — remove a page (last resort; prefer KmsWrite to merge or supersede)\n\
-             Pages may carry YAML frontmatter (`category:`, `tags:`, `sources:`, `created:`, `updated:`). \
-             Follow the schema above when authoring."
-        ));
+        // Per-KMS `### Tools` subsection removed (audit finding B): the
+        // tool signatures don't vary by KMS, only the `kms: "<name>"`
+        // argument does — duplicating ~250 bytes per attached KMS was
+        // pure waste. Tool reference is now globalised once near the
+        // top of the section below.
         parts.push(block);
     }
     if parts.is_empty() {
@@ -845,6 +879,11 @@ pub fn system_prompt_section(active: &[String]) -> String {
         // skipped lookups as a correctness bug. Reader/maintainer
         // framing kept (still useful) but moved below the consultation
         // procedure so the directive lands first.
+        //
+        // Audit finding B (globalised KMS tool reference): the per-KMS
+        // tools subsection was identical across every attached KMS
+        // bar the `name` argument. Render once here, point each KMS
+        // block at it — saves ~200 bytes per additional KMS attached.
         format!(
             "# Active knowledge bases (CONSULT BEFORE ANSWERING)\n\n\
              The following KMS are attached to this conversation. They contain \
@@ -868,7 +907,15 @@ pub fn system_prompt_section(active: &[String]) -> String {
              has nothing on this; answering from general knowledge\").\n\n\
              You are both reader AND maintainer: file new findings via `KmsWrite`, update \
              entity pages when sources contradict them, and run `/kms lint <name>` \
-             periodically.\n\n{}",
+             periodically.\n\n\
+             ## KMS tools (apply to every KMS below — substitute the `kms:` argument)\n\n\
+             - `KmsRead(kms: \"<name>\", page: \"<page>\")` — read one page\n\
+             - `KmsSearch(kms: \"<name>\", pattern: \"...\")` — grep across pages\n\
+             - `KmsWrite(kms: \"<name>\", page: \"<page>\", content: \"...\")` — create or replace a page (the tool auto-injects the `# {{title}}` / `Description:` / `---` block when your body doesn't already start with a `# heading`; just write `title:` + `topic:` in YAML frontmatter and the body)\n\
+             - `KmsAppend(kms: \"<name>\", page: \"<page>\", content: \"...\")` — append to a page\n\
+             - `KmsDelete(kms: \"<name>\", page: \"<page>\")` — remove a page (last resort; prefer `KmsWrite` to merge or supersede)\n\
+             - `KmsCreate(kms: \"<name>\", scope: \"project|user\")` — bootstrap a new KMS (idempotent)\n\n\
+             Page frontmatter conventions per KMS appear in its `### Schema` subsection.\n\n{}",
             parts.join("\n\n")
         )
     }
@@ -1177,15 +1224,90 @@ pub fn write_page(kref: &KmsRef, page_name: &str, content: &str) -> Result<PathB
     if !existed {
         fm.entry("created".into()).or_insert(today.clone());
     }
-    let serialized = write_frontmatter(&fm, &body);
+    // Canonical page header: `# {title}\nDescription: {topic}\n---\n\n`
+    // injected between the frontmatter and the body. Skipped when the
+    // body already starts with its own `# heading` — model gets to
+    // keep an intentional title (e.g. dream's "Dream consolidation —
+    // YYYY-MM-DD"). title falls back to the page stem when frontmatter
+    // `title:` is absent; the Description line is omitted entirely
+    // when `topic:` is missing/blank (instead of rendering an empty
+    // value). Re-writes are idempotent because `body_has_leading_heading`
+    // detects the previously-injected `# title` and skips re-injection.
+    let canonical_body = maybe_inject_canonical_header(&body, &stem, &fm);
+    let serialized = write_frontmatter(&fm, &canonical_body);
     std::fs::write(&path, serialized.as_bytes())
         .map_err(|e| Error::Tool(format!("write {}: {e}", path.display())))?;
 
+    // Index summary uses the user-supplied body (not the
+    // canonical-header version) so the model's first real paragraph
+    // surfaces in the index — not the auto-injected `# {title}` line.
+    // The summary's job is to signal page relevance at a glance;
+    // the title is already visible in the link text in the index.
     let summary = first_meaningful_line(&body);
     let category = fm.get("category").cloned();
     update_index_for_write(kref, &stem, &summary, category.as_deref(), existed)?;
     append_log_header(kref, if existed { "edited" } else { "wrote" }, &stem)?;
     Ok(path)
+}
+
+/// Inject the canonical KMS-page header — `# {title}\nDescription: {topic}\n---\n\n`
+/// — between the frontmatter close and the body, when the body
+/// doesn't already start with its own `# heading`. Lenient by design:
+/// a model that intentionally wrote its own title (e.g. dream's
+/// "Dream consolidation — YYYY-MM-DD" or a research-pipeline page with
+/// a specifically-formatted title line) gets left alone. Pages that
+/// arrived as pure body — common when the model treats KmsWrite as a
+/// dump-content sink — get the canonical shape stamped on so the
+/// vault stays readable.
+///
+/// Fallbacks (matching the user-confirmed lenient policy):
+/// - `title:` missing or empty → use the page stem verbatim (e.g.
+///   `dream-2026-05-11`). Ugly but always present — the alternative
+///   is failing the write, which corrodes UX more than a stem-titled
+///   page corrodes the index.
+/// - `topic:` missing or blank → emit `# {title}\n---\n\n` (omit the
+///   Description line entirely). An empty `Description:` is noise.
+fn maybe_inject_canonical_header(
+    body: &str,
+    stem: &str,
+    fm: &std::collections::BTreeMap<String, String>,
+) -> String {
+    if body_has_leading_heading(body) {
+        return body.to_string();
+    }
+    let title = fm
+        .get("title")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(stem);
+    let topic = fm
+        .get("topic")
+        .map(String::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+
+    let mut out = String::from("\n");
+    out.push_str("# ");
+    out.push_str(title);
+    out.push('\n');
+    if !topic.is_empty() {
+        out.push_str("Description: ");
+        out.push_str(topic);
+        out.push('\n');
+    }
+    out.push_str("---\n\n");
+    out.push_str(body.trim_start());
+    out
+}
+
+/// Detect whether the body opens with a `# ` ATX heading — the signal
+/// that the model wrote its own title block and we should leave it
+/// alone (idempotent re-writes + respect for intentional formatting).
+/// Skips leading whitespace so trailing-newline noise from the
+/// frontmatter parse doesn't fool the check.
+fn body_has_leading_heading(body: &str) -> bool {
+    body.trim_start().starts_with("# ")
 }
 
 /// Append a chunk to a page. If the page doesn't exist, create it
@@ -2314,6 +2436,88 @@ mod tests {
         assert_eq!(out, "");
     }
 
+    /// Audit finding B: the per-KMS `### Tools` subsection that
+    /// pre-fix appeared in every attached KMS block (~250 bytes each)
+    /// is now globalised — rendered once near the top. With N KMSes
+    /// attached the saving compounds linearly. Lock the dedup so a
+    /// future "add a Tools section to each KMS block for clarity"
+    /// can't quietly regress us back to O(N) duplication.
+    #[test]
+    fn system_prompt_section_globalises_tools_reference() {
+        let _home = scoped_home();
+        let a = create("alpha", KmsScope::User).unwrap();
+        let b = create("beta", KmsScope::User).unwrap();
+        std::fs::write(a.index_path(), "# alpha\n- [x](pages/x.md) — x\n").unwrap();
+        std::fs::write(b.index_path(), "# beta\n- [y](pages/y.md) — y\n").unwrap();
+
+        let out = system_prompt_section(&["alpha".into(), "beta".into()]);
+
+        // The globalised header should appear exactly once.
+        let header_count = out.matches("## KMS tools").count();
+        assert_eq!(
+            header_count, 1,
+            "tools reference must appear exactly once for any number of KMSes, got {header_count}:\n{out}"
+        );
+        // Each KMS still has its own block (Schema + Index).
+        assert!(out.contains("## KMS: alpha"));
+        assert!(out.contains("## KMS: beta"));
+        // The per-KMS `### Tools` subsection must NOT reappear —
+        // that was the bug. (We still allow the global `## KMS tools`
+        // h2 to match `KMS tools` substring; check the h3 form
+        // specifically.)
+        assert!(
+            !out.contains("### Tools"),
+            "no per-KMS `### Tools` h3 subsection should remain (globalised): {out}"
+        );
+        // The tools themselves must still be reachable from the
+        // prompt — name-only check on the three most-called ones.
+        assert!(out.contains("KmsRead"));
+        assert!(out.contains("KmsWrite"));
+        assert!(out.contains("KmsSearch"));
+        // KmsCreate is now in the global block too — fix from the
+        // earlier dreams-KMS rollout that had previously surfaced
+        // KmsCreate only via the tool registry.
+        assert!(
+            out.contains("KmsCreate"),
+            "KmsCreate must appear in the globalised tools so /dream + bootstrap workflows are discoverable: {out}"
+        );
+    }
+
+    /// Audit finding C: SCHEMA.md template trimmed to a single input
+    /// example. The pre-fix template carried two fenced-code blocks
+    /// (input shape + "Final on-disk shape") — the second one was
+    /// inert for the model since `KmsWrite` stamps it automatically.
+    /// Save ~300 bytes per KMS by dropping it. Lock the trim so a
+    /// future "let's add the on-disk example back for clarity" edit
+    /// can't quietly re-balloon every prompt.
+    #[test]
+    fn create_writes_concise_schema_template() {
+        let _home = scoped_home();
+        let k = create("trimmed", KmsScope::User).unwrap();
+        let schema = std::fs::read_to_string(k.schema_path()).unwrap();
+        // Must still teach the canonical shape — the input frontmatter
+        // example. The model needs this to write correctly.
+        assert!(
+            schema.contains("title:"),
+            "schema must show title: frontmatter key"
+        );
+        assert!(
+            schema.contains("topic:"),
+            "schema must show topic: frontmatter key"
+        );
+        // Must NOT carry the dual-example bloat that ballooned the
+        // template (the "Final on-disk shape:" header + `created:` /
+        // `updated:` example were the markers of the verbose template).
+        assert!(
+            !schema.contains("Final on-disk shape"),
+            "schema template must not include the redundant on-disk example: {schema}"
+        );
+        assert!(
+            !schema.contains("created: 2026"),
+            "schema template must not bake a specific date — implies the on-disk example is back: {schema}"
+        );
+    }
+
     #[test]
     fn page_path_rejects_traversal() {
         let _home = scoped_home();
@@ -2626,13 +2830,133 @@ mod tests {
         assert_eq!(fm2.get("created").map(String::as_str), Some("1999-01-01"));
         // updated still gets a stamp.
         assert!(fm2.contains_key("updated"));
-        assert_eq!(body2, "v2");
+        // Canonical header was injected (body had no `# heading`), so
+        // body2 carries `# topic\n---\n\nv2` rather than just `v2`. The
+        // v2 payload must still be present at the tail.
+        assert!(body2.contains("v2"));
+        assert!(
+            body2.contains("# topic"),
+            "expected canonical `# {{stem}}` header to be injected when body had no heading; got: {body2}"
+        );
         // Index has exactly one entry for `topic` (no duplicates).
         let index = std::fs::read_to_string(k.index_path()).unwrap();
         let count = index.matches("(pages/topic.md)").count();
         assert_eq!(count, 1, "expected one entry, got {count}\n{index}");
         // Sanity: original `created` was today, the override moved it.
         assert_ne!(created, "1999-01-01");
+    }
+
+    #[test]
+    fn write_page_injects_canonical_header_with_title_and_topic() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::User).unwrap();
+        let path = write_page(
+            &k,
+            "auth-tokens",
+            "---\ntitle: Auth tokens\ntopic: how the API stores session tokens\n---\nWe rotate JWTs nightly.\n",
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let (_, body) = parse_frontmatter(&raw);
+        assert!(
+            body.contains("# Auth tokens"),
+            "title heading missing: {body}"
+        );
+        assert!(
+            body.contains("Description: how the API stores session tokens"),
+            "Description line missing: {body}"
+        );
+        assert!(body.contains("We rotate JWTs nightly."));
+    }
+
+    #[test]
+    fn write_page_falls_back_to_stem_when_title_missing() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::User).unwrap();
+        let path = write_page(
+            &k,
+            "dream-2026-05-11",
+            "---\ntopic: KMS audit log\n---\nSome dream content.\n",
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let (_, body) = parse_frontmatter(&raw);
+        // No `title:` → fall back to the page stem verbatim.
+        assert!(
+            body.contains("# dream-2026-05-11"),
+            "stem fallback missing: {body}"
+        );
+        assert!(body.contains("Description: KMS audit log"));
+    }
+
+    #[test]
+    fn write_page_omits_description_when_topic_missing() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::User).unwrap();
+        let path = write_page(&k, "bare", "Just body, no topic.\n").unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let (_, body) = parse_frontmatter(&raw);
+        assert!(body.contains("# bare"));
+        assert!(
+            !body.contains("Description:"),
+            "Description line should be omitted entirely when topic is missing; got: {body}"
+        );
+    }
+
+    #[test]
+    fn write_page_skips_injection_when_body_has_heading() {
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::User).unwrap();
+        let path = write_page(
+            &k,
+            "intentional",
+            "---\ntitle: A different title\ntopic: would-be description\n---\n# My Custom Heading\n\nbody\n",
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let (_, body) = parse_frontmatter(&raw);
+        // Model's heading is respected — neither title nor Description
+        // line is injected when the body already opens with a `# heading`.
+        assert!(body.contains("# My Custom Heading"));
+        assert!(
+            !body.contains("# A different title"),
+            "should not have injected frontmatter title when body already had its own heading: {body}"
+        );
+        assert!(
+            !body.contains("Description: would-be description"),
+            "should not have injected Description when body already had its own heading: {body}"
+        );
+    }
+
+    #[test]
+    fn write_page_re_write_is_idempotent_on_canonical_pages() {
+        // A page that's been through write_page once will have the
+        // canonical `# title\nDescription:\n---` block at the top of
+        // its body. Reading it back and re-writing should not pile on
+        // a second copy of the header — `body_has_leading_heading`
+        // detects the prior `# heading` and skips re-injection.
+        let _home = scoped_home();
+        let k = create("nb", KmsScope::User).unwrap();
+        let path = write_page(
+            &k,
+            "tokens",
+            "---\ntitle: Tokens\ntopic: jwt storage\n---\nBody\n",
+        )
+        .unwrap();
+        let raw1 = std::fs::read_to_string(&path).unwrap();
+        // Round-trip: re-write with the same content we just read.
+        write_page(&k, "tokens", &raw1).unwrap();
+        let raw2 = std::fs::read_to_string(&path).unwrap();
+        let heading_count = raw2.matches("# Tokens").count();
+        assert_eq!(
+            heading_count, 1,
+            "canonical heading should appear exactly once after a round-trip re-write; got {heading_count}:\n{raw2}"
+        );
+        let desc_count = raw2.matches("Description: jwt storage").count();
+        assert_eq!(
+            desc_count, 1,
+            "Description should appear exactly once after a round-trip re-write; got {desc_count}:\n{raw2}"
+        );
     }
 
     #[test]
@@ -2745,7 +3069,14 @@ mod tests {
         let _home = scoped_home();
         let _k = create("nb", KmsScope::User).unwrap();
         let out = system_prompt_section(&["nb".into()]);
-        assert!(out.contains("### Tools"));
+        // Audit finding B: tools block is now globalised as a
+        // top-level `## KMS tools` h2 instead of a per-KMS `### Tools`
+        // h3 subsection. The substantive assertions (every tool
+        // listed + "last resort" framing) are unchanged.
+        assert!(
+            out.contains("## KMS tools"),
+            "expected globalised KMS-tools header; got:\n{out}"
+        );
         assert!(out.contains("KmsRead"));
         assert!(out.contains("KmsSearch"));
         assert!(out.contains("KmsWrite"));
@@ -2757,7 +3088,7 @@ mod tests {
         // The "last resort" framing biases the model away from default
         // deletion behavior — locks the prompt's stance.
         assert!(
-            out.contains("last resort") || out.contains("prefer KmsWrite"),
+            out.contains("last resort") || out.contains("prefer `KmsWrite`"),
             "KmsDelete entry should bias model toward KmsWrite for merges. Got:\n{out}"
         );
     }

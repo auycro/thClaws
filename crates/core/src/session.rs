@@ -120,6 +120,23 @@ struct GoalSnapshotEvent {
     timestamp: u64,
 }
 
+/// Append-only record of the provider's server-side session id. The
+/// Anthropic Agent SDK (`anthropic-agent` provider) returns a UUID on
+/// the first response frame and uses it to index server-side
+/// conversation state; thClaws writes one of these events after every
+/// turn that surfaces a new id so the next process / `/load` can pass
+/// it back via `--resume <uuid>` and the SDK restores its history.
+/// Latest event wins on load — same pattern as `rename`,
+/// `plan_snapshot`, and `goal_snapshot`. Other providers never emit
+/// this event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProviderStateEvent {
+    #[serde(rename = "type")]
+    kind: String, // always "provider_state"
+    provider_session_id: Option<String>,
+    timestamp: u64,
+}
+
 /// Append-only checkpoint marking that the preceding message events
 /// have been compacted (via `/compact` or similar). On load, the most
 /// recent checkpoint "wins" — its `messages` list is used as the
@@ -173,6 +190,19 @@ pub struct Session {
     /// (status moves to terminal).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<crate::goal_state::GoalState>,
+    /// Provider-side session identifier for resume support. The
+    /// Anthropic Agent SDK provider (`anthropic-agent`) maintains its
+    /// own server-side conversation indexed by a UUID it returns on
+    /// the first response frame; thClaws persists that UUID here so
+    /// the next process / `/load` can pass it back via `--resume
+    /// <uuid>` and the SDK restores its history server-side. Without
+    /// this, every resumed thClaws session became a fresh SDK
+    /// conversation that saw only the latest user message — model
+    /// appeared to "forget" everything from prior turns.
+    /// Append-only via the `provider_state` event (latest wins on
+    /// load). Other providers leave it `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
 }
 
 impl PartialEq for Session {
@@ -209,6 +239,7 @@ impl Session {
             last_saved_count: 0,
             plan: None,
             goal: None,
+            provider_session_id: None,
         }
     }
 
@@ -553,6 +584,11 @@ impl Session {
         let mut title: Option<String> = None;
         let mut plan: Option<crate::tools::plan_state::Plan> = None;
         let mut goal: Option<crate::goal_state::GoalState> = None;
+        // Latest-wins for provider session id, same pattern as title /
+        // plan_snapshot / goal_snapshot. `None` after replay means the
+        // provider doesn't persist server-side state (anything other
+        // than `anthropic-agent` today).
+        let mut provider_session_id: Option<String> = None;
         let mut skipped: usize = 0;
 
         for (line_num, line_result) in reader.lines().enumerate() {
@@ -672,6 +708,26 @@ impl Session {
                     }
                 };
                 goal = ev.goal;
+            } else if kind == "provider_state" {
+                // Latest provider_state wins. Carries the provider's
+                // server-side session id (`anthropic-agent` SDK only
+                // for now) so the next `/load` can rehydrate the
+                // provider's `--resume <uuid>` path. Don't bump
+                // last_timestamp — these events are
+                // state-restoration artifacts, not user activity.
+                let ev: ProviderStateEvent = match serde_json::from_value(val) {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        eprintln!(
+                            "\x1b[33m[session] {}:{}: skipping malformed provider_state ({e})\x1b[0m",
+                            path.display(),
+                            line_num + 1
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                };
+                provider_session_id = ev.provider_session_id;
             } else if kind == "compaction" {
                 // Replay checkpoint: everything accumulated so far is
                 // archived-on-disk but gets replaced in memory by the
@@ -808,6 +864,7 @@ impl Session {
             last_saved_count: msg_count,
             plan,
             goal,
+            provider_session_id,
         })
     }
 
@@ -889,6 +946,35 @@ impl Session {
             Some(trimmed.to_string())
         };
         self.updated_at = event.timestamp;
+        Ok(())
+    }
+
+    /// Append a `provider_state` event capturing the provider's
+    /// current server-side session id. Same wire shape as `rename` —
+    /// latest event wins on load. Pass `None` to clear (e.g. on
+    /// provider switch). Caller should only invoke when the value
+    /// has actually changed since the last write; checking
+    /// `self.provider_session_id != new` before calling avoids
+    /// trivial duplicate events.
+    pub fn append_provider_state_to(
+        &mut self,
+        path: &Path,
+        provider_session_id: Option<String>,
+    ) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let event = ProviderStateEvent {
+            kind: "provider_state".into(),
+            provider_session_id: provider_session_id.clone(),
+            timestamp: now_secs(),
+        };
+        let line = serde_json::to_string(&event)?;
+        append_locked(path, |file| writeln!(file, "{}", line))?;
+        self.provider_session_id = provider_session_id;
+        // Do NOT bump updated_at — provider_state events are
+        // state-restoration plumbing, not user activity. Same rule as
+        // plan_snapshot / goal_snapshot recency.
         Ok(())
     }
 }
@@ -1685,6 +1771,107 @@ mod tests {
         store.rename(&id, "").unwrap();
         let cleared = store.load(&id).unwrap();
         assert_eq!(cleared.title, None);
+    }
+
+    #[test]
+    fn provider_state_round_trips_through_jsonl() {
+        // The whole point of the field: write it once, kill the
+        // process, load the session back, and find the same value
+        // ready to feed back into the SDK as `--resume <uuid>`. Pre-
+        // fix this round-trip didn't exist at all (the value lived
+        // only in `Arc<Mutex<>>` on the provider instance) — that's
+        // why resumed sessions appeared to forget previous turns.
+        let dir = tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+
+        let mut session = Session::new("anthropic-agent/sonnet", "/tmp");
+        session.sync(vec![Message::user("hi")]);
+        store.save(&mut session).unwrap();
+        assert!(session.provider_session_id.is_none());
+
+        let path = store.path_for(&session.id);
+        session
+            .append_provider_state_to(&path, Some("uuid-abc-123".into()))
+            .unwrap();
+        assert_eq!(session.provider_session_id.as_deref(), Some("uuid-abc-123"));
+
+        // Reload from disk — value must survive the process boundary.
+        let reloaded = store.load(&session.id).unwrap();
+        assert_eq!(
+            reloaded.provider_session_id.as_deref(),
+            Some("uuid-abc-123"),
+            "session JSONL must persist the provider-side session id so resume can rehydrate it"
+        );
+    }
+
+    #[test]
+    fn provider_state_latest_wins_on_load() {
+        // Same latest-wins semantics as `rename`. Multiple turns =
+        // multiple events; loader collapses to the last value seen.
+        // (In practice the SDK keeps reusing the same UUID, so most
+        // turns won't change it — `save_history` skips the append
+        // when nothing changed. But the schema has to handle rotation
+        // for the case where the SDK does mint a new id.)
+        let dir = tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+
+        let mut session = Session::new("anthropic-agent/sonnet", "/tmp");
+        session.sync(vec![Message::user("hi")]);
+        store.save(&mut session).unwrap();
+        let path = store.path_for(&session.id);
+
+        session
+            .append_provider_state_to(&path, Some("first".into()))
+            .unwrap();
+        session
+            .append_provider_state_to(&path, Some("second".into()))
+            .unwrap();
+
+        let reloaded = store.load(&session.id).unwrap();
+        assert_eq!(reloaded.provider_session_id.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn provider_state_none_clears_persisted_id() {
+        // `None` is meaningful — it represents an explicit clear
+        // (e.g. provider switched away from anthropic-agent, or the
+        // user reset). Latest wins, so a trailing None overrides the
+        // earlier `Some`.
+        let dir = tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+
+        let mut session = Session::new("anthropic-agent/sonnet", "/tmp");
+        session.sync(vec![Message::user("hi")]);
+        store.save(&mut session).unwrap();
+        let path = store.path_for(&session.id);
+
+        session
+            .append_provider_state_to(&path, Some("uuid".into()))
+            .unwrap();
+        session.append_provider_state_to(&path, None).unwrap();
+
+        let reloaded = store.load(&session.id).unwrap();
+        assert!(reloaded.provider_session_id.is_none());
+    }
+
+    #[test]
+    fn provider_state_absent_in_legacy_sessions() {
+        // Backwards compat: sessions written by older builds have no
+        // `provider_state` event. `provider_session_id` must default
+        // to `None` so existing JSONL files keep loading without a
+        // forced migration.
+        let dir = tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+
+        let mut session = Session::new("anthropic-agent/sonnet", "/tmp");
+        session.sync(vec![Message::user("hi")]);
+        store.save(&mut session).unwrap();
+
+        let reloaded = store.load(&session.id).unwrap();
+        assert!(
+            reloaded.provider_session_id.is_none(),
+            "fresh session without a provider_state event must load with None"
+        );
     }
 
     #[test]

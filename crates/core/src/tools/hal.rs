@@ -25,14 +25,55 @@ use std::time::Duration;
 /// `wait_timeout` is 30s, so we give the round trip a generous 90s
 /// before giving up. The agent's per-turn cancel token still wins
 /// over this if the user cancels.
-const HAL_TIMEOUT: Duration = Duration::from_secs(90);
+pub(crate) const HAL_TIMEOUT: Duration = Duration::from_secs(90);
 const HAL_BASE_URL: &str = "https://hal.thaigpt.com/api";
 
-fn build_client() -> reqwest::Client {
+pub(crate) fn build_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(HAL_TIMEOUT)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Cheap runtime check — does the live process env hold a non-empty
+/// `HAL_API_KEY`? Same pattern as `ToolRegistry::tool_is_available`
+/// but exposed for cross-tool routing decisions (e.g. WebFetch checks
+/// this to decide whether to route through HAL's headless scrape).
+///
+/// Reads each call — no caching — so a user pasting a key
+/// mid-session sees the change on the next tool invocation without
+/// needing a worker rebuild.
+pub(crate) fn hal_available() -> bool {
+    std::env::var("HAL_API_KEY")
+        .ok()
+        .map(|k| !k.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Convenience wrapper around HAL's `/scrape/v1/url` endpoint. Posts
+/// the URL, extracts the rendered `content` field (Markdown) from the
+/// JSON envelope, and prepends a `# {title}` header when present so
+/// the model gets a single readable blob instead of nested JSON. The
+/// caller owns truncation / formatting after this returns.
+///
+/// Used by `WebFetchTool` to opportunistically upgrade plain HTTP
+/// GETs into JS-rendered scrapes when a HAL key is available. Errors
+/// propagate from `hal_post` (auth, network, HAL 5xx, target page
+/// failure) — caller decides whether to surface or fall back.
+pub(crate) async fn scrape_via_hal(client: &reqwest::Client, url: &str) -> Result<String> {
+    let body = json!({ "url": url });
+    let resp = hal_post(client, "/scrape/v1/url", &body).await?;
+    let title = resp
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let content = resp.get("content").and_then(Value::as_str).unwrap_or("");
+    Ok(if title.is_empty() {
+        content.to_string()
+    } else {
+        format!("# {title}\n\n{content}")
+    })
 }
 
 /// Shared POST helper. Resolves the API key from the live process
@@ -198,10 +239,14 @@ impl Tool for WebScrapeTool {
 
     fn description(&self) -> &'static str {
         "Render a web page in a headless browser via HAL's public API and \
-         return its content as Markdown. Use this instead of WebFetch when the \
-         page is JavaScript-heavy (SPA, lazy-loaded content), needs scrolling, \
-         or has noise (nav, ads) you want stripped. Slower than WebFetch — pick \
-         WebFetch first for static pages."
+         return its content as Markdown. `WebFetch` already runs HAL scrape \
+         (combined with a plain GET) on every call when `HAL_API_KEY` is \
+         set — reach for this tool directly only when you need the advanced \
+         HAL parameters: `wait_for` (CSS selector to wait for before scraping), \
+         `scroll_to_bottom` (load lazy content), `remove_selectors` (strip nav / \
+         ads / cookie banners), `output_format` (markdown / html_markdown / \
+         json). For ordinary page reads, prefer `WebFetch` so the model also \
+         gets the raw plain-GET payload alongside HAL's rendered output."
     }
 
     fn input_schema(&self) -> Value {

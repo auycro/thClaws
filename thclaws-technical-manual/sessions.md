@@ -128,6 +128,18 @@ The original message events that preceded the compaction stay on disk forever (a
 
 `replaces_count` is informational only; the load logic walks sequentially and resets on each checkpoint, so the field isn't strictly required.
 
+### Provider-state event (zero or more)
+
+```json
+{"type":"provider_state","provider_session_id":"550e8400-e29b-41d4-a716-446655440000","timestamp":1777752100}
+```
+
+Latest-wins, same pattern as `rename` / `plan_snapshot`. Carries the provider's server-side session identifier so a resumed `Session` can pass it back to `Provider::set_provider_session_id`. Only the `anthropic-agent` (Anthropic Agent SDK subprocess) provider emits this today — every other provider's `Provider::provider_session_id` returns `None` and `save_history` skips the append.
+
+The event does NOT bump `last_timestamp` (same exception as `plan_snapshot`) — it's state-restoration plumbing, not user activity. Without this exclusion the sidebar recency-sort would jump the just-loaded session to the top.
+
+A trailing `provider_session_id: null` is meaningful: it represents an explicit clear (provider switched away from anthropic-agent, or the user reset). Latest wins, so a later `null` overrides an earlier UUID.
+
 ---
 
 ## 3. The Session struct
@@ -143,12 +155,18 @@ pub struct Session {
     pub title: Option<String>,
     pub last_saved_count: usize,
     pub plan: Option<crate::tools::plan_state::Plan>,
+    pub goal: Option<crate::goal_state::GoalState>,
+    /// Provider's server-side session id (anthropic-agent only).
+    /// Persisted via `provider_state` events; rehydrated on `/load`.
+    pub provider_session_id: Option<String>,
 }
 ```
 
 `last_saved_count` is the number of messages already persisted; `append_to` only writes from `messages[last_saved_count..]` and bumps the field. After any `compaction`, this is reset to the post-checkpoint length.
 
 `PartialEq` deliberately ignores `last_saved_count`, `title`, and `plan` — two `Session` values with identical id/messages/etc compare equal even if their persistence-bookkeeping fields differ. Used by tests.
+
+`provider_session_id` is populated by `load_from` walking `provider_state` events and bound back to the provider on resume via `state.agent.provider().set_provider_session_id(loaded.provider_session_id.clone())` BEFORE `state.session = loaded` overwrites the in-memory session. The `save_history` helper in `shared_session` writes a new `provider_state` event whenever `agent.provider().provider_session_id()` differs from `session.provider_session_id` after a turn — skipping the append when nothing changed avoids event-log spam (the SDK reuses the same UUID across most turns).
 
 ### `SessionMeta` — sidebar payload
 

@@ -8,6 +8,39 @@ use crate::types::{Message, ToolDef};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
+/// Idle timeout applied to each individual chunk in a streaming response.
+/// If the provider sends no bytes for this many seconds the stream is
+/// aborted with an error so the UI surfaces a "try again" message instead
+/// of hanging silently until the user force-quits.
+///
+/// Stored as `AtomicU64` (seconds) so `AppConfig::load` callers can update
+/// it live without rebuilding providers. The original PR #81 / #83 constant
+/// was 30 s — too tight for `/research` and long-reasoning workloads where
+/// the model can legitimately pause mid-stream. Default now 120 s; users
+/// can override via `stream_chunk_timeout_secs` in `.thclaws/settings.json`
+/// (or the user-scope settings).
+static STREAM_CHUNK_TIMEOUT_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(120);
+
+/// Read the current idle timeout. Used by every streaming provider's
+/// `byte_stream.next()` await — `tokio::time::timeout(stream_chunk_timeout(), ...)`.
+pub(super) fn stream_chunk_timeout() -> std::time::Duration {
+    let secs = STREAM_CHUNK_TIMEOUT_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    // Floor at 1 s to avoid `Duration::from_secs(0)` which would make
+    // every chunk read instantly time out. Treat 0 as "default" since
+    // `serde(default)` falls back to the same value anyway.
+    std::time::Duration::from_secs(if secs == 0 { 120 } else { secs })
+}
+
+/// Push a new idle timeout from config. Called from worker init (CLI /
+/// GUI / serve) after `AppConfig::load`. Live — affects in-flight provider
+/// calls' NEXT chunk-await; the current `tokio::time::timeout` future
+/// keeps its original deadline (acceptable — the user only notices on the
+/// next idle anyway). Idempotent + thread-safe (atomic store).
+pub fn set_stream_chunk_timeout_secs(secs: u64) {
+    STREAM_CHUNK_TIMEOUT_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub mod agent_sdk;
 pub mod anthropic;
 pub mod assemble;
@@ -665,6 +698,30 @@ pub trait Provider: Send + Sync {
             "list_models not supported by this provider".into(),
         ))
     }
+
+    /// Provider-side session identifier for resume support. The
+    /// `anthropic-agent` SDK provider holds this in an internal
+    /// `Arc<Mutex<Option<String>>>` populated from the first response
+    /// frame that surfaces a `session_id`. Other providers don't
+    /// maintain server-side conversation state and return `None`.
+    ///
+    /// Callers (the worker / REPL loop) read this after each
+    /// `stream()` completes and persist any change to the session
+    /// JSONL via `Session::append_provider_state_to` so a process
+    /// restart or `/load` can rehydrate the id via
+    /// [`Self::set_provider_session_id`] and the next `stream()` call
+    /// passes `--resume <uuid>` to the subprocess.
+    fn provider_session_id(&self) -> Option<String> {
+        None
+    }
+
+    /// Reapply a previously-persisted provider session id, used by
+    /// the worker right after `Session::load_from` so the next
+    /// `stream()` call resumes the SDK's server-side conversation
+    /// instead of starting fresh (the bug this trait method exists
+    /// to fix). Default impl is a no-op — only the
+    /// `anthropic-agent` provider overrides.
+    fn set_provider_session_id(&self, _id: Option<String>) {}
 }
 
 /// Does the active provider have credentials (env var set) or is it
@@ -791,6 +848,35 @@ pub fn auto_fallback_model(cfg: &crate::config::AppConfig) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `set_stream_chunk_timeout_secs` must be reflected by the
+    /// next `stream_chunk_timeout()` call — the providers read this
+    /// on every chunk-await, so a config reload that drops the
+    /// timeout from 120 s to 60 s should take effect immediately.
+    /// Test isolation: snapshot + restore the global so concurrent
+    /// tests aren't affected (the live atomic is process-wide).
+    #[test]
+    fn stream_chunk_timeout_setter_round_trips() {
+        let prev = STREAM_CHUNK_TIMEOUT_SECS.load(std::sync::atomic::Ordering::Relaxed);
+        set_stream_chunk_timeout_secs(60);
+        assert_eq!(stream_chunk_timeout(), std::time::Duration::from_secs(60));
+        set_stream_chunk_timeout_secs(300);
+        assert_eq!(stream_chunk_timeout(), std::time::Duration::from_secs(300));
+        // Restore so other tests aren't poisoned.
+        STREAM_CHUNK_TIMEOUT_SECS.store(prev, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `0` means "use the default" (matches the `serde(default)` fallback
+    /// for an absent settings key). Without this guard a misconfigured
+    /// `stream_chunk_timeout_secs: 0` in settings.json would make every
+    /// chunk-await time out instantly — the worst possible UX.
+    #[test]
+    fn stream_chunk_timeout_zero_falls_back_to_default() {
+        let prev = STREAM_CHUNK_TIMEOUT_SECS.load(std::sync::atomic::Ordering::Relaxed);
+        set_stream_chunk_timeout_secs(0);
+        assert_eq!(stream_chunk_timeout(), std::time::Duration::from_secs(120));
+        STREAM_CHUNK_TIMEOUT_SECS.store(prev, std::sync::atomic::Ordering::Relaxed);
+    }
 
     /// M6.21 BUG H1: `find_bytes` must locate `\n\n` (and other
     /// boundaries) on raw byte slices, allowing providers to buffer

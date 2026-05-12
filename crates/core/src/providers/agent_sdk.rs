@@ -389,4 +389,26 @@ impl Provider for AgentSdkProvider {
             ))
         }
     }
+
+    /// Expose the captured Claude-side session UUID so the worker can
+    /// persist it to the session JSONL after every turn. Pre-fix this
+    /// value only lived in the `Arc<Mutex<>>` for the lifetime of the
+    /// provider instance — process restart or `/load` lost it and the
+    /// SDK started a fresh conversation that saw only the latest
+    /// user message.
+    fn provider_session_id(&self) -> Option<String> {
+        self.session_id.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Rehydrate the Claude-side session UUID from a previously
+    /// persisted value (typically a freshly-loaded session JSONL).
+    /// The next `stream()` call will pass `--resume <uuid>` to the
+    /// subprocess and the SDK restores its server-side history.
+    /// `None` clears the slot (used on provider switch or explicit
+    /// reset).
+    fn set_provider_session_id(&self, id: Option<String>) {
+        if let Ok(mut g) = self.session_id.lock() {
+            *g = id;
+        }
+    }
 }

@@ -56,6 +56,98 @@ pub struct Evaluation {
     pub notes: String,
 }
 
+/// Verdict assigned to one factual claim during the verify pass —
+/// whether the cited source actually supports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// Source supports the claim with no daylight between them.
+    Supported,
+    /// Source touches the topic but doesn't strictly support the
+    /// specific claim (close enough that the LLM hedges).
+    Partial,
+    /// Cited source does NOT support the claim — likely hallucination
+    /// or miscitation.
+    Unsupported,
+    /// Claim has no `[N]` citation at all — provenance unknown.
+    NoCitation,
+}
+
+/// One claim's verification result. `claim` is the rough text the
+/// verifier extracted from the page; `citation` is the `[N]` index it
+/// pointed at (None when the claim was uncited).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyItem {
+    pub claim: String,
+    pub citation: Option<u32>,
+    pub verdict: Verdict,
+    pub note: Option<String>,
+}
+
+/// Result of a verify pass over a generated research page. Pre-fix
+/// the pipeline only had a single "coverage score" from the
+/// evaluator (does the SOURCE SET answer the query?); this report
+/// answers the orthogonal question — does the generated PAGE
+/// faithfully reflect the cited sources, or did the synthesizer
+/// hallucinate / miscite? Score is the fraction of claims rated
+/// `Supported` (Partial / NoCitation / Unsupported all detract).
+#[derive(Debug, Clone, PartialEq)]
+pub struct VerifyReport {
+    pub score: f32,
+    pub items: Vec<VerifyItem>,
+}
+
+impl VerifyReport {
+    /// Render the non-`Supported` items as a Markdown section to
+    /// append at the end of the page body. Returns `None` when every
+    /// claim was supported — no need to clutter clean pages with an
+    /// empty verification section.
+    pub fn render_flagged_section(&self) -> Option<String> {
+        let flagged: Vec<&VerifyItem> = self
+            .items
+            .iter()
+            .filter(|i| i.verdict != Verdict::Supported)
+            .collect();
+        if flagged.is_empty() {
+            return None;
+        }
+        let mut s = String::from("\n\n---\n\n## Verification\n\n");
+        s.push_str(&format!(
+            "Auto-verification pass found {} claim(s) that don't strictly match their cited source. \
+             Review before relying on the page for downstream decisions.\n\n",
+            flagged.len()
+        ));
+        for item in flagged {
+            let icon = match item.verdict {
+                Verdict::Unsupported => "🚫",
+                Verdict::Partial => "⚠️",
+                Verdict::NoCitation => "❓",
+                Verdict::Supported => "✓",
+            };
+            let cite = item
+                .citation
+                .map(|n| format!("[{n}]"))
+                .unwrap_or_else(|| "(uncited)".to_string());
+            let verdict_str = match item.verdict {
+                Verdict::Supported => "supported",
+                Verdict::Partial => "partial",
+                Verdict::Unsupported => "unsupported",
+                Verdict::NoCitation => "no citation",
+            };
+            s.push_str(&format!(
+                "- {icon} **{verdict_str}** {cite}: {}",
+                item.claim.trim()
+            ));
+            if let Some(note) = &item.note {
+                if !note.trim().is_empty() {
+                    s.push_str(&format!(" — _{}_", note.trim()));
+                }
+            }
+            s.push('\n');
+        }
+        Some(s)
+    }
+}
+
 /// M6.39.6: one row of the page plan returned by [`plan_pages`].
 /// LLM groups accumulated sources into a small number of these
 /// (entity / concept / comparison / how-to pages); the pipeline
@@ -217,6 +309,32 @@ pub async fn synthesize(
     let prompt = build_synthesize_prompt(query, sources);
     let raw = oneshot(provider, model, prompt, timeout, cancel).await?;
     Ok(raw.trim().to_string())
+}
+
+/// Run a verify pass over a synthesised page: extract each factual
+/// claim, check it against the cited source, return a structured
+/// report. The synthesise step can hallucinate (claim a fact that
+/// no source supports) or miscite (cite [3] for something only [1]
+/// actually says); this pass catches both classes before the page is
+/// committed to the KMS — addressing the well-known "LLM Wiki bakes
+/// in organised persistent mistakes" critique of wiki-style KMS
+/// patterns.
+///
+/// Cost: one LLM call per generated page (~+25% of total /research
+/// LLM cost for a typical 4-page run). Soft-fails: returns an empty
+/// report on parse failure rather than aborting the pipeline, so a
+/// flaky verifier doesn't kill the whole research run.
+pub async fn verify_page(
+    provider: &dyn Provider,
+    model: &str,
+    page_body: &str,
+    cited_sources: &[ResearchSource],
+    timeout: Duration,
+    cancel: &CancelToken,
+) -> Result<VerifyReport> {
+    let prompt = build_verify_page_prompt(page_body, cited_sources);
+    let raw = oneshot(provider, model, prompt, timeout, cancel).await?;
+    Ok(parse_verify_report(&raw))
 }
 
 /// Derive a kebab-case KMS slug from a free-form query (max ~5 words).
@@ -481,6 +599,137 @@ fn build_synthesize_prompt(query: &str, sources: &[ResearchSource]) -> String {
          Answer in the same language as the original query.",
     );
     s
+}
+
+fn build_verify_page_prompt(page_body: &str, cited_sources: &[ResearchSource]) -> String {
+    let mut s = String::new();
+    s.push_str(
+        "You are a verification auditor. Read the GENERATED PAGE below \
+         and check every factual claim against the CITED SOURCES. The \
+         page was synthesised by another LLM, which may have \
+         hallucinated facts or attached a `[N]` citation to a source \
+         that doesn't actually support the claim. Your job is to flag \
+         those defects so a downstream reader knows what to trust.\n\n",
+    );
+    s.push_str("=== GENERATED PAGE ===\n");
+    s.push_str(page_body.trim());
+    s.push_str("\n\n=== CITED SOURCES ===\n");
+    for r in cited_sources {
+        s.push_str(&format!(
+            "[{}] {} ({})\n   {}\n\n",
+            r.index,
+            r.title,
+            r.url,
+            snippet(&r.body, 800)
+        ));
+    }
+    s.push_str(
+        "Walk the page sentence by sentence. For each factual claim \
+         (anything an audit reader would want to verify — definitions, \
+         dates, numbers, attributions, capability statements, comparisons), \
+         decide:\n\
+         - `Supported`: the cited source clearly states this exact claim.\n\
+         - `Partial`: the cited source touches the topic but doesn't \
+         strictly back the specific wording (e.g. claim says \"100x faster\" \
+         but source only says \"significantly faster\").\n\
+         - `Unsupported`: the citation is wrong — the source doesn't say \
+         this. Usually a hallucination or miscitation. CALL THESE OUT.\n\
+         - `NoCitation`: the page makes a factual assertion with no `[N]` \
+         attached. Provenance is unknown.\n\n\
+         Skip claims that aren't factual (opinions, hedges like \"may be\", \
+         questions, the page's own headings, the auto-generated `## Sources` \
+         section). Skip Supported claims when reporting — only LIST the \
+         flagged ones (Partial / Unsupported / NoCitation) to keep output \
+         compact.\n\n\
+         Output STRICT JSON, nothing else. Schema:\n\
+         ```\n\
+         {\n\
+           \"score\": 0.NN,                  // fraction of total factual claims that are Supported (0.0-1.0)\n\
+           \"items\": [\n\
+             {\n\
+               \"claim\": \"short paraphrase of the flagged sentence\",\n\
+               \"citation\": 3 | null,       // [N] index if cited, null if NoCitation\n\
+               \"verdict\": \"Partial\" | \"Unsupported\" | \"NoCitation\",\n\
+               \"note\": \"brief reason\" | null\n\
+             }\n\
+           ]\n\
+         }\n\
+         ```\n\
+         If the page is short and entirely well-supported, output:\n\
+         `{\"score\": 1.0, \"items\": []}`\n\
+         Output JSON ONLY — no Markdown fences, no preamble, no trailing prose.",
+    );
+    s
+}
+
+/// Parse the verifier's JSON output into a [`VerifyReport`]. Soft-
+/// fails on any parse problem (returns an empty zero-score report)
+/// so a flaky verifier doesn't kill the research run. Strips
+/// Markdown fences if the LLM wrapped its JSON in ```json blocks
+/// despite the prompt asking it not to.
+fn parse_verify_report(raw: &str) -> VerifyReport {
+    let stripped = strip_json_fences(raw.trim());
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(stripped) else {
+        return VerifyReport {
+            score: 0.0,
+            items: Vec::new(),
+        };
+    };
+    let score = v
+        .get("score")
+        .and_then(|s| s.as_f64())
+        .map(|f| f.clamp(0.0, 1.0) as f32)
+        .unwrap_or(0.0);
+    let items: Vec<VerifyItem> = v
+        .get("items")
+        .and_then(|i| i.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| {
+                    let claim = entry.get("claim").and_then(|c| c.as_str())?.to_string();
+                    let citation = entry
+                        .get("citation")
+                        .and_then(|c| c.as_u64())
+                        .map(|n| n as u32);
+                    let verdict = match entry.get("verdict").and_then(|v| v.as_str())? {
+                        "Supported" => Verdict::Supported,
+                        "Partial" => Verdict::Partial,
+                        "Unsupported" => Verdict::Unsupported,
+                        "NoCitation" => Verdict::NoCitation,
+                        _ => return None,
+                    };
+                    let note = entry
+                        .get("note")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string());
+                    Some(VerifyItem {
+                        claim,
+                        citation,
+                        verdict,
+                        note,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    VerifyReport { score, items }
+}
+
+/// Strip ```json fences (or plain ```) if the LLM wrapped its JSON
+/// despite being told not to. Returns the inner content or the
+/// original string if no fences detected.
+fn strip_json_fences(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    // ```json … ``` or ``` … ```
+    if let Some(rest) = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+    {
+        if let Some(end) = rest.rfind("```") {
+            return rest[..end].trim();
+        }
+    }
+    trimmed
 }
 
 fn build_derive_slug_prompt(query: &str) -> String {
@@ -880,6 +1129,109 @@ mod tests {
     fn parse_bulleted_list_returns_empty_for_empty_input() {
         assert!(parse_bulleted_list("").is_empty());
         assert!(parse_bulleted_list("\n\n  \n").is_empty());
+    }
+
+    // ── parse_verify_report ─────────────────────────────────────
+
+    #[test]
+    fn parse_verify_handles_clean_json() {
+        let raw = r#"{"score": 0.85, "items": [
+            {"claim": "X is 100x faster", "citation": 3, "verdict": "Unsupported", "note": "[3] says faster but not 100x"},
+            {"claim": "Y was released in 2024", "citation": null, "verdict": "NoCitation", "note": null}
+        ]}"#;
+        let r = parse_verify_report(raw);
+        assert!((r.score - 0.85).abs() < 1e-6);
+        assert_eq!(r.items.len(), 2);
+        assert_eq!(r.items[0].verdict, Verdict::Unsupported);
+        assert_eq!(r.items[0].citation, Some(3));
+        assert_eq!(r.items[1].verdict, Verdict::NoCitation);
+        assert_eq!(r.items[1].citation, None);
+    }
+
+    #[test]
+    fn parse_verify_strips_markdown_fences() {
+        // LLMs sometimes wrap JSON in ```json blocks despite being
+        // told not to. Parser tolerates it instead of returning the
+        // soft-fail zero report.
+        let raw = "```json\n{\"score\": 1.0, \"items\": []}\n```";
+        let r = parse_verify_report(raw);
+        assert!((r.score - 1.0).abs() < 1e-6);
+        assert!(r.items.is_empty());
+    }
+
+    #[test]
+    fn parse_verify_soft_fails_on_garbage() {
+        // Provider returned prose instead of JSON → score=0, empty
+        // items. Caller writes the page without a verification
+        // record rather than blowing up the whole research run.
+        let raw = "I cannot verify this page because no sources were provided.";
+        let r = parse_verify_report(raw);
+        assert_eq!(r.score, 0.0);
+        assert!(r.items.is_empty());
+    }
+
+    #[test]
+    fn verify_report_skips_section_when_all_supported() {
+        // All-clean page → no `## Verification` clutter at the
+        // bottom. Only flagged items trigger the section.
+        let r = VerifyReport {
+            score: 1.0,
+            items: vec![VerifyItem {
+                claim: "X".into(),
+                citation: Some(1),
+                verdict: Verdict::Supported,
+                note: None,
+            }],
+        };
+        assert!(r.render_flagged_section().is_none());
+    }
+
+    #[test]
+    fn verify_report_renders_flagged_items() {
+        let r = VerifyReport {
+            score: 0.5,
+            items: vec![
+                VerifyItem {
+                    claim: "Supported claim".into(),
+                    citation: Some(1),
+                    verdict: Verdict::Supported,
+                    note: None,
+                },
+                VerifyItem {
+                    claim: "Hallucinated claim".into(),
+                    citation: Some(3),
+                    verdict: Verdict::Unsupported,
+                    note: Some("source does not say this".into()),
+                },
+                VerifyItem {
+                    claim: "Uncited assertion".into(),
+                    citation: None,
+                    verdict: Verdict::NoCitation,
+                    note: None,
+                },
+            ],
+        };
+        let section = r
+            .render_flagged_section()
+            .expect("flagged section expected");
+        assert!(section.contains("## Verification"));
+        assert!(section.contains("unsupported"));
+        assert!(section.contains("Hallucinated claim"));
+        assert!(section.contains("source does not say this"));
+        assert!(section.contains("no citation"));
+        assert!(section.contains("Uncited assertion"));
+        // Supported items are NOT listed — only flagged ones.
+        assert!(!section.contains("Supported claim"));
+    }
+
+    #[test]
+    fn parse_verify_clamps_score_to_unit_interval() {
+        // Hostile / buggy LLM returns score > 1.0 or negative —
+        // clamp rather than passing nonsense through to frontmatter.
+        let r = parse_verify_report(r#"{"score": 1.5, "items": []}"#);
+        assert!((r.score - 1.0).abs() < 1e-6);
+        let r2 = parse_verify_report(r#"{"score": -0.3, "items": []}"#);
+        assert_eq!(r2.score, 0.0);
     }
 
     // ── parse_score_and_notes ─────────────────────────────────────

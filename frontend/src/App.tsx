@@ -9,6 +9,7 @@ import { PlanSidebar } from "./components/PlanSidebar";
 import { GoalSidebar } from "./components/GoalSidebar";
 import { TodoSidebar } from "./components/TodoSidebar";
 import { ResearchSidebar } from "./components/ResearchSidebar";
+import { BackgroundAgentsSidebar } from "./components/BackgroundAgentsSidebar";
 import {
   KmsBrowserSidebar,
   type ViewerTarget,
@@ -573,12 +574,21 @@ export default function App() {
             nothing until at least one research job has been observed
             via `research_update`. */}
         <ResearchSidebar />
+        {/* Background-agents sidebar. Subscribes to
+            `chat_side_channel_*` envelopes and shows currently-running
+            side-channel agents (/dream, /translator, etc.) with live
+            elapsed time. The inline chat bubble can scroll out of
+            view during long runs; this sidebar is the persistent
+            "is it still running?" answer. Renders nothing until at
+            least one agent has been spawned in this session. */}
+        <BackgroundAgentsSidebar />
         {/* KMS browser sidebar (M6.39.9). Activated by clicking a
             KMS row's title in the left sidebar. Lists pages +
             sources; click an entry to open the viewer overlay. */}
         {browsingKms && (
           <KmsBrowserSidebar
             kmsName={browsingKms}
+            selected={viewerTarget}
             onClose={() => {
               // M6.39.12: closing the browser sidebar also closes the
               // viewer pane underneath. The user's focus has moved

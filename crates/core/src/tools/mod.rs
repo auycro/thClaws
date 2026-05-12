@@ -33,6 +33,7 @@ pub mod pptx_edit;
 pub mod pptx_read;
 pub mod read;
 pub mod search;
+pub mod session_rename;
 pub mod tasks;
 pub mod todo;
 pub mod todo_state;
@@ -52,7 +53,9 @@ pub use edit::EditTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use hal::{WebScrapeTool, YouTubeTranscriptTool};
-pub use kms::{KmsAppendTool, KmsDeleteTool, KmsReadTool, KmsSearchTool, KmsWriteTool};
+pub use kms::{
+    KmsAppendTool, KmsCreateTool, KmsDeleteTool, KmsReadTool, KmsSearchTool, KmsWriteTool,
+};
 pub use ls::LsTool;
 pub use memory::{MemoryAppendTool, MemoryReadTool, MemoryWriteTool};
 pub use pdf_create::PdfCreateTool;
@@ -63,6 +66,7 @@ pub use pptx_edit::PptxEditTool;
 pub use pptx_read::PptxReadTool;
 pub use read::ReadTool;
 pub use search::WebSearchTool;
+pub use session_rename::SessionRenameTool;
 pub use todo::TodoWriteTool;
 pub use update_goal::{MarkGoalBlockedTool, MarkGoalCompleteTool, RecordGoalProgressTool};
 pub use web::WebFetchTool;

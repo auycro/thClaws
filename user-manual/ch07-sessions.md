@@ -140,6 +140,17 @@ Valid event types you'll see:
 - `{"type":"header", ...}` — once, at the top
 - `{"type":"message", "role":"user"|"assistant", "content":[...]}` — actual turns
 - `{"type":"rename", "title":"..."}` — a rename happened
+- `{"type":"plan_snapshot", ...}` / `{"type":"goal_snapshot", ...}` — sidebar state checkpoints (latest wins on load)
+- `{"type":"compaction", ...}` — compaction checkpoint that supersedes preceding `message` events
+- `{"type":"provider_state", "provider_session_id": "uuid-..."}` — provider-side conversation id (anthropic-agent only — see below)
+
+## Resuming `anthropic-agent` sessions
+
+The `anthropic-agent` provider (Anthropic Agent SDK subprocess; chosen by `claude-sonnet-4-6@agent-sdk` and friends) keeps its **own** server-side conversation indexed by a UUID it returns on the first response. thClaws captures that UUID and persists it as a `provider_state` event in the session JSONL, so the next time you `/load` or `/resume` that session the provider gets the UUID back via `Provider::set_provider_session_id` and the next turn passes `--resume <uuid>` to the subprocess. The SDK restores its server-side history and the model sees the full prior conversation.
+
+Pre-fix this hop was missing: the UUID lived only in memory, so closing thClaws and reopening it caused the SDK to start a brand-new conversation that saw only the most recent user message — the model appeared to have forgotten everything. If you've used a build older than this fix and the resume feels broken, start a fresh session.
+
+The UUID is **not** shared with other providers. Switching from `anthropic-agent` to `claude/anthropic`, OpenAI, Gemini, etc. forks a new session anyway (per the rule above), so no cross-provider state leaks.
 
 ## Sharing or archiving a session
 

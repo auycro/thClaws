@@ -38,6 +38,11 @@ interface Props {
   onOpenFile: (target: ViewerTarget) => void;
   onOpenGraph: (kms: string) => void;
   graphActive: boolean;
+  /// The file currently open in the viewer overlay. When this row
+  /// appears in the listing, it gets accent styling so the user can
+  /// see at a glance which entry corresponds to what's on screen.
+  /// Null when no file is open.
+  selected: ViewerTarget | null;
 }
 
 export function KmsBrowserSidebar({
@@ -46,7 +51,17 @@ export function KmsBrowserSidebar({
   onOpenFile,
   onOpenGraph,
   graphActive,
+  selected,
 }: Props) {
+  /// Compare a file row against the active viewer target. Limited to
+  /// rows in the currently-browsed KMS — opening a file from KMS-A
+  /// while browsing KMS-B should NOT highlight a same-named entry in
+  /// KMS-B.
+  const isSelected = (kind: FileKind, name: string) =>
+    selected !== null &&
+    selected.kms === kmsName &&
+    selected.kind === kind &&
+    selected.name === name;
   const [pages, setPages] = useState<BrowseFile[] | null>(null);
   const [sources, setSources] = useState<BrowseFile[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -211,6 +226,7 @@ export function KmsBrowserSidebar({
                   <FileRow
                     key={p.name}
                     file={p}
+                    active={isSelected("page", p.name)}
                     onClick={() =>
                       onOpenFile({ kms: kmsName, kind: "page", name: p.name })
                     }
@@ -234,6 +250,7 @@ export function KmsBrowserSidebar({
                   <FileRow
                     key={s.name}
                     file={s}
+                    active={isSelected("source", s.name)}
                     onClick={() =>
                       onOpenFile({
                         kms: kmsName,
@@ -279,19 +296,61 @@ function Section({
   );
 }
 
-function FileRow({ file, onClick }: { file: BrowseFile; onClick: () => void }) {
+function FileRow({
+  file,
+  onClick,
+  active = false,
+}: {
+  file: BrowseFile;
+  onClick: () => void;
+  active?: boolean;
+}) {
+  /// Active row styling: 2px accent left-border + tinted bg + accent
+  /// text + slightly heavier weight. The chosen tint (`color-mix`
+  /// with the accent) reads as a soft highlight on both light and
+  /// dark themes — same visual rhythm as the "Graph View" active
+  /// button above.
+  const activeBg = active
+    ? "color-mix(in srgb, var(--accent, #61afef) 14%, transparent)"
+    : "transparent";
+  const textColor = active
+    ? "var(--accent, #61afef)"
+    : "var(--text-primary)";
   return (
     <button
       type="button"
       onClick={onClick}
-      className="flex items-baseline justify-between w-full text-left px-3 py-1 hover:bg-white/5"
-      style={{ color: "var(--text-primary)" }}
-      title={file.name}
+      className="flex items-baseline justify-between w-full text-left px-3 py-1"
+      style={{
+        color: textColor,
+        background: activeBg,
+        borderLeft: active
+          ? "2px solid var(--accent, #61afef)"
+          : "2px solid transparent",
+        fontWeight: active ? 600 : 400,
+        cursor: "pointer",
+      }}
+      onMouseEnter={(e) => {
+        if (!active)
+          (e.currentTarget as HTMLButtonElement).style.background =
+            "rgba(255,255,255,0.05)";
+      }}
+      onMouseLeave={(e) => {
+        if (!active)
+          (e.currentTarget as HTMLButtonElement).style.background = activeBg;
+      }}
+      title={active ? `${file.name} (currently viewing)` : file.name}
     >
       <span className="truncate flex-1 text-xs">{file.name}</span>
       <span
         className="ml-2 shrink-0"
-        style={{ color: "var(--text-secondary)", fontSize: "9px" }}
+        style={{
+          color: active
+            ? "var(--accent, #61afef)"
+            : "var(--text-secondary)",
+          fontSize: "9px",
+          opacity: active ? 0.85 : 1,
+        }}
       >
         {formatBytes(file.bytes)}
       </span>

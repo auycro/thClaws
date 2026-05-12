@@ -133,6 +133,47 @@ registry().lock().remove(&id);
 
 `Thinking` / `ToolCallResult` / `IterationStart` events are dropped from the side-channel stream — too noisy for the chat surface. The full `result_text` is delivered in the terminal `Done` event.
 
+### Panic watchdog (defense-in-depth)
+
+The inner task body's terminal-event emit + registry cleanup runs **only if** control reaches the bottom of the loop. A panic anywhere inside the agent loop — provider hallucination, tool deserialisation bug, unwrap on `None` — would unwind the tokio task, skip the `events_tx.send(...)` + `registry().lock().remove(&id)`, and tokio would convert the abnormal exit into `Err(JoinError::Panic)` on the JoinHandle. Pre-fix this left the UI showing the agent as "running forever" and leaked a registry entry.
+
+The fix wraps the inner task in a **watchdog** task that awaits the inner's JoinHandle:
+
+```rust
+let inner = tokio::spawn(async move { /* agent loop above */ });
+
+let join = tokio::spawn(async move {
+    match inner.await {
+        Ok(()) => {}  // normal exit — inner already emitted Done/Error + cleaned registry
+        Err(je) => {
+            let err_msg = if je.is_panic() {
+                let payload = je.into_panic();
+                let panic_msg = payload
+                    .downcast_ref::<&str>().map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic payload".to_string());
+                format!("agent panicked: {panic_msg}")
+            } else if je.is_cancelled() {
+                "tokio task aborted".to_string()  // runtime shutdown
+            } else {
+                "tokio task ended unexpectedly".to_string()
+            };
+            let _ = events_tx_for_watchdog.send(ViewEvent::SideChannelError {
+                id: id_for_watchdog.clone(),
+                error: err_msg,
+            });
+            if let Ok(mut reg) = registry().lock() {
+                reg.remove(&id_for_watchdog);
+            }
+        }
+    }
+});
+```
+
+The registry stashes `join` (the watchdog handle), not the inner — the watchdog completes only after panic-detection runs, so anyone awaiting the JoinHandle sees the full sequence.
+
+Tests use `std::panic::set_hook(Box::new(|_| {}))` to suppress the backtrace from the intentional panic during the test run, then restore the hook before assertions so harness-level panics still surface clearly. See `spawn_emits_error_on_panic` in `side_channel.rs`.
+
 ## 3. Process-wide registry
 
 ```rust
@@ -329,6 +370,38 @@ Bubble layout:
 - Body: monospace block with accumulated stream text (running) or full result (done)
 
 The bubble renders BEFORE the existing `tool` / `assistant` / `user` branches in `messages.map`, since `sideChannel` is the diagnostic signal regardless of `role`.
+
+### BackgroundAgentsSidebar — persistent right-edge tracker
+
+The inline chat bubble is the per-turn view; for "is `/dream` still running?" across many turns of unrelated chatter, the inline bubble scrolls out of view. The `BackgroundAgentsSidebar` component (`frontend/src/components/BackgroundAgentsSidebar.tsx`) subscribes to the same `chat_side_channel_*` events and renders a 260 px right-edge column with one row per agent:
+
+```ts
+type AgentEntry = {
+    id: string;
+    agentName: string;
+    status: "running" | "done" | "error";
+    startedAt: number;
+    finishedAt?: number;
+    durationMs?: number;
+    lastTool?: string;
+    result?: string;
+    error?: string;
+};
+```
+
+Wiring:
+
+- `chat_side_channel_start` → push entry with `status: "running"`, `startedAt: Date.now()`. Sidebar also exits the "dismissed" state if the user had hidden it — a fresh agent surfaces automatically.
+- `chat_side_channel_tool_call` → update `lastTool` for the matching id (used to render `↳ KmsSearch` under the agent name so you see what it's currently doing).
+- `chat_side_channel_done` → set `status: "done"`, `finishedAt`, `durationMs`, `result`. For agents named `dream` the rendered footer parses `dream-YYYY-MM-DD` out of `result` and surfaces it as a hint (`→ dream-2026-05-11`) so the user can jump to the summary page.
+- `chat_side_channel_error` → set `status: "error"`, `error`. First line of the error renders below the row.
+
+A single 1 s ticker (`setInterval` inside `useEffect`) drives the elapsed-time column when at least one entry is running; the interval falls back to 30 s when only finished entries linger (purely to drive TTL pruning). The ticker stores `now: number` in state instead of calling `Date.now()` in render — React 19's `react-hooks/purity` rule rejects impure calls in the render path. The ticker callback updates both `now` (for display) and prunes any entry that's been finished/errored for more than 5 min.
+
+Suppression rules:
+
+- Component returns `null` while `agents` is empty (no flash before the first agent spawns).
+- Dismissed state (`X` button) collapses to a 20 px chevron tab on the right edge; tab glows accent color when at least one agent is still running so the user doesn't forget the work in flight.
 
 ## 9. WorkerState plumbing
 

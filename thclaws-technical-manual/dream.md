@@ -88,8 +88,7 @@ The disk path is now a thin wrapper. Behaviour is identical to before for on-dis
 ```yaml
 name: dream
 description: Consolidate the project's KMS by mining recent sessions, deduping pages, and surfacing insights
-model: claude-opus-4-7
-tools: KmsRead, KmsSearch, KmsWrite, KmsAppend, KmsDelete, Read, Glob, Grep, TodoWrite
+tools: KmsRead, KmsSearch, KmsWrite, KmsAppend, KmsDelete, KmsCreate, Read, Glob, Grep, TodoWrite, SessionRename
 permissionMode: auto
 maxTurns: 120
 color: purple
@@ -97,14 +96,40 @@ color: purple
 
 Notable choices:
 
-- **Model = `claude-opus-4-7`.** Consolidation requires synthesis (compare two pages and decide if they're really the same), not just retrieval. The default model is overrideable per-session via `model:` in `.thclaws/agents/dream.md`.
-- **Tool whitelist is tight.** `Read`/`Glob`/`Grep` exist so the agent can mine `.thclaws/sessions/*.jsonl` files; `KmsRead`/`KmsSearch` for survey; `KmsWrite`/`KmsAppend`/`KmsDelete` for mutation; `TodoWrite` for tracking which pass it's on. Notably absent: `Bash`, `Edit`, `Write`, `Memory*`, `Task`, `WebSearch`, `WebFetch`. The dream agent can only modify the KMS — it can't touch project source, can't recurse into more subagents, can't reach the network.
+- **No `model:` field.** The dream agent uses the session's active model. Pre-fix the agent def hardcoded `claude-opus-4-7`, which routed through the session's CURRENT provider — so users on OpenAI hit `404: model claude-opus-4-7 does not exist` even with an Anthropic key set. Long-context judgment models (Opus / GPT-4.1 / Sonnet 4.6) work best for this task; pick one before invoking `/dream` if you care. Override per-project via `model:` in `.thclaws/agents/dream.md`.
+- **Tool whitelist is tight.** `Read`/`Glob`/`Grep` exist so the agent can mine `.thclaws/sessions/*.jsonl` files; `KmsRead`/`KmsSearch` for survey; `KmsWrite`/`KmsAppend`/`KmsDelete` for mutation; `KmsCreate` for bootstrapping the `dreams` audit KMS; `SessionRename` for the Pass-2 auto-rename; `TodoWrite` for tracking which pass it's on. Notably absent: `Bash`, `Edit`, `Write`, `Memory*`, `Task`, `WebSearch`, `WebFetch`. The dream agent can only modify the KMS + session metadata (titles) — it can't touch project source, can't recurse into more subagents, can't reach the network.
 - **`permissionMode: auto`** — the agent's KMS mutations land directly. The user-facing review pattern is `git diff .thclaws/kms/`, not in-modal approval. A user who wants approval-gated dreaming can override the AgentDef.
 - **`maxTurns: 120`** — consolidation across multiple KMS + 10 sessions can take many turns. Default is 200; 120 is a comfortable ceiling that still bounds runaway behavior.
 
-The body is a four-pass operating procedure: **Survey** (read active KMS list + each `index.md` + glob recent sessions), **Read sessions** (skim the 10 most recently modified JSONLs for stable facts not yet in KMS), **Consolidate** (search-before-write, prefer Append over Delete, merge overlapping pages and delete duplicates), **Summarize** (write a `dream-YYYY-MM-DD.md` audit-trail page). Plus a discipline section ("stay inside the KMS", "one KMS at a time", "no backfilling old context", "stop when there's nothing to do").
+### Five-pass operating procedure
+
+Pre-fix the body was a four-pass loop. The current body is a **five-pass** loop with explicit skip-already-dreamed + auto-rename + scoped reconciliation logic:
+
+1. **Survey + skip-already-dreamed.** Read the active KMS list + each `index.md`. `KmsSearch` the dedicated `dreams` KMS for the most recent prior `dream-` summary; extract its "Sessions processed" table. Glob `.thclaws/sessions/*.jsonl` (10 most recent by default, all with `--all`). Skip sessions whose recorded `last_message_at` ≥ current file mtime — no new chat content since prior dream.
+2. **Read sessions + auto-rename.** Read each surviving session JSONL. If the session's title is missing or matches the auto-generated `sess-<8hex>` shape, propose a meaningful one-line title (≤ 70 chars) and call `SessionRename`. Skip sessions the user already gave a meaningful title to.
+3. **Consolidate (writes to ACTIVE KMSes only).** For each insight: pick the right active KMS (`auth-conventions` ↔ project-knowledge, personal preferences ↔ personal-notes, etc.); `KmsSearch(kms: "<active-kms>", pattern: "...")` first; prefer `KmsAppend` over creating a new page; merge overlapping pages via `KmsWrite` + `KmsDelete`. **The `kms:` argument MUST be one of the active KMSes from the system prompt — never `dreams`.** If no active KMS is attached, Pass 3 is skipped entirely (noted in the summary) and the agent proceeds to Pass 4. Track which pages were written/appended/deleted (all of which live in active KMSes) — Pass 3b needs that list.
+4. **Pass 3b — Targeted reconciliation (still in active KMSes).** For every page touched in Pass 3 only: `KmsRead` the full page, look for internal contradictions (two facts disagreeing, stale timestamps, "we use X" vs "we migrated away from X"), and `KmsWrite` a rewrite with a `## History` section preserving the old stance + reason for change. All Pass 3-touched pages are in active KMSes, so Pass 3b never reads or writes `dreams`. Do NOT touch unmodified pages — that's `/kms reconcile`'s job (full-vault sweep). Targeted scope keeps the diff cohesive for review.
+5. **Summarize (writes the SINGLE summary page to `dreams` ONLY).** Always end the run by writing one summary page in the **`dreams`** KMS (NOT any active project / user KMS) at `dream-YYYY-MM-DD.md`. The summary carries a Sessions-processed table (load-bearing — next dream's Pass 1 reads it), plus pages added / updated / reconciled / deleted lists, sessions renamed, insights surfaced, and skipped reasons. The summary is the ONLY page that ever lands in `dreams`; knowledge pages from Pass 3 live in active KMSes.
+
+### Two-way targeting invariant
+
+The prompt enforces a strict two-way invariant via repetition + an explicit anti-pattern section:
+
+- Pass 3 + Pass 3b: `kms:` MUST be an active KMS. NEVER `dreams`.
+- Pass 4: `kms:` MUST be `dreams`. NEVER an active KMS.
+- Pass 1 reads `dreams` (looking for prior summaries) and reads active KMSes' indices. Reads are exempt from the write-direction rule.
+
+Historical failure mode (pre-fix): the prompt's Pass 3 wording said "the relevant KMS", which the agent interpreted loosely + saw `dreams` mentioned repeatedly elsewhere in the prompt → defaulted to filing knowledge pages in `dreams`. The current prompt adds explicit `kms: "<active-kms-name>"` placeholders in every Pass 3 example, a "Common mistakes to avoid" subsection enumerating the failure patterns (knowledge to `dreams`, summary to active KMS, cross-vault merge), and a Discipline rule stating the invariant in both directions.
+
+### `--all` flag
+
+`shell_dispatch.rs`'s Dream arm encodes the `--all` flag into the user message as `[scope: ALL_SESSIONS — process every .jsonl file under .thclaws/sessions/, not just the 10 most recent. Widen Pass 3b targeted reconciliation to every page Pass 3 touched.]`. The dream prompt reads this scope hint in Pass 1 to widen the glob; with no hint it defaults to "10 most recent".
 
 The active KMS list reaches the dream agent through the same `kms::system_prompt_section` injection as any other agent — it sees `## Knowledge bases` listing the attached KMS by name, which it uses as the authoritative list to operate on.
+
+### Dispatch auto-creates the `dreams` KMS
+
+`shell_dispatch.rs`'s Dream arm calls `kms::create("dreams", KmsScope::Project)` before `spawn_side_channel` (idempotent). This is layer 1 of defense-in-depth — the agent itself also calls `KmsCreate({name: "dreams", scope: "project"})` as Pass 5 Step 0 (layer 2). Either layer alone is sufficient; both together survive stale binaries, filesystem races between dispatch and agent execution, etc.
 
 ---
 

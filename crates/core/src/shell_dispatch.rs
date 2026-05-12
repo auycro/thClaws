@@ -2756,19 +2756,53 @@ pub async fn dispatch(
                 );
             }
         }
-        SlashCommand::Dream { focus } => {
+        SlashCommand::Dream {
+            focus,
+            all_sessions,
+        } => {
             // `/dream` dispatches the built-in `dream` AgentDef as a
             // side channel. Built-in def is seeded into the registry
             // by `AgentDefsConfig::seed_builtins`, so the existing
             // side-channel pipeline handles the rest. Empty focus
             // falls back to a default consolidate-everything prompt
             // so the agent has something to chew on.
-            let prompt = if focus.trim().is_empty() {
-                "Consolidate the active KMS by mining recent sessions. \
-                 Follow your standard four-pass procedure."
-                    .to_string()
+            //
+            // The `--all` flag is encoded into the user message as a
+            // recognizable token; dream.md's Pass 1 instructions read
+            // it to decide between "last 10 sessions" (default) vs
+            // "all sessions" scope.
+
+            // Ensure the project-scope `dreams` KMS exists before the
+            // agent runs. Pass 4 of the dream procedure writes its
+            // summary page there (NOT to the user's active KMSes) so
+            // run-audit logs don't contaminate the actual knowledge
+            // vault. `kms::create` is idempotent — returns the
+            // existing ref if already present, so calling on every
+            // /dream is safe and side-effect-free after the first.
+            // Best-effort: if creation somehow fails (permissions,
+            // disk full), the agent's KmsWrite will surface a clear
+            // error later in Pass 4 — surface it to the user as a
+            // hint here so they're not surprised.
+            if let Err(e) = crate::kms::create("dreams", crate::kms::KmsScope::Project) {
+                emit(
+                    events_tx,
+                    format!(
+                        "warning: could not ensure 'dreams' KMS exists ({e}); dream summary may fail at Pass 4"
+                    ),
+                );
+            }
+
+            let scope_note = if all_sessions {
+                "\n\n[scope: ALL_SESSIONS — process every .jsonl file under .thclaws/sessions/, not just the 10 most recent. Widen Pass 3b targeted reconciliation to every page Pass 3 touched.]"
             } else {
-                focus
+                ""
+            };
+            let prompt = if focus.trim().is_empty() {
+                format!(
+                    "Consolidate the active KMS by mining recent sessions. Follow your standard four-pass procedure.{scope_note}"
+                )
+            } else {
+                format!("{focus}{scope_note}")
             };
             match crate::side_channel::spawn_side_channel(
                 "dream".to_string(),

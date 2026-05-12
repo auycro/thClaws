@@ -234,10 +234,22 @@ event type ที่จะพบเห็นได้
 - `{"type":"header", ...}` — มีครั้งเดียวที่ด้านบนสุด
 - `{"type":"message", "role":"user"|"assistant", "content":[...]}` — turn จริง
 - `{"type":"rename", "title":"..."}` — การเปลี่ยนชื่อ
+- `{"type":"plan_snapshot", ...}` / `{"type":"goal_snapshot", ...}` —
+  checkpoint ของ sidebar (latest wins on load)
 - `{"type":"compaction", "messages":[...], "replaces_count":N, ...}` —
   checkpoint ของ auto-compact หรือ `/compact` บรรทัด message ก่อนหน้ายัง
   อยู่ในไฟล์เพื่อ audit แต่การ `/load` ถัดไปจะใช้ messages ใน
   checkpoint ล่าสุดเป็นจุดเริ่มต้น
+- `{"type":"provider_state", "provider_session_id":"uuid-..."}` —
+  conversation id ฝั่ง provider (`anthropic-agent` only — ดูด้านล่าง)
+
+## Resume เซสชัน `anthropic-agent`
+
+Provider `anthropic-agent` (Anthropic Agent SDK subprocess; ใช้เมื่อเลือก model อย่าง `claude-sonnet-4-6@agent-sdk`) เก็บประวัติบทสนทนา **ฝั่ง server เอง** อ้างอิงด้วย UUID ที่ส่งกลับมาตอน response แรก thClaws จะ capture UUID นั้นและบันทึกเป็น event `provider_state` ใน JSONL ของเซสชัน เมื่อ `/load` หรือ `/resume` เซสชันนั้นในครั้งถัดไป provider จะได้ UUID กลับผ่าน `Provider::set_provider_session_id` และ turn ถัดไปจะส่ง `--resume <uuid>` ไปยัง subprocess. SDK กู้ประวัติฝั่ง server กลับมา model จึงเห็นบทสนทนาก่อนหน้าครบ
+
+ก่อน fix นี้ hop นี้หายไป — UUID อยู่แค่ในหน่วยความจำ ถ้าปิด thClaws แล้วเปิดใหม่ SDK จะเริ่ม conversation ใหม่หมด เห็นแค่ user message ล่าสุด model เหมือนลืมทุกอย่าง ถ้าใช้ build เก่ากว่า fix นี้แล้ว resume รู้สึกพัง ให้เริ่ม session ใหม่
+
+UUID นี้**ไม่**แชร์ข้าม provider การสลับจาก `anthropic-agent` ไป `claude/anthropic`, OpenAI, Gemini ฯลฯ จะ fork session ใหม่อยู่แล้ว (ตามกฎด้านบน) ไม่มี state รั่วข้าม provider
 
 ## การแชร์หรือ archive เซสชัน
 

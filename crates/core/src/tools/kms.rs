@@ -53,9 +53,80 @@ impl Tool for KmsReadTool {
             )));
         };
         let path = kref.page_path(page)?;
-        std::fs::read_to_string(&path)
-            .map_err(|e| Error::Tool(format!("read {}: {e}", path.display())))
+        let body = std::fs::read_to_string(&path)
+            .map_err(|e| Error::Tool(format!("read {}: {e}", path.display())))?;
+
+        // Freshness signal — surface staleness inline so the model
+        // hedges or re-verifies before citing facts that may have
+        // drifted. The page itself is unchanged; only the tool
+        // response prepends the warning. Addresses the LLM-Wiki
+        // critique "error persistence — pages are treated as fresh
+        // forever even when sources have moved on". `verified:`
+        // frontmatter is only stamped by callers that actually
+        // verified (research pipeline today; future /kms verify
+        // command). Pages without `verified:` get a softer
+        // "no verification record" hint rather than a date-based
+        // alarm so existing user-curated content isn't shouted at.
+        let warning = staleness_warning(&body);
+        Ok(match warning {
+            Some(w) => format!("{w}\n\n{body}"),
+            None => body,
+        })
     }
+}
+
+/// Inspect a page's frontmatter and return a one-line `[note: …]`
+/// banner if it looks stale or unverified. `verified: YYYY-MM-DD`
+/// older than [`STALE_DAYS_THRESHOLD`] → date-based warning; missing
+/// `verified:` → softer "no verification record" hint. None means
+/// the page is fresh enough that no banner is needed.
+fn staleness_warning(body: &str) -> Option<String> {
+    const STALE_DAYS_THRESHOLD: i64 = 90;
+    let (fm, _) = crate::kms::parse_frontmatter(body);
+    // Pages with no frontmatter at all (legacy / partial) → don't
+    // shout; the model can see the missing frontmatter itself.
+    if fm.is_empty() {
+        return None;
+    }
+    match fm.get("verified") {
+        None => Some(
+            "[note: this page has no `verified:` frontmatter — provenance is best-effort, treat factual claims with caution]"
+                .to_string(),
+        ),
+        Some(date_str) => {
+            let today = crate::usage::today_str();
+            let days = days_between_ymd(date_str, &today)?;
+            if days > STALE_DAYS_THRESHOLD {
+                Some(format!(
+                    "[note: this page was last verified {days} days ago — sources may have drifted; re-verify before citing as current fact]"
+                ))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Days between two `YYYY-MM-DD` strings (lhs older → positive
+/// result). Returns `None` on parse failure so the caller skips the
+/// warning rather than surfacing a misleading number.
+fn days_between_ymd(older: &str, newer: &str) -> Option<i64> {
+    let parse = |s: &str| -> Option<(i32, u32, u32)> {
+        let mut parts = s.trim().splitn(3, '-');
+        let y: i32 = parts.next()?.parse().ok()?;
+        let m: u32 = parts.next()?.parse().ok()?;
+        let d: u32 = parts.next()?.parse().ok()?;
+        Some((y, m, d))
+    };
+    let (oy, om, od) = parse(older)?;
+    let (ny, nm, nd) = parse(newer)?;
+    // Cheap day-count without pulling chrono into the tool: treat
+    // every month as 30 days, every year as 365. Off by a couple
+    // days at the boundary — fine for an "is this page stale?"
+    // banner that triggers at 90-day granularity.
+    let days_older = (oy as i64) * 365 + (om as i64) * 30 + (od as i64);
+    let days_newer = (ny as i64) * 365 + (nm as i64) * 30 + (nd as i64);
+    Some(days_newer - days_older)
 }
 
 pub struct KmsSearchTool;
@@ -154,10 +225,38 @@ impl Tool for KmsWriteTool {
 
     fn description(&self) -> &'static str {
         "Create or replace a page in an attached knowledge base. Content \
-         may begin with YAML frontmatter (---\\n category: ... \\n---\\n) — \
-         it's preserved and `updated:` is bumped to today. Use for \
-         wiki maintenance: filing curated summaries, entity pages, \
-         cross-referenced concept pages."
+         MUST start with YAML frontmatter:\n\
+         \n\
+         ```\n\
+         ---\n\
+         title: Human-readable page title\n\
+         topic: One-line description of what this page covers\n\
+         sources: [\"https://example.com/article\", \"session-XYZ\"]   # REQUIRED — provenance for every page\n\
+         category: optional\n\
+         tags: [optional, free-form]\n\
+         ---\n\
+         \n\
+         Body content goes here…\n\
+         ```\n\
+         \n\
+         `sources:` is required — pages without provenance are hard to \
+         re-verify later. Valid values: external URLs, `session-<id>` for \
+         facts learned in conversation, `memory` for stable user-supplied \
+         knowledge, or `[]` (empty list) for opinion/convention pages \
+         that have no external source (still better than omitting the \
+         field — it's an explicit acknowledgement). Without `sources:` \
+         the write succeeds but the response includes a warning, and \
+         `KmsRead` later prepends a `[note: this page has no \
+         verification record]` banner.\n\
+         \n\
+         `created:` / `updated:` are auto-stamped. The tool injects a \
+         canonical `# {title}\\nDescription: {topic}\\n---` block before \
+         the body so every page has a uniform header — DO NOT include \
+         that block yourself (it will be added automatically). If you \
+         intentionally want a different leading heading, write your own \
+         `# heading` as the body's first line and the tool will respect \
+         it. Missing `title:` falls back to the page filename; missing \
+         `topic:` skips the Description line."
     }
 
     fn input_schema(&self) -> Value {
@@ -166,7 +265,7 @@ impl Tool for KmsWriteTool {
             "properties": {
                 "kms":     {"type": "string", "description": "KMS name (from the active list)"},
                 "page":    {"type": "string", "description": "Page name (with or without .md). No path separators."},
-                "content": {"type": "string", "description": "Full page content; may include YAML frontmatter."}
+                "content": {"type": "string", "description": "Full page content. Include YAML frontmatter with `title:`, `topic:`, AND `sources:` at the top; the body follows below. The tool auto-injects `# {title}\\nDescription: {topic}\\n---` before the body."}
             },
             "required": ["kms", "page", "content"]
         })
@@ -185,12 +284,46 @@ impl Tool for KmsWriteTool {
                 "no KMS named '{kms_name}' (check /kms list)"
             )));
         };
+        // Pre-flight provenance check: pages without `sources:` in
+        // frontmatter still write (soft enforcement keeps the tool
+        // usable for legacy / quick captures), but the response
+        // carries a warning so the model notices on the spot rather
+        // than waiting for a future `KmsRead` to surface the gap.
+        // The `KmsRead` staleness banner is the second layer of the
+        // same enforcement.
+        let provenance_warning = check_provenance(content);
         let path = crate::kms::write_page(&kref, page, content)?;
-        Ok(format!(
-            "wrote {} ({} bytes)",
-            path.display(),
-            content.len()
-        ))
+        let base = format!("wrote {} ({} bytes)", path.display(), content.len());
+        Ok(match provenance_warning {
+            Some(w) => format!("{base}\nwarning: {w}"),
+            None => base,
+        })
+    }
+}
+
+/// Inspect content's frontmatter for the `sources:` key. Returns a
+/// one-line warning when missing/empty so the KmsWrite caller can
+/// notice immediately. Frontmatter-free pages are exempt (legacy /
+/// freeform — separate concern; the `KmsRead` banner handles them).
+fn check_provenance(content: &str) -> Option<String> {
+    let (fm, _) = crate::kms::parse_frontmatter(content);
+    if fm.is_empty() {
+        return None;
+    }
+    match fm.get("sources").map(String::as_str).map(str::trim) {
+        None => Some(
+            "no `sources:` frontmatter — add a URL list (or `[]` for \
+             opinion/convention pages, or `session-<id>` / `memory` for \
+             in-conversation provenance) so the page is auditable later"
+                .to_string(),
+        ),
+        Some("") => Some(
+            "`sources:` is present but empty — set explicit values \
+             (URLs / `session-<id>` / `memory` / `[]`) so the field's \
+             intent isn't ambiguous"
+                .to_string(),
+        ),
+        Some(_) => None,
     }
 }
 
@@ -292,6 +425,83 @@ impl Tool for KmsDeleteTool {
         };
         let path = crate::kms::delete_page(&kref, page)?;
         Ok(format!("deleted {}", path.display()))
+    }
+}
+
+/// Ensure a named knowledge base exists at the requested scope.
+/// Idempotent: returns the existing KMS if already present, otherwise
+/// seeds the directory tree (`pages/`, `sources/`, `index.md`,
+/// `log.md`, `SCHEMA.md`, `manifest.json`).
+///
+/// Primary motivation: /dream's Pass 4 writes its summary page into a
+/// dedicated `dreams` KMS so audit logs do not contaminate the user's
+/// real knowledge vaults. The dispatch path auto-creates `dreams`
+/// before spawning the dream agent, but giving the agent the tool to
+/// re-create on its own provides defense-in-depth — if the binary
+/// running the dispatch is stale (no pre-create call) or the disk
+/// state changed between dispatch and Pass 4, the agent can still
+/// recover by calling KmsCreate itself instead of looping on
+/// "no KMS named 'dreams'" errors.
+///
+/// Auto-approved (no Ask gate) for the same reason `SessionRename` is:
+/// the operation is name-validated, idempotent, and scoped to a
+/// known config directory. Worst case the user ends up with an empty
+/// KMS they can delete by `rm -rf .thclaws/kms/<name>` — recoverable.
+pub struct KmsCreateTool;
+
+#[async_trait]
+impl Tool for KmsCreateTool {
+    fn name(&self) -> &'static str {
+        "KmsCreate"
+    }
+
+    fn description(&self) -> &'static str {
+        "Ensure a knowledge base exists. Idempotent: returns the existing \
+         KMS if already present, otherwise seeds index.md / log.md / \
+         SCHEMA.md / pages/ / sources/. Use sparingly: prefer KmsWrite \
+         to an already-existing KMS. /dream's Pass 4 calls this on \
+         'dreams' (scope: project) so the audit-log KMS exists before \
+         the summary page is written."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name":  {"type": "string", "description": "KMS name. No path separators, no leading dot, no control chars."},
+                "scope": {
+                    "type": "string",
+                    "enum": ["project", "user"],
+                    "description": "'project' = ./.thclaws/kms/<name> (per-workspace); 'user' = ~/.config/thclaws/kms/<name> (global). /dream uses 'project'."
+                }
+            },
+            "required": ["name", "scope"]
+        })
+    }
+
+    fn requires_approval(&self, _input: &Value) -> bool {
+        false
+    }
+
+    async fn call(&self, input: Value) -> Result<String> {
+        let name = req_str(&input, "name")?;
+        let scope_str = req_str(&input, "scope")?;
+        let scope = match scope_str {
+            "project" => crate::kms::KmsScope::Project,
+            "user" => crate::kms::KmsScope::User,
+            other => {
+                return Err(Error::Tool(format!(
+                    "invalid scope '{other}' — must be 'project' or 'user'"
+                )))
+            }
+        };
+        let kref = crate::kms::create(name, scope)?;
+        Ok(format!(
+            "ensured KMS '{}' ({}) at {}",
+            kref.name,
+            scope.as_str(),
+            kref.root.display()
+        ))
     }
 }
 
@@ -534,5 +744,138 @@ mod tests {
             .call(json!({"kms": "nb", "page": "log"}))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn create_tool_seeds_new_kms() {
+        let _home = scoped_home();
+        let out = KmsCreateTool
+            .call(json!({"name": "dreams", "scope": "project"}))
+            .await
+            .unwrap();
+        assert!(out.contains("dreams"), "got: {out}");
+        // Resolve picks it up after creation — i.e. the directory exists
+        // and is shaped correctly.
+        let kref =
+            crate::kms::resolve("dreams").expect("KmsCreate should have made dreams resolvable");
+        assert!(kref.pages_dir().is_dir());
+        assert!(kref.index_path().is_file());
+    }
+
+    #[tokio::test]
+    async fn create_tool_is_idempotent() {
+        let _home = scoped_home();
+        let first = KmsCreateTool
+            .call(json!({"name": "dreams", "scope": "project"}))
+            .await
+            .unwrap();
+        // Second call must not error and must produce the same path
+        // shape — the dream agent calls this on every run, so a
+        // collision would defeat the purpose.
+        let second = KmsCreateTool
+            .call(json!({"name": "dreams", "scope": "project"}))
+            .await
+            .unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn create_tool_rejects_invalid_scope() {
+        let _home = scoped_home();
+        let err = KmsCreateTool
+            .call(json!({"name": "dreams", "scope": "shared"}))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("invalid scope"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn create_tool_rejects_path_traversal() {
+        let _home = scoped_home();
+        let err = KmsCreateTool
+            .call(json!({"name": "../escape", "scope": "user"}))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("invalid kms name"), "got: {err}");
+    }
+
+    // ── Provenance + freshness ─────────────────────────────────────
+
+    #[test]
+    fn check_provenance_flags_missing_sources_key() {
+        let warning = check_provenance("---\ntitle: t\ntopic: p\n---\nbody");
+        assert!(warning.is_some());
+        assert!(warning.unwrap().contains("no `sources:` frontmatter"));
+    }
+
+    #[test]
+    fn check_provenance_flags_empty_sources_value() {
+        // `sources:` present but blank value (model wrote the key
+        // without a list) → soft warning so the model fills it.
+        let warning = check_provenance("---\ntitle: t\nsources:\n---\nbody");
+        assert!(warning.is_some());
+        assert!(warning.unwrap().contains("present but empty"));
+    }
+
+    #[test]
+    fn check_provenance_accepts_explicit_empty_list() {
+        // `sources: []` is the deliberate "opinion / convention,
+        // no external source" form — explicit acknowledgement, not
+        // an omission. Should NOT warn.
+        let warning = check_provenance("---\ntitle: t\nsources: []\n---\nbody");
+        assert!(
+            warning.is_none(),
+            "explicit `[]` is the acknowledged opt-out, must not warn: {warning:?}"
+        );
+    }
+
+    #[test]
+    fn check_provenance_accepts_filled_sources() {
+        let warning =
+            check_provenance("---\ntitle: t\nsources: [\"https://example.com\"]\n---\nbody");
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn check_provenance_ignores_legacy_no_frontmatter_pages() {
+        // Pages without any frontmatter (legacy / freeform) aren't
+        // shouted at — the KmsRead staleness banner handles them
+        // separately. Avoids double-warning.
+        let warning = check_provenance("just body, no frontmatter");
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn staleness_warning_fires_for_old_verified_date() {
+        // `verified:` from years ago → date-based banner.
+        let body = "---\ntitle: t\ntopic: p\nverified: 2020-01-01\n---\nbody";
+        let warning = staleness_warning(body);
+        assert!(warning.is_some());
+        assert!(warning.unwrap().contains("days ago"));
+    }
+
+    #[test]
+    fn staleness_warning_silent_for_fresh_page() {
+        // `verified: <today>` → no banner. Use a date in the future
+        // so this test doesn't bit-rot when today shifts.
+        let body = "---\ntitle: t\ntopic: p\nverified: 2099-01-01\n---\nbody";
+        assert!(staleness_warning(body).is_none());
+    }
+
+    #[test]
+    fn staleness_warning_flags_missing_verified_field() {
+        // Frontmatter present but no `verified:` → softer hint.
+        let body = "---\ntitle: t\ntopic: p\n---\nbody";
+        let warning = staleness_warning(body);
+        assert!(warning.is_some());
+        assert!(warning.unwrap().contains("no `verified:` frontmatter"));
+    }
+
+    #[test]
+    fn staleness_warning_silent_for_no_frontmatter() {
+        // Legacy page with bare body — staleness check doesn't fire
+        // (the page may have been hand-written; we don't presume
+        // staleness without a frontmatter contract).
+        assert!(staleness_warning("just body").is_none());
     }
 }

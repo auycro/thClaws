@@ -491,8 +491,11 @@ plugin-only reviewer
             .expect("built-in translator agent should be seeded");
         assert_eq!(translator.name, "translator");
         assert!(!translator.instructions.is_empty());
-        // Frontmatter declares the gpt-4.1 default.
-        assert_eq!(translator.model.as_deref(), Some("gpt-4.1"));
+        // No `model:` in frontmatter — translator inherits the
+        // session's active model (so cross-provider users don't
+        // hit "model not found" 404s when the hard-coded model
+        // doesn't match their session's provider).
+        assert_eq!(translator.model.as_deref(), None);
         // Tool whitelist captured — translator has no Bash, no KMS,
         // no Task. Just file I/O.
         assert!(translator.tools.iter().any(|t| t == "Read"));
@@ -528,7 +531,9 @@ plugin-only reviewer
         let app_config = crate::config::AppConfig::default();
         config.apply_builtin_subagent_overrides(&app_config);
         let translator = config.get("translator").unwrap();
-        assert_eq!(translator.model.as_deref(), Some("gpt-4.1"));
+        // No override + no frontmatter `model:` → None (inherits
+        // session model at build time).
+        assert_eq!(translator.model.as_deref(), None);
     }
 
     #[test]

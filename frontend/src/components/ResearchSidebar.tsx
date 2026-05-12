@@ -78,6 +78,17 @@ export function ResearchSidebar() {
   // here too).
   const [focusedId, setFocusedId] = useState<string | null>(null);
   const [dismissed, setDismissed] = useState(false);
+  /// Job ids the user has explicitly dismissed AFTER the job
+  /// reached a terminal state (done / cancelled / failed). Pre-fix
+  /// the X button always collapsed to a chevron tab regardless of
+  /// run state — fine while a job is running (user might want to
+  /// peek back at progress) but pointless after the run finished
+  /// (the work is done; the sidebar is dead weight). With this set
+  /// tracked, terminal-state X closes the sidebar entirely for that
+  /// job by filtering it out of the focused-job selection and
+  /// suppressing the panel when no other live jobs remain.
+  const dismissedTerminalRef = useRef<Set<string>>(new Set());
+  const [dismissedVersion, setDismissedVersion] = useState(0);
   const lastSeenIterRef = useRef<Map<string, number>>(new Map());
 
   useEffect(() => {
@@ -103,8 +114,19 @@ export function ResearchSidebar() {
           }
           // Iteration history: append once per detected iteration
           // increment. Tracked outside React state so the comparison
-          // doesn't fight reconciliation.
-          let iterationHistory = existing?.iterationHistory ?? [];
+          // doesn't fight reconciliation. New entries are appended
+          // with `score: null` — the score gets filled in by the
+          // patch step below when the post-evaluate broadcast lands.
+          // (Backend sends two broadcasts per iter: one at iter-start
+          // with last_score=null, one after evaluate with the real
+          // score. The previous append-time-only logic locked iter N
+          // to last_score-at-append, which was iter N-1's value.)
+          // Explicit type — `existing?.iterationHistory ?? []` falls
+          // back to `never[]` on first encounter, which then poisons
+          // the inferred element type of subsequent `findIndex` /
+          // `map` callbacks (params come out as `any`, lint fails).
+          let iterationHistory: JobProgress["iterationHistory"] =
+            existing?.iterationHistory ?? [];
           const lastIter = lastSeenIterRef.current.get(j.id) ?? 0;
           if (j.iterations_done > lastIter) {
             for (let n = lastIter + 1; n <= j.iterations_done; n++) {
@@ -112,12 +134,42 @@ export function ResearchSidebar() {
                 ...iterationHistory,
                 {
                   iter: n,
-                  score: n === j.iterations_done ? j.last_score : null,
+                  score: null,
                   sourceCount: j.source_count,
                 },
               ];
             }
             lastSeenIterRef.current.set(j.id, j.iterations_done);
+          }
+          // Patch: keep the entry matching the current iter in sync
+          // with the latest broadcast. The post-evaluate broadcast
+          // arrives with iterations_done unchanged but last_score
+          // freshly populated — without this step the entry would
+          // freeze at score=null since the iter-increment branch
+          // doesn't fire a second time. `source_count` is also
+          // tracked here because fetch-phase deltas update it
+          // independently of evaluate.
+          if (iterationHistory.length > 0) {
+            const idx = iterationHistory.findIndex(
+              (e) => e.iter === j.iterations_done,
+            );
+            if (idx >= 0) {
+              const entry = iterationHistory[idx];
+              if (
+                entry.score !== j.last_score ||
+                entry.sourceCount !== j.source_count
+              ) {
+                iterationHistory = iterationHistory.map((e, i) =>
+                  i === idx
+                    ? {
+                        ...e,
+                        score: j.last_score,
+                        sourceCount: j.source_count,
+                      }
+                    : e,
+                );
+              }
+            }
           }
           next.set(j.id, { view: j, phaseLog, iterationHistory });
         }
@@ -138,12 +190,20 @@ export function ResearchSidebar() {
       // running job; fall back to most-recent terminal. User can
       // override (sticky once a job is selected manually — but we
       // don't expose manual selection in this revision).
+      // Jobs the user dismissed after they reached a terminal state
+      // are filtered out of the auto-focus selection so a closed
+      // sidebar stays closed for that job.
+      const dismissedIds = dismissedTerminalRef.current;
       setFocusedId((prev) => {
-        const prevStillExists = prev !== null && jobs.some((j) => j.id === prev);
+        const prevStillExists =
+          prev !== null && jobs.some((j) => j.id === prev) && !dismissedIds.has(prev);
         if (prevStillExists) return prev;
-        const running = jobs.find((j) => j.status === "running" || j.status === "pending");
+        const running = jobs.find(
+          (j) => (j.status === "running" || j.status === "pending") && !dismissedIds.has(j.id),
+        );
         if (running) return running.id;
-        if (jobs.length > 0) return jobs[0].id;
+        const liveJobs = jobs.filter((j) => !dismissedIds.has(j.id));
+        if (liveJobs.length > 0) return liveJobs[0].id;
         return null;
       });
       // Re-open if dismissed and a new running job appeared.
@@ -156,8 +216,17 @@ export function ResearchSidebar() {
 
   const focused = useMemo(() => {
     if (!progressMap || !focusedId) return null;
+    // After a terminal-state X-click, the dismissed job id is in
+    // dismissedTerminalRef. Treat as "no focused job" so the panel
+    // returns null below — same suppression path as a session that
+    // never ran /research.
+    if (dismissedTerminalRef.current.has(focusedId)) return null;
     return progressMap.get(focusedId) ?? null;
-  }, [progressMap, focusedId]);
+    // `dismissedVersion` is intentionally in deps so a dismiss
+    // triggers re-evaluation (the ref's `.has` check has no
+    // reactivity on its own).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [progressMap, focusedId, dismissedVersion]);
 
   // Suppress entirely when no /research run has been observed.
   if (progressMap === null || progressMap.size === 0) return null;
@@ -236,10 +305,34 @@ export function ResearchSidebar() {
         </div>
         <button
           type="button"
-          onClick={() => setDismissed(true)}
+          onClick={() => {
+            // Two close behaviors based on job state:
+            // - Job still in flight (running / pending) → collapse to
+            //   the chevron tab so the user can peek back at progress.
+            //   This is the historical behavior.
+            // - Job already finished (done / cancelled / failed) → fully
+            //   dismiss for this job id. The completed sidebar isn't
+            //   useful UI weight; the audit is in the KMS now. Re-running
+            //   `/research` mints a new job id and the sidebar re-opens
+            //   for that fresh run.
+            const isTerminal =
+              view.status === "done" ||
+              view.status === "cancelled" ||
+              view.status === "failed";
+            if (isTerminal) {
+              dismissedTerminalRef.current.add(view.id);
+              setDismissedVersion((v) => v + 1);
+            } else {
+              setDismissed(true);
+            }
+          }}
           className="p-0.5 rounded hover:bg-white/10"
           style={{ color: "var(--text-secondary)" }}
-          title="Hide sidebar (job continues; restore via chevron)"
+          title={
+            view.status === "running" || view.status === "pending"
+              ? "Hide sidebar (job continues; restore via chevron)"
+              : "Close sidebar (job is finished; the audit lives in the KMS)"
+          }
         >
           <X size={14} />
         </button>

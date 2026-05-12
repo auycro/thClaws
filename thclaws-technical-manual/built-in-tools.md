@@ -210,10 +210,39 @@ See [`permissions.md`](permissions.md) §11 for the full forbidden-command lists
 |---|---|
 | Name | `WebFetch` |
 | Approval | yes |
-| Schema | `{url: string, max_bytes?: integer}` |
-| Default max_bytes | 102400 (100 KB) |
+| Schema | `{url: string, max_bytes?: integer, prefer_raw?: boolean}` |
+| Default max_bytes | 102400 (100 KB), applied per section |
 
-HTTP GET → response body as text. User-Agent: `thclaws/0.1`. Truncates at `max_bytes` with `... [truncated at N bytes, M total]` suffix at a UTF-8 char boundary (walks back to a valid boundary, never splits mid-character). Errors on non-2xx HTTP status.
+**Combined-fetch behavior when `HAL_API_KEY` is set.** Pre-fix `WebFetch` was a plain HTTP GET; an intermediate "HAL with fallback to GET on failure" iteration kept only HAL output on the happy path, which hid the raw payload for URLs where the model actually wanted it (JSON APIs, sitemaps, robots.txt — anything HAL might render through a browser tab that mangles the structure).
+
+Current behavior: when `crate::tools::hal::hal_available()` returns `true` and `prefer_raw != true`, the tool fires both paths concurrently via `tokio::join!(hal_client_scrape, plain_http_get)` and returns a single combined response with each section explicitly labelled:
+
+```
+[via HAL scrape — JS-rendered + extracted to Markdown]
+
+# {page title}
+
+(rendered Markdown content from HAL's /scrape/v1/url endpoint)
+
+---
+
+[via plain HTTP GET — raw response body]
+
+(raw HTTP body — preserves JSON, headers-style content, anything browser-rendering would corrupt)
+```
+
+`max_bytes` (default 100 KB) caps each section independently (`truncate_for_bytes` walks back to a UTF-8 char boundary, never splits mid-character). Result-merging logic:
+
+| HAL | Plain GET | Output |
+|---|---|---|
+| Ok | Ok | both sections labelled, separated by `---` |
+| Ok | Err | HAL section + `[note: plain HTTP GET also attempted but failed: …]` |
+| Err | Ok | `[note: HAL scrape failed: …; returning plain GET only]` prefix + plain section |
+| Err | Err | `Error::Tool("fetch {url} failed on both paths — HAL: …; plain GET: …")` |
+
+`prefer_raw: true` skips HAL entirely (faster, half the tokens) — model uses this when it knows the URL is a JSON endpoint or similar where HAL's browser-rendering would be harmful. When `HAL_API_KEY` is absent the tool is a plain GET regardless of `prefer_raw`.
+
+The HAL section reuses `hal::build_client()` (90 s timeout, same as the dedicated `WebScrape` tool) so the two clients stay in lockstep on TLS / timeout configuration. The plain section uses `WebFetchTool::client` with a 30 s timeout — page servers are on the hot path of plain GET so the shorter limit is right there.
 
 ### WebSearch
 
@@ -337,7 +366,7 @@ Restores the pre-plan permission mode (defaults to `Ask` if no stash). Triggered
 
 ## 8. Knowledge management
 
-Four tools register when at least one KMS is in `config.kms_active`. See [`kms.md`](kms.md) for the full subsystem (architecture, frontmatter, ingest, lint, slash commands, security model, Obsidian compatibility).
+Six tools, all **always-registered** regardless of `config.kms_active` contents. Pre-fix the registration was gated on `!kms_active.is_empty()`, which silently broke side-channel agents (notably `/dream`) that need to bootstrap an audit KMS from a zero state — they'd inherit an empty filtered registry, exit ~30 s into the run with no work done, and the UI would show ✓ as if everything succeeded. The gate is removed; per-tool errors ("no KMS named 'X'") still provide a clear signal when a model targets a missing KMS. See [`kms.md`](kms.md) for the full subsystem (architecture, frontmatter, ingest, lint, slash commands, security model, Obsidian compatibility).
 
 ### KmsRead
 
@@ -348,6 +377,14 @@ Four tools register when at least one KMS is in `config.kms_active`. See [`kms.m
 | Schema | `{kms: string, page: string}` |
 
 Read a single page from an attached knowledge base. `kms` is the KMS name (project-scope wins on collision with user-scope, per `kms::resolve`). `page` is the page name with or without `.md` extension. Returns the file contents.
+
+Prepends a `[note: …]` staleness banner when the page's frontmatter signals trouble:
+
+- `verified:` older than 90 days → `[note: this page was last verified N days ago — sources may have drifted; re-verify before citing as current fact]`
+- Frontmatter present but no `verified:` key → `[note: this page has no \`verified:\` frontmatter — provenance is best-effort, treat factual claims with caution]`
+- No frontmatter at all (legacy / hand-written page) → no banner (don't shout at user-curated content)
+
+The 90-day threshold lives in `staleness_warning::STALE_DAYS_THRESHOLD` (constant; not user-configurable yet). Day count uses a cheap `YYYY-MM-DD` parser — months treated as 30 d, years as 365 d. Off by a couple of days at boundaries, fine for a 90-day-granularity banner.
 
 ### KmsSearch
 
@@ -369,7 +406,9 @@ Grep across all `.md` pages in one knowledge base. Returns `page:line:text` per 
 | Approval | **yes** |
 | Schema | `{kms: string, page: string, content: string}` |
 
-Create or replace a page in an attached knowledge base. `content` may begin with YAML frontmatter (`---\ncategory: ...\n---\n`) — preserved on write; `created:` (new pages) and `updated:` (always today) are auto-stamped. Updates `index.md` bullet, appends `## [date] wrote | <stem>` to `log.md`. Path validated by `kms::writable_page_path` (no `..` / separators / control chars / reserved stems; canonicalized inside `pages/`; refuses symlinked `pages/`). Bypasses `Sandbox::check_write` to land inside the KMS root — same intentional carve-out pattern as `TodoWrite` (see [`kms.md`](kms.md) §7 for the security rationale).
+Create or replace a page in an attached knowledge base. `content` should begin with YAML frontmatter — `title:` + `topic:` + `sources:` are the three keys the tool description asks for. `created:` (new pages) and `updated:` (always today) are auto-stamped; `verified:` is preserved as-passed (only the research pipeline stamps it today). `kms::write_page` invokes `maybe_inject_canonical_header(body, stem, fm)` after parsing, prepending `# {title}\nDescription: {topic}\n---\n\n` between frontmatter and body when the body doesn't already lead with a `# heading`. Updates `index.md` bullet (using the user-supplied body, not the canonical-header version, so the index summary reflects the model's first real paragraph), appends `## [date] wrote | <stem>` to `log.md`. Path validated by `kms::writable_page_path` (no `..` / separators / control chars / reserved stems; canonicalized inside `pages/`; refuses symlinked `pages/`). Bypasses `Sandbox::check_write` to land inside the KMS root — same intentional carve-out pattern as `TodoWrite` (see [`kms.md`](kms.md) §7 for the security rationale).
+
+`KmsWriteTool::call` runs a `check_provenance(content)` pre-flight check after frontmatter is parsed. If the page has frontmatter but no `sources:` key (or `sources:` with a blank value), the write still goes through (soft enforcement — keeps the tool usable for legacy / quick captures), but the tool response carries `warning: no \`sources:\` frontmatter — add a URL list (or [] for opinion/convention pages, or session-<id> / memory for in-conversation provenance) so the page is auditable later`. The companion `KmsRead` staleness banner is the second layer of the same enforcement. Explicit `sources: []` is the deliberate "opinion / convention, no external source" form and does NOT trigger the warning.
 
 ### KmsAppend
 
@@ -381,7 +420,19 @@ Create or replace a page in an attached knowledge base. `content` may begin with
 
 Append `content` to a page. If page exists with frontmatter: bumps `updated:` and re-serializes. If exists without: plain append. If doesn't exist: creates with bare body (no frontmatter). Always appends `## [date] appended | <stem>` to `log.md`. Same path-validation + sandbox-carve-out as `KmsWrite`.
 
-All four tools rely on `kms::resolve(name)` which checks the project KMS list first, then the user KMS list. Tools register when `/kms use` attaches the first KMS and unregister when `/kms off` empties the active list — they don't appear in the model's tool catalog when no KMS is attached. See [`kms.md`](kms.md) for the full subsystem.
+### KmsCreate
+
+| | |
+|---|---|
+| Name | `KmsCreate` |
+| Approval | no (idempotent + name-validated; same risk profile as `SessionRename`) |
+| Schema | `{name: string, scope: "project" \| "user"}` |
+
+Ensure a KMS exists. Wraps `kms::create(name, scope)` directly: returns the existing `KmsRef` when the directory is already present, otherwise seeds the tree (`pages/`, `sources/`, `index.md`, `log.md`, `SCHEMA.md`, `manifest.json`). Name validation rejects path separators, `..`, leading `.`, control chars, absolute paths, and empty strings.
+
+Primary motivation: `/dream`'s Pass 5 calls `KmsCreate({name: "dreams", scope: "project"})` to bootstrap the dedicated audit-log KMS before writing the run summary. The dispatch path also auto-creates `dreams` before spawning the dream side channel — both layers are defense-in-depth so a stale binary or filesystem race can't trap the dream agent in a retry loop on "no KMS named 'dreams'".
+
+All KMS tools rely on `kms::resolve(name)` (project KMS list first, then user). They're now always-registered regardless of `kms_active` contents.
 
 ### MemoryRead / MemoryWrite / MemoryAppend (M6.26)
 

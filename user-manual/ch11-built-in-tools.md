@@ -44,14 +44,39 @@ Defaults:
 
 | Tool | Approval | Summary |
 |---|---|---|
-| `WebFetch` | prompt | HTTP GET (100 KB body cap) with Markdown conversion |
+| `WebFetch` | prompt | HTTP GET (100 KB body cap, per section). When `HAL_API_KEY` is set, runs **both** a HAL headless-browser scrape **and** a plain HTTP GET in parallel and returns a single combined response with each section labelled (see below). |
 | `WebSearch` | prompt | Web search via Tavily / Brave / DuckDuckGo |
-| `WebScrape` | prompt | Headless-browser scrape via HAL (JS-rendered pages, lazy content, selector-based cleanup) — appears only when `HAL_API_KEY` is set |
+| `WebScrape` | prompt | Direct HAL scrape with advanced parameters (`wait_for` CSS selector, `scroll_to_bottom`, `remove_selectors`, `output_format`) — appears only when `HAL_API_KEY` is set |
 | `YouTubeTranscript` | prompt | Fetch YouTube captions via HAL (multi-language fallback, optional timestamps) — appears only when `HAL_API_KEY` is set |
 
 Search provider is picked via `TAVILY_API_KEY` or `BRAVE_SEARCH_API_KEY`
 if set, else DuckDuckGo (no key, lower quality). Override with
 `searchEngine: "tavily"` in settings.
+
+### `WebFetch` combine behavior (HAL_API_KEY set)
+
+Pre-fix `WebFetch` did a single plain HTTP GET. With `HAL_API_KEY` configured it now fires both paths in parallel and returns the model a labelled dual-section response:
+
+```
+[via HAL scrape — JS-rendered + extracted to Markdown]
+
+# {page title}
+
+(rendered Markdown content)
+
+---
+
+[via plain HTTP GET — raw response body]
+
+(raw HTTP body — preserves JSON, headers-style content, anything HAL might mangle)
+```
+
+The agent picks the slice that answers its question:
+
+- **HAL section** for SPA / JS-rendered / docs / blog content
+- **Plain GET section** for JSON APIs / sitemaps / robots.txt / anything where raw bytes matter
+
+If one path fails, the other still comes back with a `[note: …]` line explaining the drop. `prefer_raw: true` skips HAL entirely (faster, half the tokens) — use when you know the URL is a JSON endpoint. `max_bytes` (default 100 KB) caps each section independently. Without `HAL_API_KEY`, `WebFetch` is just a plain GET as before.
 
 ### Service-key tools (HAL)
 
@@ -63,9 +88,9 @@ tool list when the key is present and disappear when it isn't, so
 they never waste tokens or invite failed calls. Live key changes flip
 them in/out on the next turn — no restart.
 
-This pattern is general: any tool can declare `requires_env` and the
-registry filters it out when the listed env var(s) aren't set. The
-two HAL tools are the first concrete users.
+Reach for `WebScrape` directly only when you need advanced HAL parameters (`wait_for` CSS selector, `scroll_to_bottom` for lazy content, `remove_selectors` to strip nav/ads, or switching `output_format` to `html_markdown` / `json`). For ordinary page reads, prefer `WebFetch` so the model also gets the raw plain-GET payload alongside HAL's rendered output.
+
+This requires-env pattern is general: any tool can declare `requires_env` and the registry filters it out when the listed env var(s) aren't set. The two HAL tools are the first concrete users.
 
 ## Documents — PDF & Office
 
@@ -153,20 +178,20 @@ Details in [Chapter 15](ch15-subagents.md).
 
 | Tool | Approval | Summary |
 |---|---|---|
-| `KmsRead` | auto | Read a single page from an attached knowledge base |
+| `KmsRead` | auto | Read a single page from an attached knowledge base (prepends a `[note: …]` staleness banner when `verified:` is missing or > 90 days old) |
 | `KmsSearch` | auto | Grep across all pages in one knowledge base |
+| `KmsWrite` | prompt | Create or replace a page; auto-injects `# {title}\nDescription: {topic}\n---` header; warns when `sources:` frontmatter is missing |
+| `KmsAppend` | prompt | Append content to an existing page |
+| `KmsDelete` | prompt | Remove a page (last resort; prefer KmsWrite to merge or supersede) |
+| `KmsCreate` | auto | Ensure a KMS exists (idempotent). Used by `/dream` to bootstrap the `dreams` audit KMS. |
 
-These are **only registered when at least one KMS is attached** to the
-current project (via `/kms use NAME` or the sidebar checkbox). The agent
-sees each active KMS's `index.md` in the system prompt and calls these
-tools to pull in specific pages on demand.
+These are **always registered** regardless of whether a KMS is currently active. Pre-fix the registration was gated on `kms_active` being non-empty, which silently broke `/dream` and other side-channel agents that need to bootstrap an audit KMS from a zero state. The model sees each active KMS's `index.md` in the system prompt and calls these tools to pull in specific pages on demand.
 
 ```
 [tool: KmsSearch(kms: "notes", pattern: "bearer")]
 ```
 
-Returns `page:line:text` lines. Full concept + workflow in
-[Chapter 9](ch09-knowledge-bases-kms.md).
+Returns `page:line:text` lines. Full concept + workflow + page-shape convention (`title:` / `topic:` / `sources:` / `verified:`) in [Chapter 9](ch09-knowledge-bases-kms.md).
 
 ## MCP tools
 

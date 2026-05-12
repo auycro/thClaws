@@ -122,28 +122,45 @@ Both fields are `#[serde(default)]` so adding new fields in future versions does
 
 ## 3. Frontmatter convention
 
-Pages may begin with a YAML frontmatter block. The convention covers five fields; any others are stored verbatim and re-emitted on round-trip:
+Pages may begin with a YAML frontmatter block. The convention covers eight fields; any others are stored verbatim and re-emitted on round-trip:
 
 ```markdown
 ---
+title: Topic title
+topic: One-line description
+sources: ["https://…", "session-XYZ", "memory"]   # required (warns if absent)
 category: research
 tags: ai, retrieval
-sources: paper-x, paper-y
 created: 2026-05-03
-updated: 2026-05-03
+updated: 2026-05-11
+verified: 2026-05-11                              # /research stamps this; manual writes leave it absent
 ---
 
-# Topic body
-...
+(body — KmsWrite auto-injects `# {title}\nDescription: {topic}\n---` when the body doesn't start with a `# heading`)
 ```
 
 | Field | Meaning | Used by |
 |---|---|---|
+| `title` | Human-readable page title | `write_page::maybe_inject_canonical_header` (falls back to page stem) |
+| `topic` | One-line summary | Rendered as the `Description: …` line in the canonical header (omitted when blank) |
+| `sources` | URLs / `session-<id>` / `memory` / `[]` | Provenance — `KmsWriteTool` warns when this key is missing or empty (audit finding "Traceability") |
 | `category` | One-word grouping | Categorized index in system prompt |
 | `tags` | Comma-separated labels | Dataview queries (Obsidian) |
-| `sources` | Comma- or space-separated source aliases | Re-ingest cascade (BUG #10) |
 | `created` | YYYY-MM-DD; auto-stamped on first write | Audit |
 | `updated` | YYYY-MM-DD; auto-stamped on every write | Sort / freshness |
+| `verified` | YYYY-MM-DD; stamped explicitly by callers that verified (e.g. `/research`) | `KmsReadTool::staleness_warning` — pages with `verified:` older than 90 d get a banner; missing field gets a softer "no verification record" hint |
+
+### Canonical header injection
+
+`kms::write_page` invokes `maybe_inject_canonical_header(body, stem, fm)` after parsing frontmatter:
+
+- If `body.trim_start().starts_with("# ")` → body is left alone (model intentionally wrote a heading)
+- Otherwise: prepend `\n# {title}\nDescription: {topic}\n---\n\n` to the body. Title falls back to the page stem when `title:` is absent; the `Description:` line is omitted when `topic:` is missing/blank
+- Idempotent on re-writes: `body_has_leading_heading` detects the previously-injected `# {title}` and skips re-injection
+
+### Index summary uses pre-injection body
+
+`first_meaningful_line(body)` runs against the **user-supplied** body, NOT the canonical-header version. Otherwise the model's first real paragraph would be replaced by the auto-injected `# {title}` line in `index.md`, which adds zero signal beyond the link text itself.
 
 ### Parser
 
@@ -357,18 +374,21 @@ and run `/kms lint <name>` periodically.
 
 **api**
 - [api-x](pages/api-x.md) — API X reference
-
-### Tools
-- `KmsRead(kms: "mynotes", page: "<page>")` — read one page
-- `KmsSearch(kms: "mynotes", pattern: "...")` — grep across pages
-- `KmsWrite(kms: "mynotes", page: "<page>", content: "...")` — create or replace a page
-- `KmsAppend(kms: "mynotes", page: "<page>", content: "...")` — append to a page
-- `KmsDelete(kms: "mynotes", page: "<page>")` — remove a page (last resort; prefer KmsWrite to merge or supersede)
-Pages may carry YAML frontmatter (`category:`, `tags:`, `sources:`, `created:`, `updated:`).
-Follow the schema above when authoring.
 ```
 
+(`## KMS tools` is now rendered globally — see "Globalised tool reference" below — so each per-KMS block no longer carries its own duplicated Tools subsection.)
+
 > M6.38.2 audit fix (Bug B): the `KmsDelete` line was missing from the Tools block before this fix — the tool was registered when `kms_active` was non-empty but had no narrative context in the system prompt. The "last resort" / "prefer KmsWrite" framing biases the model toward merge/supersede patterns over destructive deletion (matching the `dream` and `kms-reconcile` agents' written posture).
+
+### Globalised tool reference (audit finding B)
+
+The per-KMS `### Tools` subsection used to render inside every KMS block (~250 bytes each). With N KMSes attached that scaled O(N) for content that didn't vary across KMSes (only the `kms: "<name>"` argument changes). `system_prompt_section` now renders the tool reference exactly **once** as a top-level `## KMS tools (apply to every KMS below — substitute the kms: argument)` block, sitting between the MANDATORY consultation procedure and the per-KMS subsections. Each per-KMS block now carries only Schema + Index. Savings: ~200 bytes per additional attached KMS.
+
+The global block also surfaces `KmsCreate` (previously discoverable only via the tool registry), so `/dream` bootstrap workflows are visible to any agent reading the system prompt.
+
+### Concise SCHEMA template (audit finding C)
+
+`kms::create` previously seeded `SCHEMA.md` with two fenced-code blocks (input shape + "Final on-disk shape" example). The on-disk example was inert for the model — `KmsWrite` stamps it automatically. The template now carries only the input shape, saving ~300 bytes per KMS rendered into the prompt. Existing KMSes keep their old SCHEMA.md (human-editable, no migration).
 
 ### Categorized index
 

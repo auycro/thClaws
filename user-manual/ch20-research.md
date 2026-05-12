@@ -54,7 +54,7 @@ answering from training data.
 | `--kms <name>` | auto-derive from query | Target KMS. Auto-derived names use the LLM-extracted topic slug (e.g. `obon-festival`) — no `research-` prefix. |
 | `--min-iter N` | 2 | Hard floor — pipeline runs at least this many iterations even if the LLM scores it complete earlier. |
 | `--max-iter K` | 8 | Hard ceiling. |
-| `--score-threshold 0.X` | 0.75 | Score the LLM must produce (0.0-1.0) to short-circuit between min and max. Accepts decimal (`0.85`) or integer percent (`85`). |
+| `--score-threshold 0.X` | 0.80 | Score the LLM evaluator must produce (0.0-1.0) to short-circuit between min and max. Accepts decimal (`0.85`) or integer percent (`85`). Bumped from 0.75 → 0.80 — LLMs tend to score generously after iter 2 and the old default cut research short before subtopic coverage stabilised. |
 | `--max-pages N` | 7 | Cap on KMS pages emitted per run. *Ceiling, not target* — narrow queries produce 1-2 pages. |
 | `--budget-time SEC|2m|1h` | 15m | Wall-clock budget. Past this, the job ends as `Failed` with a budget-exhausted message. |
 
@@ -102,6 +102,33 @@ The pattern emerged in early 2026 when …
 1. [Karpathy on LLM Wiki](../sources/x-com-karpathy-status.md) — https://x.com/karpathy/status/…
 2. [Comparing LLM Wiki vs RAG](../sources/medium-com-llm-wiki-vs-rag.md) — https://medium.com/…
 ```
+
+### Verify pass — guard against hallucinated citations
+
+After each page is synthesised, the pipeline runs a **verify pass** — a separate LLM call that audits the generated page against its cited sources. It walks every factual claim and decides:
+
+- `Supported` — the cited source clearly states this exact claim
+- `Partial` — the source touches the topic but doesn't strictly back the specific wording
+- `Unsupported` — the citation is wrong (the source does NOT say this); usually a hallucination or miscitation
+- `NoCitation` — the page makes a factual assertion with no `[N]` attached
+
+The pass writes two artifacts:
+
+1. **`verification_score: 0.85`** in the page's frontmatter — fraction of factual claims rated `Supported`. Sort or filter your KMS by this field to spot pages that need re-checking.
+2. **`## Verification` section** appended to the page body — listed ONLY for the flagged items (Partial / Unsupported / NoCitation). Each item shows the icon (🚫 / ⚠️ / ❓), the verdict, the cited `[N]`, the paraphrased claim, and the verifier's note:
+
+```markdown
+## Verification
+
+Auto-verification pass found 2 claim(s) that don't strictly match their cited source. Review before relying on the page for downstream decisions.
+
+- 🚫 **unsupported** [3]: X is 100x faster than Y — _[3] says faster but not "100x"_
+- ❓ **no citation** (uncited): Y was released in 2024
+```
+
+Pages where every claim is `Supported` get the `verification_score` in frontmatter but no `## Verification` section — clean pages stay clean. If the verifier itself fails (parse error, provider timeout), the page is written without a `verification_score` (a missing field is honest — a fabricated 0.0 would be misleading), and the run continues.
+
+**Why this matters** — the well-known critique of LLM-Wiki ("organised persistent mistakes") points at synthesisers that hallucinate facts then cite a real source that doesn't back them. The verify pass catches this class before the page lands in your KMS. Cost: ~+25% of total `/research` LLM cost for a typical 4-page run; soft-fails so it never aborts the pipeline.
 
 ### Sources
 

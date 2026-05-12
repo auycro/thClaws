@@ -200,7 +200,7 @@ Registers the job and spawns `pipeline::run` on a tokio task. Returns immediatel
 pub struct JobConfig {
     pub min_iter: u32,             // 2  — hard floor
     pub max_iter: u32,             // 8  — hard ceiling
-    pub score_threshold: f32,      // 0.75 — early-stop signal
+    pub score_threshold: f32,      // 0.80 — early-stop signal (bumped from 0.75)
     pub subtopics_per_iter: u32,   // 4  — fanout per iteration
     pub fetch_top_n: u32,          // 3  — pages fetched per subtopic
     pub max_pages: u32,            // 7  — KMS pages per run (ceiling)
@@ -209,6 +209,8 @@ pub struct JobConfig {
     pub kms_target: Option<String>, // auto-derive when None
 }
 ```
+
+Threshold raised from 0.75 → 0.80 because LLM evaluators tend to score generously after iter 2 ("looks reasonably covered" → 0.78+) and the old default short-circuited the loop before subtopic coverage stabilised. The `default_config_matches_documented_knobs` test pins the new value. CLI override (`--score-threshold 0.75`) still works for users who want the old behavior.
 
 Defaults pinned in `default_config_matches_documented_knobs` test — changes require updating the test deliberately.
 
@@ -297,6 +299,25 @@ Order matters:
 - `rewrite_cross_links` first — operates on `[[slug]]` patterns the LLM emitted, transforms to `[[<run-prefix>__slug]]`.
 - `ensure_sources_section` next — strips whatever LLM wrote (often partial), regenerates from actual `[N]` usage. Format is numbered list (`1. [Title](path) — url`) — not `[N]` prefix — so the next step doesn't double-link.
 - `linkify_citations` last — walks every `[N]` not followed by `(`, rewrites to `[N](../sources/<slug>.md)`. Skips multi-cite (`[1, 3]`), already-linked, and unresolved indices.
+
+### Verify pass (audit follow-up — addresses "LLM Wiki bakes in organised persistent mistakes")
+
+After linkify, the pipeline runs `llm_calls::verify_page(provider, model, &rewritten, &cited_sources, timeout, &cancel)` — a separate LLM call that audits the synthesised page against its cited sources. Returns `VerifyReport { score: f32, items: Vec<VerifyItem> }` where each `VerifyItem` carries `{claim, citation, verdict, note}` and `verdict ∈ {Supported, Partial, Unsupported, NoCitation}`. Pipeline then:
+
+1. Appends `report.render_flagged_section()` to the page body — list of non-`Supported` claims with icon + verdict + cite + note. Skipped when every claim is `Supported` (no clutter on clean pages).
+2. Passes `verification_score = Some(report.score)` to `kms_writer::write_research_page`, which renders `verification_score: 0.85` into the page's frontmatter.
+
+Soft-fail: a verifier error (parse failure, provider timeout) logs to stderr and writes the page without a `verification_score` — an absent field is honest, a fabricated 0.0 would mislead. The pipeline continues either way.
+
+Skip-when-no-citations: when `cited_sources.is_empty()` for a given page, the verify call is bypassed entirely (nothing to verify; would otherwise stamp a misleading 0.0).
+
+Cost: ~+25% of total `/research` LLM cost for a typical 4-page run. The prompt requires strict JSON output (`{"score": 0.NN, "items": [...]}`); the parser tolerates ```json fences in case the LLM wraps despite being told not to.
+
+### Score-history broadcast hygiene (display-bug fix)
+
+Pre-fix the GUI sidebar's per-iteration score column was off by one — iter N's row showed iter N-1's score. Root cause: `mgr.record_iteration(job_id, iter, sources.len(), last_score)` was called at iter-start with `last_score` still holding the previous iter's evaluation. The frontend appended the entry at that moment and locked in the wrong score.
+
+Fix: pipeline now passes `None` at iter-start, `Some(eval.score)` after evaluate. `ResearchManager::record_iteration` was changed to assign `last_score = score` unconditionally (clear on `None`, set on `Some`) instead of the previous "only assign on `Some`" sticky behavior. Frontend (`ResearchSidebar.tsx`) appends new iter entries with `score: null` and patches the latest entry's `score` from `j.last_score` on every broadcast — so the post-eval broadcast (which doesn't increment `iterations_done`) updates the existing row correctly.
 
 ---
 
