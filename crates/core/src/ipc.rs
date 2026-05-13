@@ -538,12 +538,14 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                 .unwrap_or("")
                 .to_string();
             let payload = match crate::kms::read_browse_file(&kms_name, &kind, &file) {
-                Ok(content) => serde_json::json!({
+                Ok(read) => serde_json::json!({
                     "type": "kms_file_content",
                     "kms": kms_name,
                     "kind": kind,
                     "name": file,
-                    "content": content,
+                    "content": read.content,
+                    "total_bytes": read.total_bytes,
+                    "truncated": read.truncated,
                     "ok": true,
                 }),
                 Err(e) => serde_json::json!({
@@ -556,6 +558,175 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                     "error": format!("{e}"),
                 }),
             };
+            (ctx.dispatch)(payload.to_string());
+        }
+
+        // Delete `.thclaws/todos.md` from disk and broadcast an empty
+        // TodoUpdate so the sidebar (and any future renders) reflect
+        // the cleared state. Triggered by TodoSidebar when the user
+        // closes a fully-completed list — the prior session's "all
+        // done" checkboxes shouldn't bleed into the next session as
+        // a stale checked list.
+        "clear_todos" => {
+            let path = std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .join(".thclaws")
+                .join("todos.md");
+            let removed = std::fs::remove_file(&path).is_ok();
+            // Broadcast through the proper channel so every subscriber
+            // (chat tab, terminal-translator, etc.) gets the update.
+            let _ = ctx
+                .shared
+                .events_tx
+                .send(crate::shared_session::ViewEvent::TodoUpdate(Vec::new()));
+            let payload = serde_json::json!({
+                "type": "todos_cleared",
+                "removed": removed,
+                "path": path.to_string_lossy(),
+            });
+            (ctx.dispatch)(payload.to_string());
+        }
+
+        // Plan-07 Phase 1.3 — LINE-bridge wiring. The GUI
+        // LineConnectModal hits these three; the bridge itself
+        // (WS + reply) lives in the worker so cancellation
+        // happens off a single tokio task.
+        "line_status" => {
+            // Read from disk — paired ↔ saved config exists. The
+            // worker's `state.line_session` is the truth for
+            // "is the WS task running RIGHT NOW", but for first-
+            // paint we only need "is this install paired?", which
+            // is a cheap file existence check.
+            let (state_str, server_url) = match crate::line::LineConfig::load() {
+                Ok(Some(cfg)) => ("connected".to_string(), cfg.resolved_server_url()),
+                _ => ("disconnected".to_string(), String::new()),
+            };
+            let payload = serde_json::json!({
+                "type": "line_status",
+                "state": state_str,
+                "server_url": server_url,
+                "pending_approvals": 0,
+            });
+            (ctx.dispatch)(payload.to_string());
+        }
+        "line_pair" => {
+            let code = msg
+                .get("code")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let cwd = msg
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    std::env::current_dir()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| ".".into())
+                });
+            let machine_label = msg
+                .get("machine_label")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    std::env::var("HOSTNAME")
+                        .or_else(|_| std::env::var("COMPUTERNAME"))
+                        .unwrap_or_else(|_| "this-machine".into())
+                });
+            let server_url = std::env::var("THCLAWS_LINE_SERVER")
+                .ok()
+                .map(|u| u.trim_end_matches('/').to_string())
+                .unwrap_or_else(|| {
+                    crate::line::config::DEFAULT_SERVER_URL
+                        .trim_end_matches('/')
+                        .to_string()
+                });
+            let pair_url = format!("{server_url}/pair");
+            let input_tx = ctx.shared.input_tx.clone();
+            let dispatch = ctx.dispatch.clone();
+            tokio::spawn(async move {
+                let body = serde_json::json!({
+                    "code": code,
+                    "cwd": cwd,
+                    "machine_label": machine_label,
+                });
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build()
+                    .expect("reqwest client build");
+                let resp = match client.post(&pair_url).json(&body).send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let payload = serde_json::json!({
+                            "type": "line_pair_result",
+                            "ok": false,
+                            "error": format!("relay HTTP: {e}"),
+                        });
+                        (dispatch)(payload.to_string());
+                        return;
+                    }
+                };
+                let status = resp.status();
+                let response_text = resp.text().await.unwrap_or_default();
+                if !status.is_success() {
+                    let payload = serde_json::json!({
+                        "type": "line_pair_result",
+                        "ok": false,
+                        "error": format!("relay {status}: {response_text}"),
+                    });
+                    (dispatch)(payload.to_string());
+                    return;
+                }
+                // Expected shape: {token, line_user_id, expires_at}
+                let parsed: Result<serde_json::Value, _> = serde_json::from_str(&response_text);
+                let token = parsed
+                    .ok()
+                    .and_then(|v| v.get("token").and_then(|t| t.as_str()).map(String::from));
+                let token = match token {
+                    Some(t) if !t.is_empty() => t,
+                    _ => {
+                        let payload = serde_json::json!({
+                            "type": "line_pair_result",
+                            "ok": false,
+                            "error": "relay response missing 'token'",
+                        });
+                        (dispatch)(payload.to_string());
+                        return;
+                    }
+                };
+                let cfg = crate::line::LineConfig {
+                    binding_token: token,
+                    server_url: Some(server_url.clone()),
+                };
+                if let Err(e) = cfg.save() {
+                    let payload = serde_json::json!({
+                        "type": "line_pair_result",
+                        "ok": false,
+                        "error": format!("save config: {e}"),
+                    });
+                    (dispatch)(payload.to_string());
+                    return;
+                }
+                // Hand off to the worker so the WS task lifetime
+                // is owned where the cancel token already lives.
+                let _ = input_tx.send(crate::shared_session::ShellInput::LineConnect(cfg));
+                let payload = serde_json::json!({
+                    "type": "line_pair_result",
+                    "ok": true,
+                    "server_url": server_url,
+                });
+                (dispatch)(payload.to_string());
+            });
+        }
+        "line_disconnect" => {
+            let _ = ctx
+                .shared
+                .input_tx
+                .send(crate::shared_session::ShellInput::LineDisconnect);
+            let payload = serde_json::json!({
+                "type": "line_disconnect_ack",
+                "ok": true,
+            });
             (ctx.dispatch)(payload.to_string());
         }
 

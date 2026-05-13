@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { X, ArrowLeft } from "lucide-react";
+import { X, ArrowLeft, Loader2 } from "lucide-react";
 import { marked } from "marked";
 import { send, subscribe } from "../hooks/useIPC";
 import type { ViewerTarget } from "./KmsBrowserSidebar";
@@ -41,8 +41,13 @@ export function KmsViewerOverlay({ initial, onClose }: Props) {
   const current = stack[stack.length - 1];
 
   // Reset stack when `initial` changes (parent opens a different file).
+  // Clear `content` in the same effect so the viewer shows the spinner
+  // on the very next render — otherwise the old file's HTML flashes
+  // briefly under the new title before the fetch effect clears it.
   useEffect(() => {
     setStack([initial]);
+    setContent(null);
+    setError(null);
   }, [initial.kms, initial.kind, initial.name]);
 
   // Fetch content for the top-of-stack file.
@@ -207,10 +212,11 @@ export function KmsViewerOverlay({ initial, onClose }: Props) {
           )}
           {content === null && !error && (
             <div
-              className="px-3 py-2 italic text-sm"
+              className="px-3 py-2 italic text-sm flex items-center gap-2"
               style={{ color: "var(--text-secondary)" }}
             >
-              Loading…
+              <Loader2 size={14} className="animate-spin" />
+              <span>Loading…</span>
             </div>
           )}
           {content !== null && (

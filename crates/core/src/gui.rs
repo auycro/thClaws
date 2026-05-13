@@ -1121,6 +1121,7 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
                     "mcp_servers": mcp_servers,
                     "sessions": sessions,
                     "kmss": kms_update.get("kmss").cloned().unwrap_or(serde_json::Value::Array(vec![])),
+                    "version": crate::version::VERSION,
                 });
                 let js = format!(
                     "window.__thclaws_dispatch('{}')",

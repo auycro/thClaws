@@ -575,6 +575,7 @@ pub async fn dispatch(
                     crate::permissions::PermissionMode::Auto => "auto",
                     crate::permissions::PermissionMode::Ask => "ask",
                     crate::permissions::PermissionMode::Plan => "plan",
+                    crate::permissions::PermissionMode::LineGated => "linegated",
                 };
                 emit(
                     events_tx,
@@ -2018,6 +2019,177 @@ pub async fn dispatch(
                 Err(e) => emit(events_tx, format!("/kms reconcile: {e}")),
             }
         }
+        SlashCommand::KmsLink {
+            name,
+            apply,
+            min_len,
+            llm,
+        } => {
+            let names: Vec<String> = match name {
+                Some(n) => vec![n],
+                None => {
+                    if state.config.kms_active.is_empty() {
+                        emit(
+                            events_tx,
+                            "/kms link: no KMS attached to this session. Run `/kms use <name>` first, or pass a name: `/kms link <name>`.".into(),
+                        );
+                        return;
+                    }
+                    state.config.kms_active.clone()
+                }
+            };
+            let provider_opt = if llm {
+                match crate::repl::build_provider(&state.config) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        emit(
+                            events_tx,
+                            format!("/kms link --llm: provider unavailable: {e}"),
+                        );
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let model_name = state.config.model.clone();
+            for kname in &names {
+                let Some(k) = crate::kms::resolve(kname) else {
+                    emit(
+                        events_tx,
+                        format!("/kms link {kname}: not found, skipping."),
+                    );
+                    continue;
+                };
+                let opts = crate::kms::AutoLinkOptions { min_len, apply };
+                let result = if let Some(ref prov) = provider_opt {
+                    emit(
+                        events_tx,
+                        format!(
+                            "/kms link {kname} --llm: starting per-page LLM pass with `{model_name}` (this may take a while)…"
+                        ),
+                    );
+                    crate::kms::auto_link_llm(&k, opts, prov.as_ref(), &model_name, &state.cancel)
+                        .await
+                } else {
+                    crate::kms::auto_link(&k, opts)
+                };
+                match result {
+                    Ok(report) => {
+                        let mode_tag = if llm { "llm" } else { "deterministic" };
+                        let mode = if apply { "applied" } else { "dry-run" };
+                        let mut msg = format!(
+                            "/kms link {kname} ({mode_tag}, {mode}): scanned {} page(s), {} would gain link(s), {} link insertion(s) total.",
+                            report.pages_scanned,
+                            report.pages_modified,
+                            report.links_added,
+                        );
+                        for hit in report.hits.iter().take(20) {
+                            msg.push_str(&format!(
+                                "\n    {}: \"{}\" → [[{}]]",
+                                hit.page_stem, hit.matched, hit.target_slug,
+                            ));
+                        }
+                        if report.hits.len() > 20 {
+                            msg.push_str(&format!("\n    … and {} more.", report.hits.len() - 20));
+                        }
+                        if !apply && report.links_added > 0 {
+                            msg.push_str("\n  re-run with --apply to write the changes.");
+                        }
+                        emit(events_tx, msg);
+                    }
+                    Err(e) => emit(events_tx, format!("/kms link {kname} failed: {e}")),
+                }
+            }
+        }
+        SlashCommand::KmsDrop { name, force } => {
+            let Some(k) = crate::kms::resolve(&name) else {
+                emit(events_tx, format!("no KMS named '{name}'"));
+                return;
+            };
+            if !force {
+                let pages = std::fs::read_dir(k.pages_dir())
+                    .map(|it| it.filter_map(|e| e.ok()).count())
+                    .unwrap_or(0);
+                let sources = std::fs::read_dir(k.root.join("sources"))
+                    .map(|it| it.filter_map(|e| e.ok()).count())
+                    .unwrap_or(0);
+                emit(
+                    events_tx,
+                    format!(
+                        "/kms drop {name}: dry-run (would remove {pages} page(s), {sources} source(s) from {}).\n  re-run with --force to delete.",
+                        k.root.display()
+                    ),
+                );
+                return;
+            }
+            match crate::kms::remove(&name) {
+                Ok(report) => {
+                    // Detach from the session's active list if it was
+                    // there, otherwise the kms_active config keeps a
+                    // dangling name that will fail to resolve on the
+                    // next system-prompt rebuild.
+                    if let Some(pos) = state.config.kms_active.iter().position(|n| n == &name) {
+                        state.config.kms_active.remove(pos);
+                    }
+                    emit(
+                        events_tx,
+                        format!(
+                            "deleted KMS '{name}' ({} page(s), {} source(s)) from {}.",
+                            report.pages_removed,
+                            report.sources_removed,
+                            report.root.display()
+                        ),
+                    );
+                    // Refresh the GUI sidebar so the dropped KMS
+                    // disappears from the list immediately.
+                    broadcast_kms_update(events_tx);
+                }
+                Err(e) => emit(events_tx, format!("/kms drop failed: {e}")),
+            }
+        }
+        SlashCommand::KmsMerge { src, dst } => match crate::kms::merge_into(&src, &dst) {
+            Ok(report) => {
+                let mut msg = format!(
+                        "merged '{src}' → '{dst}': {} page(s) copied ({} renamed, {} combined), {} source(s) copied ({} renamed), {} index entr(ies) added.",
+                        report.pages_copied,
+                        report.pages_renamed,
+                        report.pages_combined,
+                        report.sources_copied,
+                        report.sources_renamed,
+                        report.index_entries_added,
+                    );
+                if !report.combined.is_empty() {
+                    msg.push_str(
+                        "\n  aggregator pages combined (src body appended under dst body):",
+                    );
+                    for stem in &report.combined {
+                        msg.push_str(&format!("\n    {stem}.md"));
+                    }
+                }
+                if !report.renames.is_empty() {
+                    msg.push_str(
+                        "\n  collision renames (kept original on dst, incoming was renamed):",
+                    );
+                    for (kind, old, new) in &report.renames {
+                        msg.push_str(&format!("\n    {kind}: {old}.md → {new}.md"));
+                    }
+                }
+                msg.push_str(&format!(
+                    "\n  '{src}' is left intact; run `/kms drop {src}` once you've verified."
+                ));
+                msg.push_str("\n\nsuggested workflow now:");
+                msg.push_str(&format!(
+                    "\n  /kms wrap-up {dst} --fix       # fix broken links + STALE markers\
+                     \n  /kms link {dst}                # dry-run preview of auto-links\
+                     \n  /kms link {dst} --apply        # write the wikilinks\
+                     \n  /kms reconcile {dst} --apply   # resolve contradictions across pages\
+                     \n  /kms drop {src} --force        # remove the source KMS once happy"
+                ));
+                emit(events_tx, msg);
+            }
+            Err(e) => emit(events_tx, format!("/kms merge failed: {e}")),
+        },
         SlashCommand::KmsLint(name) => {
             // M6.25 BUG #3: pure-read health check.
             let Some(k) = crate::kms::resolve(&name) else {

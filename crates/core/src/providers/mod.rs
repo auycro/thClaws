@@ -67,6 +67,11 @@ pub enum ProviderKind {
     OllamaAnthropic,
     OllamaCloud,
     DashScope,
+    /// Alibaba Cloud's Singapore-region DashScope endpoint
+    /// (`dashscope-intl.aliyuncs.com`). Same wire protocol as
+    /// `DashScope` but a different account / region / key, so it
+    /// gets its own variant and `qwen-cloud/` model namespace.
+    QwenCloud,
     ZAi,
     LMStudio,
     AzureAIFoundry,
@@ -90,6 +95,7 @@ impl ProviderKind {
         Self::OllamaAnthropic,
         Self::OllamaCloud,
         Self::DashScope,
+        Self::QwenCloud,
         Self::ZAi,
         Self::LMStudio,
         Self::AzureAIFoundry,
@@ -113,6 +119,7 @@ impl ProviderKind {
             Self::OllamaAnthropic => "ollama-anthropic",
             Self::OllamaCloud => "ollama-cloud",
             Self::DashScope => "dashscope",
+            Self::QwenCloud => "qwen-cloud",
             Self::ZAi => "zai",
             Self::LMStudio => "lmstudio",
             Self::AzureAIFoundry => "azure",
@@ -144,6 +151,13 @@ impl ProviderKind {
             Self::OllamaAnthropic => "oa/qwen3-coder",
             Self::OllamaCloud => "ollama-cloud/deepseek-v4-flash",
             Self::DashScope => "qwen-max",
+            // Alibaba Singapore DashScope (`dashscope-intl.aliyuncs.com`).
+            // Same OpenAI-compat wire protocol as DashScope, but a
+            // separate region/account, so models route via the short
+            // `qc/` prefix. Prefix is stripped before the request
+            // reaches the upstream (which expects bare `qwen-max`,
+            // `qwen-plus`, etc.).
+            Self::QwenCloud => "qc/qwen-max",
             Self::ZAi => "zai/glm-4.6",
             // Most LMStudio installs change models constantly; this is a
             // placeholder that lets the connection establish so the user
@@ -195,6 +209,7 @@ impl ProviderKind {
             // Agentic Press is a hosted gateway with a fixed URL — no env
             // override, no UI knob. Build-time only.
             Self::DashScope => Some("DASHSCOPE_BASE_URL"),
+            Self::QwenCloud => Some("QWENCLOUD_BASE_URL"),
             Self::Ollama => Some("OLLAMA_BASE_URL"),
             Self::OllamaAnthropic => Some("OLLAMA_BASE_URL"),
             Self::ZAi => Some("ZAI_BASE_URL"),
@@ -232,6 +247,8 @@ impl ProviderKind {
         match self {
             // Agentic Press URL is fixed build-time; no UI placeholder.
             Self::DashScope => Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            // International / Singapore region of DashScope.
+            Self::QwenCloud => Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
             Self::Ollama => Some("http://localhost:11434"),
             Self::OllamaAnthropic => Some("http://localhost:11434"),
             // Z.ai exposes the Coding Plan at /api/coding/paas/v4. The
@@ -293,6 +310,7 @@ impl ProviderKind {
             Self::OllamaAnthropic => None,
             Self::OllamaCloud => Some("OLLAMA_CLOUD_API_KEY"),
             Self::DashScope => Some("DASHSCOPE_API_KEY"),
+            Self::QwenCloud => Some("QWENCLOUD_API_KEY"),
             Self::ZAi => Some("ZAI_API_KEY"),
             Self::LMStudio => None, // Local runtime, no auth.
             Self::AzureAIFoundry => Some("AZURE_AI_FOUNDRY_API_KEY"),
@@ -394,6 +412,7 @@ impl ProviderKind {
             | Self::OllamaAnthropic
             | Self::OllamaCloud
             | Self::DashScope
+            | Self::QwenCloud
             | Self::ZAi
             | Self::LMStudio
             | Self::AzureAIFoundry
@@ -433,6 +452,12 @@ impl ProviderKind {
             // they route through the Gemini provider. Covers `gemma-3-*`,
             // `gemma-3n-*`, `gemma-4-*`, etc.
             Some(Self::Gemini)
+        } else if model.starts_with("qc/") {
+            // Alibaba Cloud Singapore DashScope (`dashscope-intl.aliyuncs.com`).
+            // Models look like `qc/qwen-max`, `qc/qwen-plus`, etc.; the
+            // `qc/` prefix is stripped before the request reaches the
+            // upstream so it sees the bare `qwen-*` id.
+            Some(Self::QwenCloud)
         } else if model.starts_with("qwen") || model.starts_with("qwq-") {
             Some(Self::DashScope)
         } else if model.starts_with("deepseek-") {
@@ -608,7 +633,22 @@ pub struct StreamRequest {
     pub max_tokens: u32,
     /// Anthropic extended-thinking budget. `None` disables thinking.
     pub thinking_budget: Option<u32>,
+    /// Per-call override for the per-chunk idle timeout. `None` falls
+    /// back to the global `stream_chunk_timeout()` (driven by the user
+    /// `stream_chunk_timeout_secs` setting). `Some(d)` forces `d` for
+    /// this one request only — used by known long-running features
+    /// (research pipeline, `/kms html`) that legitimately need ≥15 min
+    /// of stream idleness without raising the user's default.
+    pub stream_chunk_timeout_override: Option<std::time::Duration>,
 }
+
+/// Hard 15-minute idle ceiling reserved for features that orchestrate
+/// long-running single LLM calls (research synthesis, KMS HTML
+/// generation). Passed in `StreamRequest::stream_chunk_timeout_override`
+/// so each call overrides the user's `stream_chunk_timeout_secs`
+/// setting without changing the global default for normal chat.
+pub const LONG_RUNNING_STREAM_CHUNK_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(900);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Usage {
@@ -832,6 +872,7 @@ pub fn auto_fallback_model(cfg: &crate::config::AppConfig) -> Option<String> {
         ProviderKind::OpenRouter,
         ProviderKind::Gemini,
         ProviderKind::DashScope,
+        ProviderKind::QwenCloud,
         ProviderKind::ZAi,
         ProviderKind::DeepSeek,
         ProviderKind::ThaiLLM,
@@ -1083,6 +1124,41 @@ mod tests {
         assert!(
             ProviderKind::resolve_alias_for_provider("sonnet", ProviderKind::ThaiLLM).is_none()
         );
+    }
+
+    #[test]
+    fn detect_qc_prefix_routes_to_qwen_cloud_provider() {
+        // `qc/` prefix is the short routing tag for Alibaba's
+        // Singapore-region DashScope. Bare `qwen-*` (no prefix) still
+        // routes to mainland DashScope so the two regions stay
+        // explicitly distinguishable.
+        assert_eq!(
+            ProviderKind::detect("qc/qwen-max"),
+            Some(ProviderKind::QwenCloud)
+        );
+        assert_eq!(
+            ProviderKind::detect("qc/qwen-plus"),
+            Some(ProviderKind::QwenCloud)
+        );
+        assert_eq!(
+            ProviderKind::detect("qwen-max"),
+            Some(ProviderKind::DashScope),
+            "bare qwen-* still routes to mainland DashScope"
+        );
+        assert_eq!(
+            ProviderKind::QwenCloud.api_key_env(),
+            Some("QWENCLOUD_API_KEY")
+        );
+        assert_eq!(
+            ProviderKind::QwenCloud.endpoint_env(),
+            Some("QWENCLOUD_BASE_URL")
+        );
+        assert_eq!(
+            ProviderKind::QwenCloud.default_endpoint(),
+            Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
+        );
+        assert_eq!(ProviderKind::QwenCloud.name(), "qwen-cloud");
+        assert_eq!(ProviderKind::QwenCloud.default_model(), "qc/qwen-max");
     }
 
     #[test]

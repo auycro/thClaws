@@ -97,6 +97,7 @@ const MANAGED: &[ProviderKind] = &[
     ProviderKind::OpenRouter,
     ProviderKind::Gemini,
     ProviderKind::DashScope,
+    ProviderKind::QwenCloud,
     ProviderKind::OllamaCloud,
     ProviderKind::ZAi,
     ProviderKind::AzureAIFoundry,

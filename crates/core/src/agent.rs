@@ -712,6 +712,14 @@ pub struct Agent {
     /// Arc<Mutex> lets external state (the worker's skill resolver)
     /// hold a clone and write into it from outside the agent loop.
     pub(crate) model_override: Arc<Mutex<Option<String>>>,
+    /// Per-turn override for the provider's per-chunk idle timeout.
+    /// Read at the top of every iteration's `StreamRequest` build and
+    /// cleared at the end of `run_turn`, so a slash dispatch
+    /// (e.g. `/kms html`) can mark the *next* user-submitted turn as
+    /// long-running without bumping the user's global
+    /// `stream_chunk_timeout_secs` setting. `None` means: defer to the
+    /// global setting via `providers::stream_chunk_timeout()`.
+    pub(crate) next_turn_chunk_timeout: Arc<Mutex<Option<std::time::Duration>>>,
 }
 
 impl Agent {
@@ -745,7 +753,26 @@ impl Agent {
             hooks: None,
             origin: crate::permissions::AgentOrigin::Main,
             model_override: Arc::new(Mutex::new(None)),
+            next_turn_chunk_timeout: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Mark the next `run_turn` as long-running so its `StreamRequest`
+    /// carries an override that bypasses the user's global
+    /// `stream_chunk_timeout_secs` setting. Cleared automatically when
+    /// that turn ends. Slash dispatches like `/kms html` call this
+    /// right before submitting the prompt.
+    pub fn set_next_turn_chunk_timeout(&self, timeout: std::time::Duration) {
+        *self
+            .next_turn_chunk_timeout
+            .lock()
+            .expect("next_turn_chunk_timeout lock") = Some(timeout);
+    }
+
+    /// Clone the override slot so an external component (worker /
+    /// dispatch layer) can write into it without holding `&Agent`.
+    pub fn next_turn_chunk_timeout_slot(&self) -> Arc<Mutex<Option<std::time::Duration>>> {
+        self.next_turn_chunk_timeout.clone()
     }
 
     /// Hand out a clone of the model-override slot so an external
@@ -861,6 +888,7 @@ impl Agent {
         let tools = self.tools.clone();
         let model = self.model.clone();
         let model_override = self.model_override.clone();
+        let next_turn_chunk_timeout = self.next_turn_chunk_timeout.clone();
         // Compose the per-turn system prompt: base + dynamic plan-mode
         // reminder + dynamic todos reminder so the model sees fresh
         // state every turn (plan mode active? plan submitted but not
@@ -987,6 +1015,15 @@ impl Agent {
                     let g = model_override.lock().expect("model_override lock");
                     g.as_ref().cloned().unwrap_or_else(|| model.clone())
                 };
+                // Long-running-feature override: read fresh every
+                // iteration so a slash dispatch that set it before
+                // run_turn carries through every retry/iteration of
+                // the same turn. Cleared in the end-of-run_turn cleanup
+                // (alongside `model_override`).
+                let chunk_timeout_override = next_turn_chunk_timeout
+                    .lock()
+                    .expect("next_turn_chunk_timeout lock")
+                    .clone();
                 let req = StreamRequest {
                     model: active_model,
                     system: if system.is_empty() { None } else { Some(system.clone()) },
@@ -994,6 +1031,7 @@ impl Agent {
                     tools: tool_defs,
                     max_tokens: current_max_tokens,
                     thinking_budget,
+                    stream_chunk_timeout_override: chunk_timeout_override,
                 };
 
                 // Retry with exponential backoff on transient errors.
@@ -1198,6 +1236,9 @@ impl Agent {
                         if let Ok(mut g) = model_override.lock() {
                             *g = None;
                         }
+                        if let Ok(mut g) = next_turn_chunk_timeout.lock() {
+                            *g = None;
+                        }
                         yield AgentEvent::Done { stop_reason: turn_stop_reason, usage: cumulative_usage.clone() };
                         return;
                     }
@@ -1376,9 +1417,11 @@ impl Agent {
                         continue;
                     }
 
-                    // Approval gate.
-                    let needs_approval = matches!(permission_mode, PermissionMode::Ask)
-                        && tool.requires_approval(input);
+                    // Approval gate. `asks_for_approval()` covers
+                    // both `Ask` (local prompt) and `LineGated`
+                    // (plan-07 Phase 1.2 — prompt routed to LINE).
+                    let needs_approval =
+                        permission_mode.asks_for_approval() && tool.requires_approval(input);
                     if needs_approval {
                         let req = ApprovalRequest {
                             tool_name: name.clone(),
@@ -1521,6 +1564,9 @@ impl Agent {
             // that capped out doesn't leak its skill recommendation
             // forward.
             if let Ok(mut g) = model_override.lock() {
+                *g = None;
+            }
+            if let Ok(mut g) = next_turn_chunk_timeout.lock() {
                 *g = None;
             }
             yield AgentEvent::Done {
@@ -2956,6 +3002,60 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(2),
             "cancel didn't short-circuit the retry backoff (took {elapsed:?})",
+        );
+    }
+
+    /// Setting `next_turn_chunk_timeout` before `run_turn` causes the
+    /// resulting `StreamRequest` to carry that override, and the slot
+    /// is cleared once the turn ends so the next turn starts at the
+    /// global default.
+    #[tokio::test]
+    async fn next_turn_chunk_timeout_flows_into_request_and_clears() {
+        struct OverrideCapturingProvider {
+            captured: Arc<Mutex<Vec<Option<std::time::Duration>>>>,
+        }
+        #[async_trait]
+        impl Provider for OverrideCapturingProvider {
+            async fn stream(&self, req: crate::providers::StreamRequest) -> Result<EventStream> {
+                self.captured
+                    .lock()
+                    .unwrap()
+                    .push(req.stream_chunk_timeout_override);
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(ProviderEvent::TextDelta("ok".into())),
+                    Ok(ProviderEvent::ContentBlockStop),
+                    Ok(ProviderEvent::MessageStop {
+                        stop_reason: Some("end_turn".into()),
+                        usage: None,
+                    }),
+                ])))
+            }
+        }
+
+        let captured: Arc<Mutex<Vec<Option<std::time::Duration>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(OverrideCapturingProvider {
+            captured: captured.clone(),
+        });
+        let agent = Agent::new(provider, ToolRegistry::default(), "test-model", "");
+
+        // Turn 1: mark the next turn as long-running. The captured
+        // request should carry the override.
+        agent.set_next_turn_chunk_timeout(std::time::Duration::from_secs(900));
+        let _ = collect_agent_turn(agent.run_turn("first".into())).await;
+        // Turn 2: no override set — should be back to None.
+        let _ = collect_agent_turn(agent.run_turn("second".into())).await;
+
+        let got = captured.lock().unwrap().clone();
+        assert_eq!(
+            got.len(),
+            2,
+            "expected one StreamRequest per turn, got {got:?}"
+        );
+        assert_eq!(got[0], Some(std::time::Duration::from_secs(900)));
+        assert_eq!(
+            got[1], None,
+            "override should clear after the first turn ends"
         );
     }
 }

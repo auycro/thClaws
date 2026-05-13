@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { ChevronRight, X } from "lucide-react";
-import { subscribe } from "../hooks/useIPC";
+import { send, subscribe } from "../hooks/useIPC";
 
 /// Todo-list sidebar. Subscribes to `chat_todo_update` IPC envelopes
 /// from the worker and renders the model's `TodoWrite` checklist as a
@@ -73,10 +73,12 @@ export function TodoSidebar() {
     };
   }, [todos]);
 
-  /// Empty + dismissed → don't even show the chevron tab. There's
-  /// nothing to peek at, and the user has already opted out of seeing
-  /// the empty state.
-  if (todos.length === 0 && dismissed) return null;
+  /// Empty list → render nothing at all. The sidebar has nothing to
+  /// show until the model calls `TodoWrite`; previously we rendered a
+  /// "No todos yet" empty-state panel that opened unsolicited on
+  /// every session start (and alongside the research sidebar on
+  /// `/research` launch). Wait until todos exist, then auto-open.
+  if (todos.length === 0) return null;
 
   // Collapsed: chevron tab on the right edge re-opens.
   if (dismissed) {
@@ -136,27 +138,30 @@ export function TodoSidebar() {
         </div>
         <button
           type="button"
-          onClick={() => setDismissed(true)}
+          onClick={() => {
+            // When every todo is `completed` and the user closes the
+            // sidebar, drop the on-disk file too. The "all done"
+            // checklist would otherwise hydrate back on next session
+            // start as a stale list of all-checked items.
+            const allDone =
+              todos.length > 0 && todos.every((t) => t.status === "completed");
+            if (allDone) {
+              send({ type: "clear_todos" });
+              setTodos([]);
+            }
+            setDismissed(true);
+          }}
           className="p-0.5 rounded hover:bg-white/10"
           style={{ color: "var(--text-secondary)" }}
-          title="Hide sidebar (todos stay in .thclaws/todos.md)"
+          title="Hide sidebar (all-done lists are cleared from .thclaws/todos.md; in-progress lists are kept)"
         >
           <X size={14} />
         </button>
       </div>
 
       <div className="flex-1 overflow-auto">
-        {todos.length === 0 ? (
-          <div
-            className="px-3 py-4 text-xs italic"
-            style={{ color: "var(--text-secondary)" }}
-          >
-            No todos yet. The model will populate this list when it
-            calls <code>TodoWrite</code> on multi-step work.
-          </div>
-        ) : (
-          <ul className="px-3 py-2 space-y-1.5">
-            {todos.map((todo, idx) => {
+        <ul className="px-3 py-2 space-y-1.5">
+          {todos.map((todo, idx) => {
               const status = (todo.status as TodoStatus) ?? "pending";
               const inProgress = status === "in_progress";
               const done = status === "completed";
@@ -200,11 +205,10 @@ export function TodoSidebar() {
                   >
                     {todo.content}
                   </span>
-                </li>
-              );
-            })}
-          </ul>
-        )}
+              </li>
+            );
+          })}
+        </ul>
       </div>
 
       <div

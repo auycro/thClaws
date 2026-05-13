@@ -454,6 +454,38 @@ pub enum SlashCommand {
         name: String,
         idea: String,
     },
+    /// Merge `src` KMS into `dst` KMS. Pages and sources from `src` are
+    /// copied into `dst`'s directories; on slug collision the incoming
+    /// file is renamed to `<slug>-from-<src>.md`. Index and log get
+    /// merged entries. `src` is left intact — the user can `/kms drop`
+    /// it after verifying the result.
+    KmsMerge {
+        src: String,
+        dst: String,
+    },
+    /// Delete a KMS from disk. Dry-run by default — prints the
+    /// pages/sources count that *would* be removed and stops.
+    /// `--force` actually removes the directory tree.
+    KmsDrop {
+        name: String,
+        force: bool,
+    },
+    /// Auto-link a KMS by inserting `[[<slug>]]` wikilinks at the first
+    /// literal mention of every page's title / aliases / slug inside
+    /// other pages' bodies. Dry-run by default; `--apply` writes the
+    /// changes. `name == None` iterates over every KMS in the active
+    /// set for this session.
+    ///
+    /// `llm == true` swaps the deterministic literal-match pass for a
+    /// per-page LLM call that proposes semantic links the regex
+    /// approach can't see (synonyms, related-concept links). Each
+    /// LLM suggestion is still validated in Rust before writing.
+    KmsLink {
+        name: Option<String>,
+        apply: bool,
+        min_len: usize,
+        llm: bool,
+    },
     /// Auto-resolve contradictions across pages. Dispatches the built-in
     /// `kms-reconcile` subagent which rewrites outdated pages with History
     /// sections, flags ambiguous cases as Conflict pages. Dry-run by default;
@@ -1754,6 +1786,20 @@ pub fn build_kms_ingest_session_prompt(
     )
 }
 
+/// Render the post-merge "next steps" workflow hint that both the
+/// CLI REPL and the GUI shell-dispatch emit after a successful
+/// `/kms merge`. Centralised here so both surfaces stay in sync.
+pub fn post_merge_workflow_hint(src: &str, dst: &str) -> String {
+    format!(
+        "{COLOR_DIM}suggested workflow now:{COLOR_RESET}\n  \
+         /kms wrap-up {dst} --fix       # fix broken links + STALE markers\n  \
+         /kms link {dst}                # dry-run preview of auto-links\n  \
+         /kms link {dst} --apply        # write the wikilinks\n  \
+         /kms reconcile {dst} --apply   # resolve contradictions across pages\n  \
+         /kms drop {src} --force        # remove the source KMS once happy"
+    )
+}
+
 /// Compose the agent-facing prompt for `/kms dump <name> <text>`. The
 /// agent receives the dump verbatim plus routing rules, announces its
 /// plan in plain text first, then executes via the KMS tools. Inline-
@@ -2292,6 +2338,98 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
                 ),
             }
         }
+        "merge" | "combine" => {
+            // `/kms merge <src> <dst>` — copy <src> into <dst> with
+            // rename-on-collision. Both positional, both required.
+            let mut parts = rest.split_whitespace();
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some(src), Some(dst), None) if !src.is_empty() && !dst.is_empty() => {
+                    SlashCommand::KmsMerge {
+                        src: src.to_string(),
+                        dst: dst.to_string(),
+                    }
+                }
+                _ => SlashCommand::Unknown("usage: /kms merge <src> <dst>".into()),
+            }
+        }
+        "link" | "autolink" | "cross-link" => {
+            // `/kms link [<name>] [--apply] [--min-len N] [--llm]` —
+            // defaults to deterministic dry-run; without a name,
+            // iterates active KMSes for this session at dispatch
+            // time. `--llm` switches to the per-page LLM-driven pass.
+            let mut name: Option<String> = None;
+            let mut apply = false;
+            let mut min_len: usize = 4;
+            let mut llm = false;
+            let mut tokens = rest.split_whitespace().peekable();
+            while let Some(tok) = tokens.next() {
+                match tok {
+                    "--apply" | "--execute" => apply = true,
+                    "--dry-run" | "--plan" => apply = false,
+                    "--llm" | "--semantic" => llm = true,
+                    "--no-llm" | "--deterministic" => llm = false,
+                    "--min-len" => {
+                        match tokens.next().and_then(|s| s.parse::<usize>().ok()) {
+                            Some(n) if n >= 2 => min_len = n,
+                            _ => {
+                                return SlashCommand::Unknown(
+                                    "--min-len requires an integer >= 2".into(),
+                                );
+                            }
+                        }
+                    }
+                    other if other.starts_with("--min-len=") => {
+                        match other.trim_start_matches("--min-len=").parse::<usize>() {
+                            Ok(n) if n >= 2 => min_len = n,
+                            _ => {
+                                return SlashCommand::Unknown(
+                                    "--min-len requires an integer >= 2".into(),
+                                );
+                            }
+                        }
+                    }
+                    other if !other.starts_with("--") => {
+                        if name.is_none() {
+                            name = Some(other.to_string());
+                        }
+                    }
+                    other => {
+                        return SlashCommand::Unknown(format!(
+                            "unknown flag '{other}' — usage: /kms link [<name>] [--apply] [--llm] [--min-len N]"
+                        ));
+                    }
+                }
+            }
+            SlashCommand::KmsLink { name, apply, min_len, llm }
+        }
+        "drop" | "delete" | "rm" => {
+            // `/kms drop <name> [--force]` — destructive. Dry-run by
+            // default; `--force` actually removes the directory tree.
+            let mut name: Option<String> = None;
+            let mut force = false;
+            for tok in rest.split_whitespace() {
+                match tok {
+                    "--force" | "-f" => force = true,
+                    "--dry-run" => force = false,
+                    other if !other.starts_with("--") => {
+                        if name.is_none() {
+                            name = Some(other.to_string());
+                        }
+                    }
+                    other => {
+                        return SlashCommand::Unknown(format!(
+                            "unknown flag '{other}' — usage: /kms drop <name> [--force]"
+                        ));
+                    }
+                }
+            }
+            match name {
+                Some(n) => SlashCommand::KmsDrop { name: n, force },
+                None => {
+                    SlashCommand::Unknown("usage: /kms drop <name> [--force]".into())
+                }
+            }
+        }
         "reconcile" | "resolve" => {
             // `/kms reconcile <name> [<focus>] [--apply]` — finds and
             // resolves contradictions; dry-run by default.
@@ -2398,7 +2536,7 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
             }
         }
         other => SlashCommand::Unknown(format!(
-            "unknown kms subcommand: '{other}' (try: /kms, /kms new …, /kms use …, /kms off …, /kms show …, /kms ingest …, /kms dump …, /kms challenge …, /kms html …, /kms lint …, /kms wrap-up …, /kms reconcile …, /kms migrate …, /kms file-answer …)"
+            "unknown kms subcommand: '{other}' (try: /kms, /kms new …, /kms use …, /kms off …, /kms show …, /kms ingest …, /kms dump …, /kms challenge …, /kms html …, /kms merge …, /kms drop …, /kms link …, /kms lint …, /kms wrap-up …, /kms reconcile …, /kms migrate …, /kms file-answer …)"
         )),
     }
 }
@@ -2877,6 +3015,23 @@ pub fn render_help() -> &'static str {
      \x20                 Copy a working-dir file into KMS/pages/ and\n  \
      \x20                 add it to the index. Allowed: .md .markdown\n  \
      \x20                 .txt .rst .log .json\n  \
+     /kms merge SRC DST\n  \
+     \x20                 Merge pages + sources from SRC into DST.\n  \
+     \x20                 On slug collision the incoming file is\n  \
+     \x20                 renamed `<slug>-from-<SRC>.md`. SRC is left\n  \
+     \x20                 intact — drop it after verifying.\n  \
+     /kms drop NAME [--force]\n  \
+     \x20                 Delete a KMS from disk. Dry-run by default;\n  \
+     \x20                 prints the would-be-deleted counts. Pass\n  \
+     \x20                 --force to actually remove the directory.\n  \
+     /kms link [NAME] [--apply] [--llm] [--min-len N]\n  \
+     \x20                 Insert [[slug]] wikilinks at the first\n  \
+     \x20                 literal mention of every page's title /\n  \
+     \x20                 aliases / slug inside other pages. Dry-run\n  \
+     \x20                 by default. No NAME → iterates active KMSes.\n  \
+     \x20                 --llm switches to a semantic per-page LLM\n  \
+     \x20                 pass (synonyms + related concepts; slower\n  \
+     \x20                 + costs tokens, still dry-run by default).\n  \
      /schedule         List scheduled jobs (use `thclaws schedule add` from\n  \
      \x20                 the shell to create one — multi-line prompts don't\n  \
      \x20                 fit a REPL line)\n  \
@@ -3019,6 +3174,27 @@ pub fn build_provider(config: &AppConfig) -> Result<Arc<dyn Provider>> {
                 format!("{}/chat/completions", base.trim_end_matches('/'))
             };
             Ok(Arc::new(OpenAIProvider::new(api_key).with_base_url(url)))
+        }
+        ProviderKind::QwenCloud => {
+            // Singapore-region DashScope (`dashscope-intl.aliyuncs.com`).
+            // Identical wire protocol to mainland DashScope — same
+            // OpenAI-compatible /chat/completions shape. Models use the
+            // short `qc/` prefix in our catalogue; the prefix is
+            // stripped before the request reaches Alibaba's upstream
+            // so it sees the bare `qwen-*` id it expects.
+            let base = std::env::var("QWENCLOUD_BASE_URL").unwrap_or_else(|_| {
+                "https://dashscope-intl.aliyuncs.com/compatible-mode/v1".to_string()
+            });
+            let url = if base.ends_with("/chat/completions") {
+                base
+            } else {
+                format!("{}/chat/completions", base.trim_end_matches('/'))
+            };
+            Ok(Arc::new(
+                OpenAIProvider::new(api_key)
+                    .with_base_url(url)
+                    .with_strip_model_prefix("qc/"),
+            ))
         }
         ProviderKind::ZAi => {
             // Z.ai GLM Coding Plan endpoint. Models use `zai/<id>` form
@@ -3210,6 +3386,7 @@ pub async fn build_provider_with_fallback(
         ProviderKind::OpenRouter,
         ProviderKind::Gemini,
         ProviderKind::DashScope,
+        ProviderKind::QwenCloud,
         ProviderKind::ZAi,
         ProviderKind::ThaiLLM,
         ProviderKind::Ollama,
@@ -4691,6 +4868,16 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     println!(
                         "{COLOR_DIM}(/kms html {name} → workspace site at {outdir_str}){COLOR_RESET}"
                     );
+                    // KMS-HTML generation is a known long-running
+                    // feature: the model designs a component
+                    // vocabulary and writes a full site, frequently
+                    // going silent mid-stream for minutes. Bypass the
+                    // user's `stream_chunk_timeout_secs` setting for
+                    // *this* turn only — the agent clears the slot
+                    // when the turn ends.
+                    agent.set_next_turn_chunk_timeout(
+                        crate::providers::LONG_RUNNING_STREAM_CHUNK_TIMEOUT,
+                    );
                     line = build_kms_html_prompt(&name, &outdir_str);
                 }
             }
@@ -6156,9 +6343,10 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                             PermissionMode::Auto => "auto",
                             PermissionMode::Ask => "ask",
                             PermissionMode::Plan => "plan",
+                            PermissionMode::LineGated => "linegated",
                         };
                         println!(
-                            "{COLOR_DIM}permissions: {label} (auto = never prompt, ask = prompt on mutating tools, plan = read-only exploration){COLOR_RESET}"
+                            "{COLOR_DIM}permissions: {label} (auto = never prompt, ask = prompt on mutating tools, plan = read-only exploration, linegated = prompt routed to LINE chat){COLOR_RESET}"
                         );
                     } else {
                         match mode.as_str() {
@@ -7095,6 +7283,182 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         }
                         Err(e) => {
                             println!("{COLOR_YELLOW}lint failed: {e}{COLOR_RESET}");
+                        }
+                    }
+                }
+                SlashCommand::KmsLink { name, apply, min_len, llm } => {
+                    let names: Vec<String> = match name {
+                        Some(n) => vec![n],
+                        None => {
+                            if config.kms_active.is_empty() {
+                                println!(
+                                    "{COLOR_YELLOW}/kms link: no KMS attached to this session. Run `/kms use <name>` first, or pass a name explicitly: `/kms link <name>`.{COLOR_RESET}"
+                                );
+                                continue;
+                            }
+                            config.kms_active.clone()
+                        }
+                    };
+                    let model_name = config.model.clone();
+                    let cancel_token = crate::cancel::CancelToken::new();
+                    // Rebuild a provider lazily for the LLM path. The
+                    // CLI's main `provider` was already moved into the
+                    // Agent at session bootstrap, so re-derive from
+                    // `config` here. Costs nothing for deterministic
+                    // runs.
+                    let link_provider: Option<Arc<dyn Provider>> = if llm {
+                        match build_provider(&config) {
+                            Ok(p) => Some(p),
+                            Err(e) => {
+                                println!(
+                                    "{COLOR_YELLOW}/kms link --llm: provider unavailable: {e}{COLOR_RESET}"
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    for kname in &names {
+                        let Some(k) = crate::kms::resolve(kname) else {
+                            println!(
+                                "{COLOR_YELLOW}/kms link {kname}: not found, skipping.{COLOR_RESET}"
+                            );
+                            continue;
+                        };
+                        let opts = crate::kms::AutoLinkOptions { min_len, apply };
+                        let result = if let Some(ref prov) = link_provider {
+                            println!(
+                                "{COLOR_DIM}/kms link {kname} --llm: starting per-page LLM pass with model `{model_name}` (this may take a while)…{COLOR_RESET}"
+                            );
+                            crate::kms::auto_link_llm(
+                                &k,
+                                opts,
+                                prov.as_ref(),
+                                &model_name,
+                                &cancel_token,
+                            )
+                            .await
+                        } else {
+                            crate::kms::auto_link(&k, opts)
+                        };
+                        match result {
+                            Ok(report) => {
+                                let mode_tag = if llm { "llm" } else { "deterministic" };
+                                let mode = if apply { "applied" } else { "dry-run" };
+                                println!(
+                                    "{COLOR_DIM}/kms link {kname} ({mode_tag}, {mode}): scanned {} page(s), {} would gain link(s), {} link insertion(s) total.{COLOR_RESET}",
+                                    report.pages_scanned,
+                                    report.pages_modified,
+                                    report.links_added,
+                                );
+                                // Cap the preview so a 200-hit report
+                                // doesn't drown the terminal.
+                                let preview: Vec<&crate::kms::LinkHit> =
+                                    report.hits.iter().take(20).collect();
+                                for hit in &preview {
+                                    println!(
+                                        "    {}: \"{}\" → [[{}]]",
+                                        hit.page_stem, hit.matched, hit.target_slug,
+                                    );
+                                }
+                                if report.hits.len() > preview.len() {
+                                    println!(
+                                        "    … and {} more.",
+                                        report.hits.len() - preview.len()
+                                    );
+                                }
+                                if !apply && report.links_added > 0 {
+                                    println!(
+                                        "{COLOR_DIM}  re-run with --apply to write the changes.{COLOR_RESET}"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                println!("{COLOR_YELLOW}/kms link {kname} failed: {e}{COLOR_RESET}");
+                            }
+                        }
+                    }
+                }
+                SlashCommand::KmsDrop { name, force } => {
+                    let Some(k) = crate::kms::resolve(&name) else {
+                        println!("{COLOR_YELLOW}no KMS named '{name}'{COLOR_RESET}");
+                        continue;
+                    };
+                    if !force {
+                        let pages = std::fs::read_dir(k.pages_dir())
+                            .map(|it| it.filter_map(|e| e.ok()).count())
+                            .unwrap_or(0);
+                        let sources = std::fs::read_dir(k.root.join("sources"))
+                            .map(|it| it.filter_map(|e| e.ok()).count())
+                            .unwrap_or(0);
+                        println!(
+                            "{COLOR_YELLOW}/kms drop {name}: dry-run (would remove {pages} page(s), {sources} source(s) from {}).\n  re-run with --force to delete.{COLOR_RESET}",
+                            k.root.display()
+                        );
+                    } else {
+                        match crate::kms::remove(&name) {
+                            Ok(report) => {
+                                println!(
+                                    "{COLOR_DIM}deleted KMS '{name}' ({} page(s), {} source(s)) from {}.{COLOR_RESET}",
+                                    report.pages_removed,
+                                    report.sources_removed,
+                                    report.root.display()
+                                );
+                                // Detach if it was attached to this session.
+                                if let Some(pos) =
+                                    config.kms_active.iter().position(|n| n == &name)
+                                {
+                                    config.kms_active.remove(pos);
+                                    println!(
+                                        "{COLOR_DIM}  also detached '{name}' from this session.{COLOR_RESET}"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                println!("{COLOR_YELLOW}/kms drop failed: {e}{COLOR_RESET}");
+                            }
+                        }
+                    }
+                }
+                SlashCommand::KmsMerge { src, dst } => {
+                    match crate::kms::merge_into(&src, &dst) {
+                        Ok(report) => {
+                            println!(
+                                "{COLOR_DIM}merged '{src}' → '{dst}': \
+                                 {} page(s) copied ({} renamed, {} combined), \
+                                 {} source(s) copied ({} renamed), \
+                                 {} index entr(ies) added.{COLOR_RESET}",
+                                report.pages_copied,
+                                report.pages_renamed,
+                                report.pages_combined,
+                                report.sources_copied,
+                                report.sources_renamed,
+                                report.index_entries_added,
+                            );
+                            if !report.combined.is_empty() {
+                                println!(
+                                    "  aggregator pages combined (src body appended under dst body):"
+                                );
+                                for stem in &report.combined {
+                                    println!("    {stem}.md");
+                                }
+                            }
+                            if !report.renames.is_empty() {
+                                println!(
+                                    "  collision renames (kept original on '{dst}', incoming was renamed):"
+                                );
+                                for (kind, old, new) in &report.renames {
+                                    println!("    {kind}: {old}.md → {new}.md");
+                                }
+                            }
+                            println!(
+                                "{COLOR_DIM}  '{src}' is left intact; run `/kms drop {src}` once you've verified the result.{COLOR_RESET}"
+                            );
+                            println!("\n{}", post_merge_workflow_hint(&src, &dst));
+                        }
+                        Err(e) => {
+                            println!("{COLOR_YELLOW}/kms merge failed: {e}{COLOR_RESET}");
                         }
                     }
                 }
@@ -10165,5 +10529,20 @@ mod tests {
         fn hinter_silent_for_non_slash() {
             assert_eq!(hint("hello", 5), None);
         }
+    }
+
+    #[test]
+    fn post_merge_workflow_hint_substitutes_both_names() {
+        let h = post_merge_workflow_hint("alpha", "beta");
+        // Every step in the canonical workflow is present with the
+        // correct kms name substituted.
+        assert!(h.contains("/kms wrap-up beta --fix"));
+        assert!(h.contains("/kms link beta"));
+        assert!(h.contains("/kms link beta --apply"));
+        assert!(h.contains("/kms reconcile beta --apply"));
+        assert!(h.contains("/kms drop alpha --force"));
+        // No placeholders leaked through.
+        assert!(!h.contains("{src}"));
+        assert!(!h.contains("{dst}"));
     }
 }

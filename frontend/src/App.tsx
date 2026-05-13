@@ -17,6 +17,7 @@ import {
 import { KmsViewerOverlay } from "./components/KmsViewerOverlay";
 import { KmsGraphView } from "./components/KmsGraphView";
 import { SettingsModal } from "./components/SettingsModal";
+import { LineConnectModal } from "./components/LineConnectModal";
 import { SettingsMenu } from "./components/SettingsMenu";
 import { InstructionsEditorModal } from "./components/InstructionsEditorModal";
 import { SecretsBackendDialog } from "./components/SecretsBackendDialog";
@@ -343,6 +344,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>("terminal");
   const [showSettings, setShowSettings] = useState(false);
   const [showSettingsMenu, setShowSettingsMenu] = useState(false);
+  const [showLineConnect, setShowLineConnect] = useState(false);
   const [instructionsScope, setInstructionsScope] =
     useState<"global" | "folder" | null>(null);
   const closeInstructions = useCallback(() => setInstructionsScope(null), []);
@@ -657,6 +659,7 @@ export default function App() {
                 if (choice === "api-keys") setShowSettings(true);
                 else if (choice === "global-instructions") setInstructionsScope("global");
                 else if (choice === "folder-instructions") setInstructionsScope("folder");
+                else if (choice === "line-connect") setShowLineConnect(true);
               }}
             />
           )}
@@ -664,6 +667,9 @@ export default function App() {
       </div>
 
       {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
+      {showLineConnect && (
+        <LineConnectModal onClose={() => setShowLineConnect(false)} />
+      )}
       {instructionsScope && (
         <InstructionsEditorModal
           scope={instructionsScope}

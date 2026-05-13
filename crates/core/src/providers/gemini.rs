@@ -376,6 +376,9 @@ impl Provider for GeminiProvider {
         // M6.21 BUG H2: pass the provider's shared tool-id counter into
         // the parser so synthesized ids stay unique across streams.
         let counter = self.next_tool_id.clone();
+        let chunk_timeout = req
+            .stream_chunk_timeout_override
+            .unwrap_or_else(super::stream_chunk_timeout);
         let event_stream = try_stream! {
             // M6.21 BUG H1: byte buffer to avoid UTF-8 corruption at
             // chunk boundaries. Critical for Gemini because Gemini-served
@@ -394,13 +397,13 @@ impl Provider for GeminiProvider {
 
             loop {
                 let maybe_chunk = tokio::time::timeout(
-                    super::stream_chunk_timeout(),
+                    chunk_timeout,
                     byte_stream.next(),
                 )
                 .await
                 .map_err(|_| Error::Provider(format!(
                     "stream idle for {}s — provider stopped sending; try again",
-                    super::stream_chunk_timeout().as_secs()
+                    chunk_timeout.as_secs()
                 )))?;
                 let Some(chunk) = maybe_chunk else { break };
                 let chunk = chunk.map_err(|e| Error::Provider(format!("stream: {e}")))?;
@@ -914,6 +917,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let contents = GeminiProvider::messages_to_gemini(&req);
         // user(hi), model(functionCall), user(functionResponse)
@@ -975,6 +979,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let contents = GeminiProvider::messages_to_gemini(&req);
         // model(functionCall), user(functionResponse + inlineData)
@@ -1025,6 +1030,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let contents = GeminiProvider::messages_to_gemini(&req);
         assert_eq!(contents.len(), 1);
@@ -1065,6 +1071,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let contents = GeminiProvider::messages_to_gemini(&req);
         let parts = contents[1]["parts"].as_array().expect("parts array");
@@ -1081,6 +1088,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let body = GeminiProvider::build_body(&req);
         assert_eq!(
@@ -1108,6 +1116,7 @@ mod tests {
             }],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let body = GeminiProvider::build_body(&req);
         assert_eq!(body["tools"][0]["functionDeclarations"][0]["name"], "Read");
@@ -1177,6 +1186,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let raw = provider.stream(req).await.expect("stream");
         let result = collect_turn(assemble(raw)).await.expect("collect");
@@ -1212,6 +1222,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let raw = provider.stream(req).await.expect("stream");
         let result = collect_turn(assemble(raw)).await.expect("collect");

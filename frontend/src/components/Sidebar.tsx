@@ -5,6 +5,11 @@ import { ModelPickerDropdown } from "./ModelPickerDropdown";
 
 type SessionInfo = { id: string; model: string; messages: number; title?: string | null };
 type KmsInfo = { name: string; scope: "user" | "project"; active: boolean };
+type LineStatus = {
+  state: "connected" | "disconnected";
+  server_url: string;
+  pending_approvals: number;
+};
 
 // Confirmation dialog with two backends. Mirrors `platformConfirm`
 // in FilesView. Desktop (`wry` WebView in `--gui`): the IPC bridge
@@ -87,6 +92,14 @@ export function Sidebar({ onBrowseKms }: SidebarProps = {}) {
     { id: string; current: string } | null
   >(null);
   const renameInputRef = useRef<HTMLInputElement | null>(null);
+  // Plan-07 Phase 2.4: LINE bridge status pill. The worker
+  // broadcasts `line_status` envelopes on connect / disconnect;
+  // the pill is rendered only while `state === "connected"`.
+  const [lineStatus, setLineStatus] = useState<LineStatus>({
+    state: "disconnected",
+    server_url: "",
+    pending_approvals: 0,
+  });
 
   useEffect(() => {
     const unsub = subscribe((msg) => {
@@ -132,11 +145,19 @@ export function Sidebar({ onBrowseKms }: SidebarProps = {}) {
           expires_in_secs: msg.expires_in_secs as number | undefined,
           error: msg.error as string | undefined,
         });
+      } else if (msg.type === "line_status") {
+        setLineStatus({
+          state: (msg.state as LineStatus["state"]) ?? "disconnected",
+          server_url: (msg.server_url as string) ?? "",
+          pending_approvals: (msg.pending_approvals as number) ?? 0,
+        });
       }
     });
-    // Ask for current SSO state once at mount. Backend replies with an
-    // `sso_state` event the subscriber above renders.
+    // Ask for current SSO + LINE state once at mount. The backend
+    // replies with `sso_state` / `line_status` envelopes the
+    // subscriber above renders.
     send({ type: "sso_status" });
+    send({ type: "line_status" });
     return unsub;
   }, []);
 
@@ -256,6 +277,40 @@ export function Sidebar({ onBrowseKms }: SidebarProps = {}) {
           )}
         </div>
       </Section>
+
+      {/* LINE bridge pill — visible only when the worker reports the
+          bridge is connected. Mirrors the LineConnectModal's source
+          of truth (`line_status` envelope). Plan-07 Phase 2.4. */}
+      {lineStatus.state === "connected" && (
+        <Section title="LINE">
+          <div
+            className="px-2 py-1 flex items-center gap-1.5"
+            title={`Bridge live · ${lineStatus.server_url}${lineStatus.pending_approvals > 0 ? ` · ${lineStatus.pending_approvals} pending` : ""}`}
+          >
+            <span
+              className="w-1.5 h-1.5 rounded-full"
+              style={{
+                background:
+                  lineStatus.pending_approvals > 0
+                    ? "var(--warning, #d19a66)"
+                    : "var(--accent)",
+              }}
+              aria-hidden
+            />
+            <span style={{ color: "var(--text-primary)" }}>
+              bridge live
+            </span>
+            {lineStatus.pending_approvals > 0 && (
+              <span
+                className="ml-auto"
+                style={{ color: "var(--text-secondary)", fontSize: "10px" }}
+              >
+                {lineStatus.pending_approvals} pending
+              </span>
+            )}
+          </div>
+        </Section>
+      )}
 
       {/* Identity (org-policy SSO — EE Phase 4). Renders only when the
           active org policy has policies.sso.enabled. Otherwise the

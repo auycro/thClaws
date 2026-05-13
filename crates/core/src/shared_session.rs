@@ -67,7 +67,14 @@ impl Default for ReadyGate {
 }
 
 /// Inputs to the shared session — produced by either tab.
-#[derive(Debug, Clone)]
+///
+/// `Clone` is intentionally *not* derived: `LineMessage` carries
+/// a `oneshot::Sender` which is move-only by design (each pending
+/// reply has exactly one waiter). Plenty of other variants would
+/// have to wrap their payloads in `Arc` just to satisfy `Clone`
+/// even though nothing in the codebase actually clones a
+/// `ShellInput`.
+#[derive(Debug)]
 pub enum ShellInput {
     /// Raw line submitted by the user. Slash-prefix → dispatched as
     /// command, anything else → fed to the agent as a prompt.
@@ -148,6 +155,29 @@ pub enum ShellInput {
     /// commands (e.g. `/sessions`) reflect the new value. No-op if
     /// `id` doesn't match the current session.
     SessionRenamedExternal { id: String, title: String },
+    /// Plan-07 Phase 1.3: IPC successfully redeemed a pairing
+    /// code via the relay's `POST /pair`, saved the binding to
+    /// `~/.config/thclaws/line.json`, and is asking the worker
+    /// to spawn the WebSocket session. Worker stashes the
+    /// `LineSessionHandle` on `state.line_session` and
+    /// broadcasts `ViewEvent::LineStatus`.
+    LineConnect(crate::line::LineConfig),
+    /// Plan-07 Phase 1.3: IPC `line_disconnect` request. Worker
+    /// cancels the active session (if any), drops the handle,
+    /// deletes the on-disk config, and broadcasts the
+    /// disconnected status.
+    LineDisconnect,
+    /// Plan-07 Phase 2: LINE user sent a message; the WS handler
+    /// pushes the text into the worker so it drives the real
+    /// `Agent::run_turn`. `respond` is a oneshot the worker fills
+    /// with the captured final assistant text — the LineSession
+    /// then POSTs it back to the relay's `/reply/{id}` endpoint
+    /// (which calls LINE's Messaging API). One LINE turn = one
+    /// worker turn = one OA reply.
+    LineMessage {
+        text: String,
+        respond: tokio::sync::oneshot::Sender<String>,
+    },
 }
 
 /// What both tabs render. Each variant maps to a UI affordance:
@@ -202,6 +232,11 @@ pub enum ViewEvent {
     /// Emitted after `/mcp add | remove` so the sidebar reflects the
     /// new state without waiting for the next full session_update.
     McpUpdate(String),
+    /// LINE bridge status (plan-07 Phase 1.3). Pre-built JSON shaped
+    /// like `{type: "line_status", state: "connected"|"disconnected",
+    /// server_url: "...", pending_approvals: N}`. Emitted on pair /
+    /// disconnect and whenever the bridge crosses a state boundary.
+    LineStatus(String),
     /// Goal-state sidebar refresh (Phase A). Carries the latest snapshot
     /// of the active /goal — `None` means the goal was cleared. Frontend
     /// renders a compact indicator (objective, iterations, tokens
@@ -533,6 +568,17 @@ pub struct WorkerState {
     /// before spawning; the factory uses it to register a Task tool
     /// for the spawned child.
     pub agent_defs: crate::agent_defs::AgentDefsConfig,
+    /// Plan-07 Phase 1.3: active LINE-bridge session, if the user has
+    /// paired their thClaws install to a LINE OA. `Some` only while
+    /// the background WS task is running; `line_disconnect` cancels
+    /// + clears it.
+    pub line_session: Option<crate::line::LineSessionHandle>,
+    /// Plan-07 Phase 2.1: pre-LINE-connect snapshot of the agent's
+    /// permission mode + approver, so `LineDisconnect` can restore
+    /// exactly where the user left off. `Some` only while a LINE
+    /// session is active.
+    pub line_pre_mode: Option<crate::permissions::PermissionMode>,
+    pub line_pre_approver: Option<std::sync::Arc<dyn crate::permissions::ApprovalSink>>,
 }
 
 /// M6.29: handle to a running `/loop` task.
@@ -1444,6 +1490,9 @@ async fn run_worker(
         last_turn_made_tool_calls: true,
         agent_factory: factory_state,
         agent_defs: agent_defs_state,
+        line_session: None,
+        line_pre_mode: None,
+        line_pre_approver: None,
     };
 
     // M6.35 HOOK2: fire session_start hook now that WorkerState is
@@ -1456,6 +1505,18 @@ async fn run_worker(
         &state.session.id,
         &state.config.model,
     );
+
+    // Plan-07 Phase 1.3: auto-reconnect the LINE bridge on worker
+    // boot when a binding token is already on disk. `LineConfig::load`
+    // returns Ok(None) when the file's absent — that's the common
+    // case, and we just skip silently.
+    match crate::line::LineConfig::load() {
+        Ok(Some(cfg)) => {
+            let _ = input_tx_self.send(ShellInput::LineConnect(cfg));
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("[line] failed to load on-disk config: {e}"),
+    }
 
     // Lead inbox poller — parity with repl.rs:1524. Without this, teammates
     // message the lead, messages pile up in `.thclaws/team/inboxes/lead.json`
@@ -1717,6 +1778,132 @@ async fn run_worker(
                 let _ = events_tx.send(ViewEvent::ErrorText(format!(
                     "[mcp] '{server_name}' failed to start: {error}"
                 )));
+            }
+            ShellInput::LineConnect(line_cfg) => {
+                // If a session is already running, cancel it
+                // first — the new pair always wins.
+                if let Some(prev) = state.line_session.take() {
+                    prev.cancel.cancel();
+                    // Don't restore mode/approver here — the new
+                    // session will replace them in a moment. The
+                    // stash from the *original* connect is what
+                    // we want to keep so LineDisconnect lands
+                    // back on the user's pre-LINE posture.
+                }
+                let handle = crate::line::bootstrap::spawn(line_cfg, input_tx_self.clone());
+
+                // Plan-07 Phase 2.1: swap permission posture to
+                // route approvals through LINE while the bridge
+                // is connected. Stash the pre-existing values so
+                // LineDisconnect can put them back.
+                if state.line_pre_mode.is_none() {
+                    state.line_pre_mode = Some(crate::permissions::current_mode());
+                    state.line_pre_approver = Some(state.approver.clone());
+                }
+                crate::permissions::set_current_mode_and_broadcast(
+                    crate::permissions::PermissionMode::LineGated,
+                );
+                state.approver =
+                    handle.approver.clone() as std::sync::Arc<dyn crate::permissions::ApprovalSink>;
+                if let Err(e) = state.rebuild_agent(true) {
+                    eprintln!("[line] rebuild_agent after mode swap failed: {e}");
+                }
+
+                let payload = serde_json::json!({
+                    "type": "line_status",
+                    "state": handle.status.state,
+                    "server_url": handle.status.server_url,
+                    "pending_approvals": handle.status.pending_approvals,
+                });
+                state.line_session = Some(handle);
+                let _ = events_tx.send(ViewEvent::LineStatus(payload.to_string()));
+                let _ = events_tx.send(ViewEvent::SlashOutput(
+                    "[line] bridge connected · permissions routed to LINE".into(),
+                ));
+            }
+            ShellInput::LineDisconnect => {
+                if let Some(handle) = state.line_session.take() {
+                    handle.cancel.cancel();
+                }
+                // Plan-07 Phase 2.1: restore the pre-connect mode
+                // + approver so the local Ask/Auto/Plan posture
+                // resumes immediately. No-op if no stash exists
+                // (shouldn't happen, but defensively safe).
+                if let Some(prev_mode) = state.line_pre_mode.take() {
+                    crate::permissions::set_current_mode_and_broadcast(prev_mode);
+                }
+                if let Some(prev_approver) = state.line_pre_approver.take() {
+                    state.approver = prev_approver;
+                    if let Err(e) = state.rebuild_agent(true) {
+                        eprintln!("[line] rebuild_agent after restore failed: {e}");
+                    }
+                }
+                // Delete the on-disk config so the next worker
+                // boot doesn't auto-reconnect.
+                if let Err(e) = crate::line::LineConfig::delete() {
+                    eprintln!("[line] delete on-disk config: {e}");
+                }
+                let payload = serde_json::json!({
+                    "type": "line_status",
+                    "state": "disconnected",
+                    "server_url": "",
+                    "pending_approvals": 0,
+                });
+                let _ = events_tx.send(ViewEvent::LineStatus(payload.to_string()));
+                let _ = events_tx.send(ViewEvent::SlashOutput("[line] bridge disconnected".into()));
+            }
+            ShellInput::LineMessage { text, respond } => {
+                // Plan-07 Phase 2: drive the live agent for an
+                // inbound LINE message. Subscribe to `events_tx`
+                // BEFORE the turn starts, accumulate
+                // `AssistantTextDelta` until `TurnDone`, then
+                // answer the LineSession via the oneshot. The
+                // bridge POSTs the captured text back to the
+                // relay's `/reply/{id}` endpoint inside its own
+                // task — we just hand the text over.
+                //
+                // The collector runs in parallel to the turn so
+                // it doesn't block the broadcast bus; the turn
+                // itself goes through the existing `handle_line`
+                // path so slash / bang / goal intercepts behave
+                // identically to GUI-driven prompts.
+                let mut event_rx = events_tx.subscribe();
+                let collector = tokio::spawn(async move {
+                    // Plan-07 Phase 2.2: capture only the FINAL
+                    // assistant text — everything emitted after
+                    // the last `ToolCallStart` of the turn.
+                    // Intermediate "I'll do X next" narration
+                    // between tool calls would just be noise in
+                    // LINE chat, and the tool calls themselves
+                    // are already gated through the LineApprover
+                    // when LineGated mode is active.
+                    let mut buf = String::new();
+                    while let Ok(ev) = event_rx.recv().await {
+                        match ev {
+                            ViewEvent::AssistantTextDelta(s) => buf.push_str(&s),
+                            ViewEvent::ToolCallStart { .. } => buf.clear(),
+                            ViewEvent::TurnDone => break,
+                            // ErrorText also signals the turn
+                            // ended (cancel / fatal). Capture
+                            // the message so the user sees the
+                            // failure in LINE instead of silence.
+                            ViewEvent::ErrorText(s) => {
+                                if buf.is_empty() {
+                                    buf.push_str(&s);
+                                } else {
+                                    buf.push_str("\n\n");
+                                    buf.push_str(&s);
+                                }
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    buf
+                });
+                handle_line(text, &mut state, &events_tx, &cancel, &input_tx_self).await;
+                let final_text = collector.await.unwrap_or_default();
+                let _ = respond.send(final_text);
             }
             ShellInput::McpAppCallTool {
                 request_id,

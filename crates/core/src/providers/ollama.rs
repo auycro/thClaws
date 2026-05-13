@@ -275,6 +275,9 @@ impl Provider for OllamaProvider {
         let byte_stream = resp.bytes_stream();
         let raw_dump = super::RawDump::new(format!("ollama {}", req.model));
         let tool_names: Vec<String> = req.tools.iter().map(|t| t.name.clone()).collect();
+        let chunk_timeout = req
+            .stream_chunk_timeout_override
+            .unwrap_or_else(super::stream_chunk_timeout);
 
         let event_stream = try_stream! {
             // M6.21 BUG H1: byte buffer to avoid UTF-8 corruption at
@@ -287,13 +290,13 @@ impl Provider for OllamaProvider {
 
             loop {
                 let maybe_chunk = tokio::time::timeout(
-                    super::stream_chunk_timeout(),
+                    chunk_timeout,
                     byte_stream.next(),
                 )
                 .await
                 .map_err(|_| Error::Provider(format!(
                     "stream idle for {}s — provider stopped sending; try again",
-                    super::stream_chunk_timeout().as_secs()
+                    chunk_timeout.as_secs()
                 )))?;
                 let Some(chunk) = maybe_chunk else { break };
                 let chunk = chunk.map_err(|e| Error::Provider(format!("stream: {e}")))?;
@@ -744,6 +747,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let msgs = OllamaProvider::messages_to_ollama(&req);
         // system + user(hi) + assistant(tool_calls) + tool(result)
@@ -771,6 +775,7 @@ mod tests {
             tools: vec![],
             max_tokens: 0,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let body = OllamaProvider::build_body(&req);
         assert_eq!(body["model"], "llama3.2");
@@ -905,6 +910,7 @@ mod tests {
             tools: vec![],
             max_tokens: 0,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let raw = provider.stream(req).await.expect("stream");
         let result = collect_turn(assemble(raw)).await.expect("collect");
@@ -942,6 +948,7 @@ mod tests {
             tools: vec![],
             max_tokens: 0,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let raw = provider.stream(req).await.expect("stream");
         let result = collect_turn(assemble(raw)).await.expect("collect");

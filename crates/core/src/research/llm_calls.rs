@@ -367,7 +367,7 @@ fn build_extract_subtopics_prompt(query: &str, seed: &[ResearchSource], n: u32) 
             "- {} ({})\n  {}\n",
             r.title,
             r.url,
-            snippet(&r.body, 200)
+            snippet(&r.body, 3000)
         ));
     }
     s.push_str(&format!(
@@ -420,7 +420,7 @@ fn build_evaluate_prompt(query: &str, sources: &[ResearchSource]) -> String {
             r.index,
             r.title,
             r.url,
-            snippet(&r.body, 300)
+            snippet(&r.body, 15000)
         ));
     }
     s.push_str(
@@ -455,7 +455,7 @@ fn build_plan_pages_prompt(query: &str, sources: &[ResearchSource], max_pages: u
             r.index,
             r.title,
             r.url,
-            snippet(&r.body, 300)
+            snippet(&r.body, 15000)
         ));
     }
     s.push_str(&format!(
@@ -534,7 +534,7 @@ fn build_write_research_page_prompt(
             r.index,
             r.title,
             r.url,
-            snippet(&r.body, 600)
+            snippet(&r.body, 60000)
         ));
     }
     s.push_str(
@@ -574,7 +574,7 @@ fn build_synthesize_prompt(query: &str, sources: &[ResearchSource]) -> String {
             r.index,
             r.title,
             r.url,
-            snippet(&r.body, 500)
+            snippet(&r.body, 20000)
         ));
     }
     s.push_str(
@@ -606,10 +606,15 @@ fn build_verify_page_prompt(page_body: &str, cited_sources: &[ResearchSource]) -
     s.push_str(
         "You are a verification auditor. Read the GENERATED PAGE below \
          and check every factual claim against the CITED SOURCES. The \
-         page was synthesised by another LLM, which may have \
-         hallucinated facts or attached a `[N]` citation to a source \
-         that doesn't actually support the claim. Your job is to flag \
-         those defects so a downstream reader knows what to trust.\n\n",
+         page was synthesised by another LLM and may contain real \
+         hallucinations — `[N]` citations attached to claims the source \
+         doesn't actually make. Your job is to flag THOSE — not honest \
+         paraphrases.\n\n\
+         **Be generous about paraphrasing.** Synthesis necessarily restates \
+         ideas in different words; that is not a defect. A faithful \
+         paraphrase that expands or simplifies the source's wording, adds \
+         synonyms, or merges adjacent sentences IS supported. Only flag \
+         when meaning actually diverges.\n\n",
     );
     s.push_str("=== GENERATED PAGE ===\n");
     s.push_str(page_body.trim());
@@ -620,43 +625,66 @@ fn build_verify_page_prompt(page_body: &str, cited_sources: &[ResearchSource]) -
             r.index,
             r.title,
             r.url,
-            snippet(&r.body, 800)
+            snippet(&r.body, 60000)
         ));
     }
     s.push_str(
-        "Walk the page sentence by sentence. For each factual claim \
-         (anything an audit reader would want to verify — definitions, \
-         dates, numbers, attributions, capability statements, comparisons), \
-         decide:\n\
-         - `Supported`: the cited source clearly states this exact claim.\n\
-         - `Partial`: the cited source touches the topic but doesn't \
-         strictly back the specific wording (e.g. claim says \"100x faster\" \
-         but source only says \"significantly faster\").\n\
-         - `Unsupported`: the citation is wrong — the source doesn't say \
-         this. Usually a hallucination or miscitation. CALL THESE OUT.\n\
-         - `NoCitation`: the page makes a factual assertion with no `[N]` \
-         attached. Provenance is unknown.\n\n\
-         Skip claims that aren't factual (opinions, hedges like \"may be\", \
-         questions, the page's own headings, the auto-generated `## Sources` \
-         section). Skip Supported claims when reporting — only LIST the \
-         flagged ones (Partial / Unsupported / NoCitation) to keep output \
-         compact.\n\n\
+        "For each factual claim in the page (definitions, dates, numbers, \
+         attributions, capability statements, comparisons), classify it:\n\n\
+         **`Supported`** — the source's content backs the claim's meaning. \
+         This INCLUDES:\n\
+         - The page restates the source idea in different/expanded words\n\
+         - The page adds explanatory synonyms or merges adjacent source \
+           sentences (e.g. source says \"store and recall past experiences\"; \
+           page says \"store, retain, and recall past experiences, \
+           interactions, and knowledge\" — still Supported)\n\
+         - The page reorders or rephrases a definition\n\
+         - The page applies the source's general claim to a specific case \
+           the source clearly implies\n\n\
+         **`Partial`** — only flag when a LOAD-BEARING detail diverges from \
+         the source. Examples of load-bearing:\n\
+         - Quantitative claim: \"100x faster\" vs source's \"significantly faster\"\n\
+         - Date / version: \"released 2024\" vs source's \"released 2023\"\n\
+         - Named entity: \"GPT-4\" vs source's \"Claude 3\"; \"OpenAI\" vs \
+           source's \"Anthropic\"\n\
+         - Scope quantifier: \"all agents\" vs source's \"some agents\"; \
+           \"always\" vs source's \"sometimes\"\n\
+         Do NOT flag Partial just because the page's wording differs from \
+         the source's wording.\n\n\
+         **`Unsupported`** — only flag when:\n\
+         - The source's content directly CONTRADICTS the claim, OR\n\
+         - The source body in this prompt is substantive AND addresses an \
+           entirely different topic than what the claim asserts.\n\
+         Hallucinated citations (model invented a connection that isn't \
+         in the source's content) belong here.\n\n\
+         **`NoCitation`** — the page makes a load-bearing factual assertion \
+         with no `[N]` attached at all. Only flag genuinely uncited factual \
+         claims; do not flag opinion lines, hedges (\"may be\"), questions, \
+         page headings, or the auto-generated `## Sources` block.\n\n\
+         **When in doubt, default to `Supported`.** A small amount of false \
+         negatives is much less harmful than a flood of false positives.\n\n\
+         **If a source's body content here is mostly navigation, header, \
+         footer, or otherwise non-substantive** (fewer than ~300 chars of \
+         actual prose about the topic), SKIP every claim citing that \
+         source — do NOT include them in `items`. Absence of evidence in \
+         the snippet does not mean the source contradicts the claim. \
+         Treat those claims as if they didn't exist for scoring purposes.\n\n\
          Output STRICT JSON, nothing else. Schema:\n\
          ```\n\
          {\n\
-           \"score\": 0.NN,                  // fraction of total factual claims that are Supported (0.0-1.0)\n\
+           \"score\": 0.NN,                  // fraction of total IN-SCOPE factual claims that are Supported (0.0-1.0). Skipped claims (above) do not count for or against the score.\n\
            \"items\": [\n\
              {\n\
                \"claim\": \"short paraphrase of the flagged sentence\",\n\
                \"citation\": 3 | null,       // [N] index if cited, null if NoCitation\n\
                \"verdict\": \"Partial\" | \"Unsupported\" | \"NoCitation\",\n\
-               \"note\": \"brief reason\" | null\n\
+               \"note\": \"brief reason — quote the load-bearing divergence\" | null\n\
              }\n\
            ]\n\
          }\n\
          ```\n\
-         If the page is short and entirely well-supported, output:\n\
-         `{\"score\": 1.0, \"items\": []}`\n\
+         Only LIST the flagged ones (Partial / Unsupported / NoCitation). \
+         If the page is well-supported, output `{\"score\": 1.0, \"items\": []}`. \
          Output JSON ONLY — no Markdown fences, no preamble, no trailing prose.",
     );
     s
@@ -1043,6 +1071,11 @@ async fn oneshot(
         tools: Vec::new(),
         max_tokens: 4096,
         thinking_budget: None,
+        // Research synthesizes long pages — the model may go silent
+        // for minutes mid-stream. Force the per-chunk idle ceiling to
+        // the pipeline's `llm_timeout` (default 900s) regardless of
+        // the user's `stream_chunk_timeout_secs` setting.
+        stream_chunk_timeout_override: Some(timeout),
     };
     let stream_fut = provider.stream(req);
     let mut stream = match tokio::time::timeout(timeout, stream_fut).await {

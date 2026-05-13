@@ -39,10 +39,24 @@ use std::sync::Arc;
 /// site dumped to one URL). At 30 accumulated sources × 1 MB worst
 /// case = ~30 MB peak in memory per run; comfortable for desktop.
 ///
-/// Synth prompts still truncate via `snippet(body, N)` (500 chars
-/// for evaluate / 600 for write_research_page) when composing, so a
-/// large source body doesn't bloat LLM cost — only the sources/
-/// archive on disk grows.
+/// Synth prompts still truncate via `snippet(body, N)` when
+/// composing. Caps are chosen so each call comfortably fits a 200 K
+/// context window while giving the model as much real article body
+/// as possible:
+/// - 3 KB / source for `extract_subtopics` (seed only)
+/// - 15 KB / source for `evaluate` and `plan_pages` (40 sources × 15 KB
+///   ≈ 150 K tokens — fits Sonnet's 200 K with headroom)
+/// - 20 KB / source for the broad `synthesize` answer (30 sources)
+/// - **60 KB / source** for `write_research_page` and `verify_page`
+///   — these are per-page (~5 cited sources) so total stays well
+///   under 100 K tokens, and 60 KB covers basically every scraped
+///   article including long-form pieces.
+///
+/// 1 M context models have massive headroom on top of these caps;
+/// 200 K context models also fit comfortably.
+///
+/// The 1 MB on-disk cap above bounds memory; per-call truncation
+/// bounds per-prompt token spend.
 const MAX_SOURCE_BODY_CHARS: usize = 1_000_000;
 /// Per-fetch byte budget for `WebFetch` calls. Same 1 MB ceiling as
 /// the in-memory cap so they don't conflict. M6.39.8: HAL-backed

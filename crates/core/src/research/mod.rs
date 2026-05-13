@@ -100,7 +100,11 @@ pub struct JobConfig {
     /// pages without exploding LLM cost (each page is one LLM call).
     /// Override via `/research --max-pages N`.
     pub max_pages: u32,
-    /// Per-LLM-call timeout. Default 120s.
+    /// Per-LLM-call timeout. Default 900s (15 min) — research
+    /// synthesis is a known long-running feature; this also feeds the
+    /// provider's per-chunk idle ceiling via
+    /// `StreamRequest::stream_chunk_timeout_override`, so it bypasses
+    /// the user's normal `stream_chunk_timeout_secs` setting.
     pub llm_timeout: Duration,
     /// Total wall-clock budget. Pipeline aborts as `Failed` with a
     /// budget-exhausted message past this. Default 15 minutes.
@@ -119,7 +123,7 @@ impl Default for JobConfig {
             subtopics_per_iter: 4,
             fetch_top_n: 3,
             max_pages: 7,
-            llm_timeout: Duration::from_secs(120),
+            llm_timeout: Duration::from_secs(900),
             time_budget: Duration::from_secs(15 * 60),
             kms_target: None,
         }

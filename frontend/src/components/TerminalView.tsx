@@ -245,7 +245,7 @@ export function TerminalView({ active, modalOpen }: Props) {
       promptShowing = true;
     };
 
-    // Print a banner + first prompt so the tab doesn't open empty.
+    // Print a banner so the tab doesn't open empty.
     term.write(
       "\x1b[36m" +
         BANNER +
@@ -253,7 +253,40 @@ export function TerminalView({ active, modalOpen }: Props) {
         "\r\n" +
         "\x1b[2mthClaws — type a message, or /help for commands\x1b[0m\r\n",
     );
-    writePrompt();
+
+    // Wait briefly for `initial_state` to arrive before writing the
+    // prompt — that way the version line lands ABOVE the prompt and
+    // the user sees:
+    //   banner
+    //   subtitle
+    //   v0.9.0
+    //   >
+    // not "> v0.9.0" mashed together. Fallback timer (1 s) writes the
+    // prompt regardless so the input never sits in limbo.
+    let promptWritten = false;
+    const writeVersionThenPrompt = (version: string | null) => {
+      if (promptWritten) return;
+      promptWritten = true;
+      if (version) {
+        term.write(`\x1b[2mv${version}\x1b[0m\r\n`);
+      }
+      writePrompt();
+    };
+    const unsubVersion = subscribe((msg) => {
+      if (
+        !promptWritten &&
+        msg.type === "initial_state" &&
+        typeof msg.version === "string"
+      ) {
+        writeVersionThenPrompt(msg.version as string);
+      }
+    });
+    // Belt-and-braces: if initial_state never lands (e.g. the worker
+    // is wedged), still drop the prompt so the user can type.
+    const versionFallback = window.setTimeout(
+      () => writeVersionThenPrompt(null),
+      1000,
+    );
 
     // Native clipboard via the IPC bridge — wry blocks navigator.clipboard.
     term.attachCustomKeyEventHandler((e: KeyboardEvent) => {
@@ -771,6 +804,8 @@ export function TerminalView({ active, modalOpen }: Props) {
 
     return () => {
       unsub();
+      unsubVersion();
+      window.clearTimeout(versionFallback);
       ro.disconnect();
       term.dispose();
       termRef.current = null;

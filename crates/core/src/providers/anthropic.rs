@@ -294,6 +294,9 @@ impl Provider for AnthropicProvider {
 
         let byte_stream = resp.bytes_stream();
         let raw_dump = super::RawDump::new(format!("anthropic {}", req.model));
+        let chunk_timeout = req
+            .stream_chunk_timeout_override
+            .unwrap_or_else(super::stream_chunk_timeout);
 
         let event_stream = try_stream! {
             // M6.21 BUG H1: buffer raw bytes (NOT String::from_utf8_lossy
@@ -304,13 +307,13 @@ impl Provider for AnthropicProvider {
             let mut raw = raw_dump;
             loop {
                 let maybe_chunk = tokio::time::timeout(
-                    super::stream_chunk_timeout(),
+                    chunk_timeout,
                     byte_stream.next(),
                 )
                 .await
                 .map_err(|_| Error::Provider(format!(
                     "stream idle for {}s — provider stopped sending; try again",
-                    super::stream_chunk_timeout().as_secs()
+                    chunk_timeout.as_secs()
                 )))?;
                 let Some(chunk) = maybe_chunk else { break };
                 let chunk = chunk.map_err(|e| Error::Provider(format!("stream: {e}")))?;
@@ -540,6 +543,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let body = AnthropicProvider::build_body(&req);
         // System is now wrapped in a content block with cache_control.
@@ -571,6 +575,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let body = AnthropicProvider::build_body(&req);
         let msgs = body["messages"].as_array().unwrap();
@@ -599,6 +604,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let body = AnthropicProvider::build_body(&req);
         for msg in body["messages"].as_array().unwrap() {
@@ -626,6 +632,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let a = AnthropicProvider::build_body(&req);
         let b = AnthropicProvider::build_body(&req);
@@ -644,6 +651,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let body = AnthropicProvider::build_body(&req);
         assert!(body.get("system").is_none());
@@ -704,6 +712,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
 
         let stream = provider.stream(req).await.expect("stream");
@@ -802,6 +811,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
 
         let raw = provider.stream(req).await.expect("stream");
@@ -872,6 +882,7 @@ mod tests {
             tools: vec![],
             max_tokens: 10,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         match provider.stream(req).await {
             Err(e) => {
@@ -898,6 +909,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let body = AnthropicProvider::build_body(&req);
         let first = &body["messages"][0]["content"][0];
@@ -931,6 +943,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         }
     }
 
@@ -992,6 +1005,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let body = AnthropicProvider::build_body(&req);
         // Second-to-last is index 2 (the ToolResult message)
@@ -1024,6 +1038,7 @@ mod tests {
             }],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
 
         let cached = AnthropicProvider::build_body(&req);
@@ -1127,6 +1142,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
 
         let stream = provider
@@ -1179,6 +1195,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
 
         match provider.stream(req).await {

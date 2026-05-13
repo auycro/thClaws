@@ -217,6 +217,10 @@ pub async fn compact_with_summary(
         tools: vec![],
         max_tokens: 2048,
         thinking_budget: None,
+        // Compaction summarizes the whole history in one shot — can
+        // legitimately go silent mid-stream while the model thinks.
+        // Bypass the user's per-chunk idle setting for this one call.
+        stream_chunk_timeout_override: Some(crate::providers::LONG_RUNNING_STREAM_CHUNK_TIMEOUT),
     };
 
     match provider.stream(req).await {

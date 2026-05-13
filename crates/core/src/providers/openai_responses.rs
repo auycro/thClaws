@@ -234,6 +234,9 @@ impl Provider for OpenAIResponsesProvider {
         let id_slot_final = id_slot.clone();
 
         let raw_dump = super::RawDump::new(format!("openai-responses {}", req.model));
+        let chunk_timeout = req
+            .stream_chunk_timeout_override
+            .unwrap_or_else(super::stream_chunk_timeout);
         let event_stream = try_stream! {
             // M6.21 BUG H1: byte buffer to avoid UTF-8 corruption at
             // chunk boundaries. See providers::find_bytes doc.
@@ -244,13 +247,13 @@ impl Provider for OpenAIResponsesProvider {
 
             loop {
                 let maybe_chunk = tokio::time::timeout(
-                    super::stream_chunk_timeout(),
+                    chunk_timeout,
                     byte_stream.next(),
                 )
                 .await
                 .map_err(|_| Error::Provider(format!(
                     "stream idle for {}s — provider stopped sending; try again",
-                    super::stream_chunk_timeout().as_secs()
+                    chunk_timeout.as_secs()
                 )))?;
                 let Some(chunk) = maybe_chunk else { break };
                 let chunk = chunk.map_err(|e| Error::Provider(format!("stream: {e}")))?;

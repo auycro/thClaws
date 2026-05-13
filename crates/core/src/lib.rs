@@ -34,6 +34,7 @@ pub mod instructions;
 #[cfg(feature = "gui")]
 pub mod ipc;
 pub mod kms;
+pub mod line;
 pub mod marketplace;
 pub mod mcp;
 pub mod memory;

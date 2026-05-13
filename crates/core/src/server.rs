@@ -401,6 +401,7 @@ fn build_initial_state_payload() -> String {
         "mcp_servers": mcp_servers,
         "sessions": sessions,
         "kmss": kmss,
+        "version": crate::version::VERSION,
     })
     .to_string()
 }

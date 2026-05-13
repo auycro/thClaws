@@ -417,6 +417,9 @@ impl Provider for OpenAIProvider {
 
         let byte_stream = resp.bytes_stream();
         let raw_dump = super::RawDump::new(format!("openai {}", req.model));
+        let chunk_timeout = req
+            .stream_chunk_timeout_override
+            .unwrap_or_else(super::stream_chunk_timeout);
 
         let event_stream = try_stream! {
             // M6.21 BUG H1: buffer raw bytes so UTF-8 chars don't get
@@ -429,13 +432,13 @@ impl Provider for OpenAIProvider {
 
             loop {
                 let maybe_chunk = tokio::time::timeout(
-                    super::stream_chunk_timeout(),
+                    chunk_timeout,
                     byte_stream.next(),
                 )
                 .await
                 .map_err(|_| Error::Provider(format!(
                     "stream idle for {}s — provider stopped sending; try again",
-                    super::stream_chunk_timeout().as_secs()
+                    chunk_timeout.as_secs()
                 )))?;
                 let Some(chunk) = maybe_chunk else { break };
                 let chunk = chunk.map_err(|e| Error::Provider(format!("stream: {e}")))?;
@@ -1014,6 +1017,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let msgs = OpenAIProvider::messages_to_openai(&req);
         // system, user(hi), assistant(tool_calls), tool(result)
@@ -1077,6 +1081,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let msgs = OpenAIProvider::messages_to_openai(&req);
         // assistant(tool_use), tool(text-only summary), user(image_url)
@@ -1209,6 +1214,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let msgs = OpenAIProvider::messages_to_openai(&req);
 
@@ -1288,6 +1294,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let msgs = OpenAIProvider::messages_to_openai(&req);
         assert_eq!(msgs.len(), 1);
@@ -1330,6 +1337,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let msgs = OpenAIProvider::messages_to_openai(&req);
         // assistant(tool_use), tool(text) — no synthetic user.
@@ -1351,6 +1359,7 @@ mod tests {
             }],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let body = OpenAIProvider::build_body(&req);
         assert_eq!(body["stream"], true);
@@ -1423,6 +1432,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let raw = provider.stream(req).await.expect("stream");
         let result = collect_turn(assemble(raw)).await.expect("collect");
@@ -1466,6 +1476,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let raw = provider.stream(req).await.expect("stream");
         let result = collect_turn(assemble(raw)).await.expect("collect");
@@ -1568,6 +1579,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let msgs = OpenAIProvider::messages_to_openai(&req);
         let assistant = msgs.iter().find(|m| m["role"] == "assistant").unwrap();
@@ -1583,6 +1595,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             thinking_budget: None,
+            stream_chunk_timeout_override: None,
         };
         let msgs_plain = OpenAIProvider::messages_to_openai(&req_plain);
         let assistant_plain = msgs_plain

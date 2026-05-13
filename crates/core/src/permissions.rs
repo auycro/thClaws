@@ -35,6 +35,29 @@ pub enum PermissionMode {
     /// corrects on the next turn. The user retains the sidebar Cancel
     /// button as a per-plan escape hatch.
     Plan,
+    /// LINE-gated (plan-07 Phase 1.2) — semantically identical to
+    /// `Ask` for *what* gets gated (every tool whose
+    /// `requires_approval` returns true), but the approval prompt
+    /// is routed to the user's LINE chat via the `LineApprover`
+    /// sink rather than the local REPL / GUI modal. Lets a user
+    /// approve agent-initiated mutations from their phone when the
+    /// LINE bridge is active.
+    LineGated,
+}
+
+impl PermissionMode {
+    /// True when this mode requires per-tool approval on mutating
+    /// calls. Centralised so a future "Slack-gated" / "Discord-
+    /// gated" variant just opts into the same arm.
+    pub fn asks_for_approval(&self) -> bool {
+        matches!(self, Self::Ask | Self::LineGated)
+    }
+
+    /// True when this mode blocks mutating calls outright (Plan
+    /// surfaces a structured tool_result; no approval flow).
+    pub fn blocks_mutations(&self) -> bool {
+        matches!(self, Self::Plan)
+    }
 }
 
 impl Default for PermissionMode {
