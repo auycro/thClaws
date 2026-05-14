@@ -62,7 +62,7 @@ pub const BASELINE_JSON: &str = include_str!("../resources/model_catalogue.json"
 /// whose context hasn't been verified yet (`None` falls through to the
 /// provider's `default_context` at lookup time — same semantics as a
 /// missing row, but the id stays visible for `/models` listings).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<u32>,
@@ -77,6 +77,22 @@ pub struct ModelEntry {
     /// ISO-8601 date this row was last verified against its `source`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified_at: Option<String>,
+    /// `true` when the upstream provider lists this model as free
+    /// (both prompt and completion token prices = 0). Currently
+    /// only populated by OpenRouter; other providers' entries
+    /// leave this unset. Drives the "Free only" toggle in the
+    /// Settings → OpenRouter card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free: Option<bool>,
+    /// `Some(false)` when the upstream provider lists this row with a
+    /// non-text output modality (e.g. Lyria → audio, Imagen → image,
+    /// embedding endpoints → vector). Such rows must not appear in the
+    /// chat-model picker because the agent feeds the response straight
+    /// into the conversation. `Some(true)` when output explicitly
+    /// includes text; `None` means the catalogue source doesn't
+    /// publish modality info — treat as chat-capable (legacy default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat: Option<bool>,
 }
 
 /// All models known for one provider, plus the provider-level metadata
@@ -434,7 +450,25 @@ impl EffectiveCatalogue {
         if let Some(c) = &self.cache {
             if let Some(pc) = c.providers.get(provider) {
                 for (id, e) in &pc.models {
-                    out.insert(id.clone(), e.clone()); // cache wins
+                    // Cache row wins on metadata it actually carries,
+                    // but when the cache lacks a field that the baseline
+                    // knows about, prefer the baseline value rather than
+                    // nulling it. Matters for `free` after a `/models
+                    // refresh` written by an older binary (pre-`free`
+                    // field) — without this carve-out, every cached row
+                    // would mask the baseline's `free: true`.
+                    let merged = match out.remove(id) {
+                        Some(baseline) => ModelEntry {
+                            context: e.context.or(baseline.context),
+                            max_output: e.max_output.or(baseline.max_output),
+                            source: e.source.clone().or(baseline.source),
+                            verified_at: e.verified_at.clone().or(baseline.verified_at),
+                            free: e.free.or(baseline.free),
+                            chat: e.chat.or(baseline.chat),
+                        },
+                        None => e.clone(),
+                    };
+                    out.insert(id.clone(), merged);
                 }
             }
         }
@@ -462,6 +496,8 @@ impl EffectiveCatalogue {
                     max_output: entry.max_output,
                     source: Some("override".to_string()),
                     verified_at: None,
+                    free: entry.free,
+                    chat: entry.chat,
                 },
             };
             out.insert(id.to_string(), merged);
@@ -569,6 +605,8 @@ pub fn load_overrides_from_settings() -> HashMap<String, ModelEntry> {
                     .map(|n| n as u32),
                 source: Some("override".to_string()),
                 verified_at: None,
+                free: None,
+                chat: None,
             };
             // Project (read second) wins per-key.
             out.insert(k.clone(), entry);
@@ -663,6 +701,7 @@ pub fn provider_kind_name(k: crate::providers::ProviderKind) -> &'static str {
         ProviderKind::AgentSdk => "agent-sdk",
         ProviderKind::OpenAI => "openai",
         ProviderKind::OpenAIResponses => "openai-responses",
+        ProviderKind::ChatGptCodex => "chatgpt-codex",
         ProviderKind::OpenRouter => "openrouter",
         ProviderKind::Gemini => "gemini",
         ProviderKind::Ollama => "ollama",
@@ -910,6 +949,8 @@ mod tests {
             max_output: None,
             source: Some("override".into()),
             verified_at: None,
+            free: None,
+            chat: None,
         }
     }
 
@@ -1136,6 +1177,56 @@ mod tests {
         assert_eq!(rows[0].1.source.as_deref(), Some("user scan"));
         // Cache-only id is present.
         assert_eq!(rows[1].1.context, Some(32_768));
+    }
+
+    #[test]
+    fn cache_missing_free_inherits_baseline() {
+        // Regression: a `/models refresh` written by an older binary
+        // omits the `free` field entirely. The cache row must not
+        // silently mask the baseline's `free: true`, otherwise the
+        // "Free only" filter shows almost nothing.
+        let baseline = Catalogue::from_json_str(
+            r#"{
+            "schema": 3,
+            "providers": {
+                "openrouter": {
+                    "default_context": 8192,
+                    "models": {
+                        "vendor/free-model:free": {"context": 131072, "free": true},
+                        "vendor/paid-model":     {"context": 131072, "free": false}
+                    }
+                }
+            }
+        }"#,
+        )
+        .unwrap();
+        // Cache row mirrors the pre-`free` schema: no `free` key at all.
+        let cache = Catalogue::from_json_str(
+            r#"{
+            "schema": 3,
+            "providers": {
+                "openrouter": {
+                    "default_context": 8192,
+                    "models": {
+                        "vendor/free-model:free": {"context": 200000},
+                        "vendor/paid-model":     {"context": 200000}
+                    }
+                }
+            }
+        }"#,
+        );
+        let eff = EffectiveCatalogue {
+            cache,
+            baseline,
+            overrides: HashMap::new(),
+        };
+        let rows = eff.list_models_for_provider("openrouter");
+        let by_id: HashMap<_, _> = rows.into_iter().collect();
+        // Cache wins on context (200k overrides 131k)…
+        assert_eq!(by_id["vendor/free-model:free"].context, Some(200_000));
+        // …but `free` falls back to the baseline value, not None.
+        assert_eq!(by_id["vendor/free-model:free"].free, Some(true));
+        assert_eq!(by_id["vendor/paid-model"].free, Some(false));
     }
 
     #[test]

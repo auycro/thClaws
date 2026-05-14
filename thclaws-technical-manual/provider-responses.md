@@ -39,21 +39,64 @@ pub struct OpenAIResponsesProvider {
     client: Client,
     api_key: String,
     base_url: String,
+    chatgpt_account_id: Option<String>,
     last_response_id: Arc<Mutex<Option<String>>>,
 }
 
 impl OpenAIResponsesProvider {
     pub fn new(api_key: impl Into<String>) -> Self;
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self;
+    pub fn with_chatgpt_account_id(mut self, id: impl Into<String>) -> Self;
     fn model_id(model: &str) -> &str {
-        model.strip_prefix("codex/").unwrap_or(model)
+        model
+            .strip_prefix("chatgpt-codex/")
+            .or_else(|| model.strip_prefix("codex/"))
+            .unwrap_or(model)
     }
 }
 ```
 
-No `with_strip_model_prefix` knob — the strip is hard-coded for `codex/`. There's only one variant (`OpenAIResponses`) so this is fine. No `with_api_key_header` — auth is always `Authorization: Bearer <key>`.
+The provider hosts two variants of the Responses wire shape that
+share its `try_stream!` pipeline:
 
-`last_response_id` is an `Arc<Mutex<Option<String>>>` so the provider can mutate it from inside the streaming `try_stream!` block (which doesn't have `&mut self`).
+1. **`OpenAIResponses`** (`codex/<id>`, paid API key) — the
+   default. `chatgpt_account_id = None`. Standard Responses body
+   with `store: true`, `max_output_tokens`, and (optionally)
+   `previous_response_id` for cross-turn continuation.
+2. **`ChatGptCodex`** (`chatgpt-codex/<id>`, OAuth-bound) — built
+   in [`crate::repl::build_provider`](../crates/core/src/repl.rs)
+   via `OpenAIResponsesProvider::new(access_token)
+   .with_base_url("chatgpt.com/backend-api/codex/responses")
+   .with_chatgpt_account_id(...)`. When
+   `chatgpt_account_id` is `Some`, the provider:
+   - Adds three extra headers: `chatgpt-account-id: <jwt-sub>`,
+     `originator: pi`, `OpenAI-Beta: responses=experimental`.
+   - Sets `store: false` in the body — the subscription endpoint
+     returns 400 with `Unsupported parameter: store=true`
+     otherwise, and `previous_response_id` is not supported on
+     this path either, so cross-session continuation is gated to
+     in-stream `response.completed end_turn: false` (future work).
+   - Skips `max_output_tokens` in the body — same 400 reason.
+
+`model_id` strips both `chatgpt-codex/` and `codex/` prefixes so
+the upstream sees the bare model id (`gpt-5.4`, `gpt-5.2-codex`,
+etc.) regardless of which variant routed the call. No
+`with_strip_model_prefix` knob — there are only the two prefixes
+and they're hard-coded.
+
+No `with_api_key_header` — auth is always `Authorization: Bearer
+<key>`, where the key is either an `OPENAI_API_KEY` (paid API) or
+the access_token resolved from `~/.codex/auth.json`
+(subscription). The CodexAuth resolver lives in
+`crate::codex_auth_store` and chains: per-profile file →
+legacy `~/.config/thclaws/auth.json` → auto-import from
+`~/.codex/auth.json`.
+
+`last_response_id` is an `Arc<Mutex<Option<String>>>` so the
+provider can mutate it from inside the streaming `try_stream!`
+block (which doesn't have `&mut self`). Only the `OpenAIResponses`
+path uses it — `ChatGptCodex` always sends a `None` previous_id
+because the subscription endpoint rejects the field.
 
 ---
 

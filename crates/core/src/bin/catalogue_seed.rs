@@ -39,6 +39,15 @@ const DEEPSEEK_URL: &str = "https://api.deepseek.com/v1/models";
 const THAILLM_URL: &str = "http://thaillm.or.th/api/v1/models";
 const NVIDIA_URL: &str = "https://integrate.api.nvidia.com/v1/models";
 const MINIMAX_URL: &str = "https://api.minimax.io/v1/models";
+// Alibaba DashScope. The compatible-mode endpoint is OpenAI-
+// shape so /v1/models returns {data:[{id, …}]}. We hit two
+// regions: the China-mainland default (`dashscope.aliyuncs.com`)
+// and the Singapore/intl region (`dashscope-intl.aliyuncs.com`,
+// our QwenCloud variant). Both can be overridden via
+// DASHSCOPE_BASE_URL / QWENCLOUD_BASE_URL but the script keeps
+// hard-coded defaults so it works out of the box.
+const DASHSCOPE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1/models";
+const QWENCLOUD_URL: &str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models";
 const DEFAULT_TARGET: &str = "crates/core/resources/model_catalogue.json";
 
 // ── Wire types ──────────────────────────────────────────────────────
@@ -55,6 +64,91 @@ struct OpenRouterModel {
     context_length: Option<u32>,
     #[serde(default)]
     top_provider: Option<TopProvider>,
+    /// OpenRouter publishes per-million-token rates as strings
+    /// (e.g. `{"prompt":"0","completion":"0"}` for free models,
+    /// `{"prompt":"0.000003","completion":"0.000015"}` for paid).
+    /// Models with both fields at "0" are zero-cost — surfaced
+    /// in the catalogue as `free: true`.
+    #[serde(default)]
+    pricing: Option<OpenRouterPricing>,
+    /// Input/output modalities published by OpenRouter. We use
+    /// `output_modalities` to drop rows that don't emit text
+    /// (Lyria → audio, Imagen → image, etc.) from the chat picker.
+    #[serde(default)]
+    architecture: Option<OpenRouterArchitecture>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterPricing {
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    completion: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterArchitecture {
+    /// Short modality string like `"text->text"`, `"text->audio"`,
+    /// `"text+image->text"`. Older OpenRouter responses ship this
+    /// without the structured `output_modalities` array, so we keep
+    /// it as a fallback signal.
+    #[serde(default)]
+    modality: Option<String>,
+    /// Newer field: explicit list like `["text"]` or `["audio"]`.
+    #[serde(default)]
+    output_modalities: Option<Vec<String>>,
+}
+
+impl OpenRouterModel {
+    /// True when both prompt and completion rates parse to 0.0.
+    /// Missing fields or unparseable values are treated as
+    /// non-free (defensive — better to undercount than overcount).
+    fn is_free(&self) -> bool {
+        let p = self.pricing.as_ref();
+        let zero = |s: &Option<String>| {
+            s.as_deref()
+                .and_then(|v| v.parse::<f64>().ok())
+                .map(|v| v == 0.0)
+                .unwrap_or(false)
+        };
+        p.map(|pr| zero(&pr.prompt) && zero(&pr.completion))
+            .unwrap_or(false)
+    }
+
+    /// Returns `Some(true)` when this row is a pure text-out model
+    /// (suitable for the chat agent), `Some(false)` when it emits any
+    /// non-text modality (audio / image / video / embeddings — even
+    /// alongside text, e.g. Lyria's `["text", "audio"]`), and `None`
+    /// when OpenRouter doesn't publish modality data. `None` defaults
+    /// to chat-capable at filter time — better to over-include legacy
+    /// rows than silently hide them.
+    fn is_chat(&self) -> Option<bool> {
+        const NON_CHAT: &[&str] = &["audio", "image", "video", "embedding", "embeddings"];
+        let arch = self.architecture.as_ref()?;
+        let outputs: Vec<String> = if let Some(list) = &arch.output_modalities {
+            if list.is_empty() {
+                return None;
+            }
+            list.iter().map(|s| s.trim().to_ascii_lowercase()).collect()
+        } else {
+            let modality = arch.modality.as_deref()?;
+            let output = modality.split("->").nth(1)?.trim();
+            if output.is_empty() {
+                return None;
+            }
+            output
+                .split('+')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .collect()
+        };
+        if outputs.iter().any(|m| NON_CHAT.contains(&m.as_str())) {
+            return Some(false);
+        }
+        if outputs.iter().any(|m| m == "text") {
+            return Some(true);
+        }
+        None
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,6 +259,21 @@ async fn run() -> Result<String, String> {
             Some((bare, ctx))
         })
         .collect();
+    // Mirror map for `max_completion_tokens` so providers whose own
+    // `/v1/models` endpoint doesn't return per-model output caps (OpenAI,
+    // Anthropic, DashScope, …) can borrow OpenRouter's well-curated
+    // values. Without this, every downstream provider row ships
+    // `max_output: None`, the agent's cap-against-max-output logic
+    // becomes a no-op, and `max_tokens: 32000` blows up for gpt-4o
+    // (cap 16384) and similar.
+    let openrouter_max_output_by_bare: HashMap<String, u32> = openrouter_rows
+        .iter()
+        .filter_map(|m| {
+            let max = m.top_provider.as_ref()?.max_completion_tokens?;
+            let bare = m.id.rsplit('/').next().unwrap_or(&m.id).to_string();
+            Some((bare, max))
+        })
+        .collect();
     let added_or = merge_openrouter(&mut cat, openrouter_rows, &today);
     push_provider_stats(&mut report, "openrouter", &added_or, None);
 
@@ -181,6 +290,7 @@ async fn run() -> Result<String, String> {
                     ANTHROPIC_URL,
                     ids,
                     &openrouter_ctx_by_bare,
+                    &openrouter_max_output_by_bare,
                     &today,
                 );
                 push_provider_stats(&mut report, "anthropic", &added, None);
@@ -202,6 +312,7 @@ async fn run() -> Result<String, String> {
                     OPENAI_URL,
                     kept,
                     &openrouter_ctx_by_bare,
+                    &openrouter_max_output_by_bare,
                     &today,
                 );
                 let suffix = format!(
@@ -268,6 +379,7 @@ async fn run() -> Result<String, String> {
                     OLLAMA_CLOUD_URL,
                     prefixed,
                     &openrouter_ctx_by_bare,
+                    &openrouter_max_output_by_bare,
                     &today,
                 );
                 push_provider_stats(&mut report, "ollama-cloud", &added, None);
@@ -300,6 +412,7 @@ async fn run() -> Result<String, String> {
                     DEEPSEEK_URL,
                     ids,
                     &openrouter_ctx_by_bare,
+                    &openrouter_max_output_by_bare,
                     &today,
                 );
                 push_provider_stats(&mut report, "deepseek", &added, None);
@@ -334,6 +447,7 @@ async fn run() -> Result<String, String> {
                     THAILLM_URL,
                     prefixed,
                     &openrouter_ctx_by_bare,
+                    &openrouter_max_output_by_bare,
                     &today,
                 );
                 push_provider_stats(&mut report, "thaillm", &added, None);
@@ -374,6 +488,7 @@ async fn run() -> Result<String, String> {
                     NVIDIA_URL,
                     prefixed,
                     &openrouter_ctx_by_bare,
+                    &openrouter_max_output_by_bare,
                     &today,
                 );
                 push_provider_stats(&mut report, "nvidia", &added, None);
@@ -410,6 +525,7 @@ async fn run() -> Result<String, String> {
                     MINIMAX_URL,
                     prefixed,
                     &openrouter_ctx_by_bare,
+                    &openrouter_max_output_by_bare,
                     &today,
                 );
                 push_provider_stats(&mut report, "minimax", &added, None);
@@ -418,6 +534,88 @@ async fn run() -> Result<String, String> {
         }
     } else {
         report.push("  minimax:     skipped (no MINIMAX_API_KEY)".into());
+    }
+
+    // 4f. DashScope (Alibaba, mainland-China region). OpenAI-compat
+    //     `/v1/models` at dashscope.aliyuncs.com lists the qwen-*
+    //     family (qwen-max, qwen-plus, qwen3-coder-plus, etc.).
+    //     Bare ids — the `dashscope/` prefix is added by the seed
+    //     so ProviderKind::detect routes correctly. Default
+    //     context conservative at 32K; specific rows hand-bumped
+    //     for the long-context variants (qwen3-coder is 1M).
+    let dashscope_url = std::env::var("DASHSCOPE_BASE_URL")
+        .map(|b| format!("{}/models", b.trim_end_matches('/')))
+        .unwrap_or_else(|_| DASHSCOPE_URL.to_string());
+    if let Ok(key) = std::env::var("DASHSCOPE_API_KEY") {
+        match fetch_dashscope(&dashscope_url, &key).await {
+            Ok(ids) => {
+                let prefixed: Vec<String> = ids
+                    .into_iter()
+                    .map(|id| format!("dashscope/{id}"))
+                    .collect();
+                let pc = cat
+                    .providers
+                    .entry("dashscope".into())
+                    .or_insert_with(ProviderCatalogue::default);
+                if pc.default_context.is_none() {
+                    pc.default_context = Some(32768);
+                }
+                let added = merge_discovered(
+                    &mut cat,
+                    "dashscope",
+                    &dashscope_url,
+                    prefixed,
+                    &openrouter_ctx_by_bare,
+                    &openrouter_max_output_by_bare,
+                    &today,
+                );
+                push_provider_stats(&mut report, "dashscope", &added, None);
+            }
+            Err(e) => report.push(format!("  dashscope:   FAILED ({e})")),
+        }
+    } else {
+        report.push("  dashscope:   skipped (no DASHSCOPE_API_KEY)".into());
+    }
+
+    // 4g. QwenCloud — Alibaba's Singapore/intl region of DashScope
+    //     at dashscope-intl.aliyuncs.com. Same wire shape as
+    //     mainland DashScope but a different account, key, and
+    //     model availability set (intl region typically lags
+    //     mainland by a release or two). The `qc/` prefix
+    //     namespace separates QwenCloud rows from DashScope so
+    //     a single workspace can have both keys configured and
+    //     ProviderKind::detect picks the right one. The `qc/`
+    //     prefix is stripped before the request hits the
+    //     upstream (which expects bare `qwen-max`, etc.).
+    let qwencloud_url = std::env::var("QWENCLOUD_BASE_URL")
+        .map(|b| format!("{}/models", b.trim_end_matches('/')))
+        .unwrap_or_else(|_| QWENCLOUD_URL.to_string());
+    if let Ok(key) = std::env::var("QWENCLOUD_API_KEY") {
+        match fetch_dashscope(&qwencloud_url, &key).await {
+            Ok(ids) => {
+                let prefixed: Vec<String> = ids.into_iter().map(|id| format!("qc/{id}")).collect();
+                let pc = cat
+                    .providers
+                    .entry("qwen-cloud".into())
+                    .or_insert_with(ProviderCatalogue::default);
+                if pc.default_context.is_none() {
+                    pc.default_context = Some(32768);
+                }
+                let added = merge_discovered(
+                    &mut cat,
+                    "qwen-cloud",
+                    &qwencloud_url,
+                    prefixed,
+                    &openrouter_ctx_by_bare,
+                    &openrouter_max_output_by_bare,
+                    &today,
+                );
+                push_provider_stats(&mut report, "qwen-cloud", &added, None);
+            }
+            Err(e) => report.push(format!("  qwen-cloud:  FAILED ({e})")),
+        }
+    } else {
+        report.push("  qwen-cloud:  skipped (no QWENCLOUD_API_KEY)".into());
     }
 
     // 5. Derive agent-sdk rows from anthropic. The Claude CLI subprocess
@@ -460,6 +658,8 @@ async fn run() -> Result<String, String> {
                     max_output: None,
                     source: Some(format!("derived:{claude_id}")),
                     verified_at: Some(today.clone()),
+                    free: None,
+                    chat: None,
                 },
             );
             stats.added.push(agent_id);
@@ -559,7 +759,24 @@ fn merge_openrouter(cat: &mut Catalogue, rows: Vec<OpenRouterModel>, today: &str
             stats.skipped_no_context += 1;
             continue;
         };
-        if pc.models.contains_key(&m.id) {
+        let is_free = m.is_free();
+        let chat = m.is_chat();
+        let max_output = m
+            .top_provider
+            .as_ref()
+            .and_then(|p| p.max_completion_tokens);
+        // Even when the entry already exists, refresh the `free`
+        // and `chat` flags — OpenRouter occasionally flips models
+        // (free ↔ paid; preview modality reclassified) and we want
+        // the Settings filters to reflect current upstream state
+        // without forcing operators to delete-and-reseed.
+        if let Some(existing) = pc.models.get_mut(&m.id) {
+            if existing.free != Some(is_free) {
+                existing.free = Some(is_free);
+            }
+            if chat.is_some() && existing.chat != chat {
+                existing.chat = chat;
+            }
             stats.unchanged += 1;
             continue;
         }
@@ -567,12 +784,11 @@ fn merge_openrouter(cat: &mut Catalogue, rows: Vec<OpenRouterModel>, today: &str
             m.id.clone(),
             ModelEntry {
                 context: Some(ctx),
-                max_output: m
-                    .top_provider
-                    .as_ref()
-                    .and_then(|p| p.max_completion_tokens),
+                max_output,
                 source: Some(OPENROUTER_URL.into()),
                 verified_at: Some(today.into()),
+                free: Some(is_free),
+                chat,
             },
         );
         stats.added.push(m.id);
@@ -593,6 +809,7 @@ fn merge_discovered(
     list_url: &str,
     ids: Vec<String>,
     openrouter_ctx_by_bare: &HashMap<String, u32>,
+    openrouter_max_output_by_bare: &HashMap<String, u32>,
     today: &str,
 ) -> MergeStats {
     let pc = cat
@@ -605,7 +822,17 @@ fn merge_discovered(
     let default_ctx = pc.default_context;
     let mut stats = MergeStats::default();
     for id in ids {
-        if pc.models.contains_key(&id) {
+        let mirrored_max_output = openrouter_max_output_by_bare.get(&id).copied();
+        if let Some(existing) = pc.models.get_mut(&id) {
+            // Backfill max_output on rows that pre-date the cap-tracking
+            // changes (existing seed runs left it None for OpenAI etc.).
+            // Treat OpenRouter's mirror value as authoritative — that's
+            // where every other path resolves the cap from.
+            if existing.max_output.is_none() {
+                if let Some(max) = mirrored_max_output {
+                    existing.max_output = Some(max);
+                }
+            }
             stats.unchanged += 1;
             continue;
         }
@@ -623,9 +850,11 @@ fn merge_discovered(
             id.clone(),
             ModelEntry {
                 context: Some(ctx),
-                max_output: None,
+                max_output: mirrored_max_output,
                 source: Some(source),
                 verified_at: Some(today.into()),
+                free: None,
+                chat: None,
             },
         );
         stats.added.push(id);
@@ -666,6 +895,8 @@ fn merge_gemini(cat: &mut Catalogue, rows: Vec<GeminiModel>, today: &str) -> Mer
                 max_output: m.output_token_limit,
                 source: Some(GEMINI_URL.into()),
                 verified_at: Some(today.into()),
+                free: None,
+                chat: None,
             },
         );
         stats.added.push(id);
@@ -742,6 +973,54 @@ async fn fetch_deepseek(key: &str) -> Result<Vec<String>, String> {
     }
     let env: OpenAIEnvelope = resp.json().await.map_err(|e| format!("json: {e}"))?;
     Ok(env.data.into_iter().map(|m| m.id).collect())
+}
+
+/// Fetch the model list from Alibaba DashScope's OpenAI-compatible
+/// endpoint. Both `dashscope` (mainland) and `qwen-cloud`
+/// (Singapore / intl) speak the same wire shape — the same
+/// helper handles both, parameterised on URL + key. `base_url`
+/// is the override env var if set; otherwise the hard-coded
+/// default. Returns bare model ids (`qwen-max`, `qwen-plus`,
+/// `qwen3-coder-plus`, …); caller adds the provider-specific
+/// `dashscope/` or `qc/` prefix.
+async fn fetch_dashscope(url: &str, key: &str) -> Result<Vec<String>, String> {
+    let resp = client()?
+        .get(url)
+        .bearer_auth(key)
+        .send()
+        .await
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("dashscope HTTP {}", resp.status()));
+    }
+    let env: OpenAIEnvelope = resp.json().await.map_err(|e| format!("json: {e}"))?;
+    // Some DashScope responses include non-chat models (text-
+    // embedding-*, qwen-vl-*, reranker, etc.). Catalogue is for
+    // chat; filter to the `qwen-*` family minus embeddings /
+    // vision-only / audio variants. Power users can hand-edit
+    // `model_catalogue.json` if they want a specialised model.
+    Ok(env
+        .data
+        .into_iter()
+        .map(|m| m.id)
+        .filter(|id| {
+            // Chat-only roster. DashScope's /v1/models surfaces a
+            // lot of specialised endpoints — image generation
+            // (`qwen-image-*`), machine translation
+            // (`qwen-mt-*`), embeddings, rerankers, ASR, TTS,
+            // audio understanding. None of them speak the chat
+            // protocol we route through. Filter aggressively to
+            // keep the catalogue useful in the model picker.
+            id.starts_with("qwen")
+                && !id.contains("embedding")
+                && !id.contains("rerank")
+                && !id.contains("-audio")
+                && !id.contains("-tts")
+                && !id.contains("-asr")
+                && !id.contains("-image")
+                && !id.contains("-mt-")
+        })
+        .collect())
 }
 
 /// Fetch the model list from NSTDA's Thai LLM aggregator. The endpoint

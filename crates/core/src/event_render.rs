@@ -114,11 +114,22 @@ pub fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
             "file_size_mb": file_size_mb,
         })
         .to_string()],
-        ViewEvent::ErrorText(text) => vec![serde_json::json!({
-            "type": "chat_text_delta",
-            "text": format!("\n{}\n", strip_ansi(text)),
-        })
-        .to_string()],
+        ViewEvent::ErrorText(text) => {
+            // Distinct envelope so the chat UI can render a red-bordered
+            // error bubble — previously these were folded into
+            // `chat_text_delta` and appeared as ordinary assistant text,
+            // so users couldn't tell a 429/auth-failure from an actual
+            // response. Provider-shaped errors are humanized server-side
+            // (OpenRouter's `error.metadata.raw`, OpenAI's
+            // `error.message`); free-form text passes through unchanged.
+            let cleaned = strip_ansi(text);
+            let humanized = crate::providers::humanize_provider_error(&cleaned);
+            vec![serde_json::json!({
+                "type": "chat_error",
+                "text": humanized,
+            })
+            .to_string()]
+        }
         ViewEvent::McpAppCallToolResult {
             request_id,
             content,
@@ -593,6 +604,30 @@ mod chat_render_tests {
         assert_eq!(dispatches.len(), 1);
         let parsed: serde_json::Value = serde_json::from_str(&dispatches[0]).unwrap();
         assert_eq!(parsed["type"], "chat_done");
+    }
+
+    #[test]
+    fn error_text_renders_humanized_chat_error() {
+        let raw = r#"Error: provider error: http 429 Too Many Requests: {"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"foo is temporarily rate-limited upstream."}}}"#;
+        let dispatches = render_chat_dispatches(&ViewEvent::ErrorText(raw.into()));
+        assert_eq!(dispatches.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&dispatches[0]).unwrap();
+        assert_eq!(parsed["type"], "chat_error");
+        assert_eq!(
+            parsed["text"],
+            "Rate limited: foo is temporarily rate-limited upstream."
+        );
+    }
+
+    #[test]
+    fn error_text_falls_back_to_raw_when_unparseable() {
+        let raw = "Error: agent error: tool dispatcher panicked";
+        let dispatches = render_chat_dispatches(&ViewEvent::ErrorText(raw.into()));
+        assert_eq!(dispatches.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&dispatches[0]).unwrap();
+        assert_eq!(parsed["type"], "chat_error");
+        // No JSON to extract → original text passes through unchanged.
+        assert_eq!(parsed["text"], raw);
     }
 
     /// Restored chat history is rendered into the terminal as one

@@ -1024,12 +1024,26 @@ impl Agent {
                     .lock()
                     .expect("next_turn_chunk_timeout lock")
                     .clone();
+                // Cap the requested max_tokens against the model's
+                // documented `max_output` so we don't hit per-model 400s
+                // (e.g. gpt-4o = 16384, gpt-4-turbo = 4096). Pre-fix the
+                // default 32000 sailed through unchanged for any model
+                // with a smaller completion-token ceiling and the
+                // upstream rejected the entire turn. `None` means the
+                // catalogue doesn't track a cap — we trust
+                // `current_max_tokens` as authored.
+                let request_max_tokens = match crate::model_catalogue::effective_max_output(
+                    &active_model,
+                ) {
+                    Some(cap) => current_max_tokens.min(cap),
+                    None => current_max_tokens,
+                };
                 let req = StreamRequest {
                     model: active_model,
                     system: if system.is_empty() { None } else { Some(system.clone()) },
                     messages,
                     tools: tool_defs,
-                    max_tokens: current_max_tokens,
+                    max_tokens: request_max_tokens,
                     thinking_budget,
                     stream_chunk_timeout_override: chunk_timeout_override,
                 };

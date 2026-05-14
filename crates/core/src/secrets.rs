@@ -194,6 +194,43 @@ fn write_bundle(map: &std::collections::HashMap<String, String>) -> Result<()> {
     Ok(())
 }
 
+/// Direct keychain write that **bypasses** the user's
+/// `Backend::Dotenv` preference. SSO tokens (access / refresh /
+/// id) are short-lived secrets that explicitly never want to land
+/// in `.env`, so they go to keychain regardless of how the user
+/// configured provider-API-key storage. Each caller picks its own
+/// account name (typically a hash, so the entry doesn't leak
+/// what's inside).
+pub fn keychain_set_raw(account: &str, value: &str) -> Result<()> {
+    keyring::Entry::new(SERVICE, account)
+        .map_err(|e| Error::Config(format!("keychain open failed: {e}")))?
+        .set_password(value)
+        .map_err(|e| Error::Config(format!("keychain write failed: {e}")))
+}
+
+/// Direct keychain read counterpart to [`keychain_set_raw`]. Same
+/// rationale — SSO storage uses this, not [`get`], so a Dotenv-
+/// preferring user can still sign in.
+pub fn keychain_get_raw(account: &str) -> Option<String> {
+    if std::env::var("THCLAWS_DISABLE_KEYCHAIN").is_ok() {
+        return None;
+    }
+    keyring::Entry::new(SERVICE, account)
+        .ok()
+        .and_then(|e| e.get_password().ok())
+}
+
+/// Direct keychain delete. Used by SSO logout to clear stored
+/// sessions on Dotenv-preferring installs.
+pub fn keychain_clear_raw(account: &str) -> Result<()> {
+    let entry = keyring::Entry::new(SERVICE, account)
+        .map_err(|e| Error::Config(format!("keychain open failed: {e}")))?;
+    // `delete_credential` errors when the entry is absent — fine,
+    // treat as a no-op so logout is idempotent.
+    let _ = entry.delete_credential();
+    Ok(())
+}
+
 /// Store a key in the keychain. Respects the user's backend choice —
 /// when they picked `Dotenv`, returns an error up front instead of
 /// touching the keychain (which would trigger an OS prompt on macOS

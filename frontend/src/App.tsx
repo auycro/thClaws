@@ -4,6 +4,7 @@ import { TerminalView } from "./components/TerminalView";
 import { ChatView } from "./components/ChatView";
 import { FilesView } from "./components/FilesView";
 import { TeamView } from "./components/TeamView";
+import { LoginButton } from "./components/LoginButton";
 import { Sidebar } from "./components/Sidebar";
 import { PlanSidebar } from "./components/PlanSidebar";
 import { GoalSidebar } from "./components/GoalSidebar";
@@ -495,12 +496,7 @@ export default function App() {
           </button>
         ))}
         <div className="flex-1" />
-        <span
-          className="text-[10px] px-3"
-          style={{ color: "var(--text-secondary)" }}
-        >
-          thClaws
-        </span>
+        <LoginButton />
       </div>
 
       {/* Main content */}

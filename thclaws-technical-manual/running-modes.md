@@ -194,6 +194,25 @@ return run_repl(config).await;
 
 **Frontend protocol**: same JSON message envelopes the WS transport in `--serve` mode uses. `useIPC.ts` detects `window.ipc` (wry) vs WebSocket (web) at module-load and picks the right `send()` / `subscribe()`.
 
+**Error envelopes** (v0.9.5+): `ViewEvent::ErrorText` no longer
+folds into `chat_text_delta`. `event_render::render_chat_dispatches`
+emits a distinct `{type: "chat_error", text: …}` envelope where the
+text has been run through `crate::providers::humanize_provider_error`.
+The humanizer parses the `http <status>: <json>` shape providers
+return on 4xx/5xx and extracts `error.metadata.raw` →
+`error.message` → `message` (first non-empty wins), prefixing with a
+status-class label (`Rate limited`, `Auth failed`, `Credits
+required`, `Provider error`). Falls back to the original text on
+parse failure. The React frontend renders `chat_error` as a centered
+red-bordered bubble with a ⚠ glyph instead of appending to the
+last assistant bubble — pre-fix a 429 wall of JSON read as ordinary
+assistant output and users described it as "silently failed". The
+LINE/browser bridge translator (`view_event_to_chat_envelope` in
+`shared_session.rs`) applies the same humanizer to its existing
+`{type: "error", text}` payload so the browser SPA's `case "error"`
+arm gets the cleaned message too. Terminal pane keeps its red-ANSI
+rendering unchanged.
+
 **Approval surface**: `GuiApprover` — frontend modal popup. The `approval_request` IPC envelope carries an `id`; the user's click → `approval_response` with the same id → resolves the worker's pending oneshot. AskUserQuestion uses the same pattern via `pending_asks: HashMap<u64, oneshot::Sender<String>>`.
 
 **Tools available**: full set including the desktop-only File browser tab (`file_list` / `file_read` / `file_write` IPCs), Team tab (`team_list` / `team_send_message`), MCP-Apps widgets (iframe alongside chat tool results).

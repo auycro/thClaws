@@ -597,15 +597,23 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
             // "is the WS task running RIGHT NOW", but for first-
             // paint we only need "is this install paired?", which
             // is a cheap file existence check.
-            let (state_str, server_url) = match crate::line::LineConfig::load() {
-                Ok(Some(cfg)) => ("connected".to_string(), cfg.resolved_server_url()),
-                _ => ("disconnected".to_string(), String::new()),
-            };
+            let (state_str, server_url, display_name, picture_url) =
+                match crate::line::LineConfig::load() {
+                    Ok(Some(cfg)) => (
+                        "connected".to_string(),
+                        cfg.resolved_server_url(),
+                        cfg.display_name.clone(),
+                        cfg.picture_url.clone(),
+                    ),
+                    _ => ("disconnected".to_string(), String::new(), None, None),
+                };
             let payload = serde_json::json!({
                 "type": "line_status",
                 "state": state_str,
                 "server_url": server_url,
                 "pending_approvals": 0,
+                "display_name": display_name,
+                "picture_url": picture_url,
             });
             (ctx.dispatch)(payload.to_string());
         }
@@ -677,11 +685,18 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                     (dispatch)(payload.to_string());
                     return;
                 }
-                // Expected shape: {token, line_user_id, expires_at}
-                let parsed: Result<serde_json::Value, _> = serde_json::from_str(&response_text);
+                // Expected shape:
+                //   {token, line_user_id, expires_at,
+                //    display_name?, picture_url?, language?}
+                // Profile fields are optional — older relays don't
+                // send them; relay also omits when LINE API fetch
+                // failed.
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&response_text).unwrap_or(serde_json::Value::Null);
                 let token = parsed
-                    .ok()
-                    .and_then(|v| v.get("token").and_then(|t| t.as_str()).map(String::from));
+                    .get("token")
+                    .and_then(|t| t.as_str())
+                    .map(String::from);
                 let token = match token {
                     Some(t) if !t.is_empty() => t,
                     _ => {
@@ -694,9 +709,18 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                         return;
                     }
                 };
+                let pick_str = |key: &str| -> Option<String> {
+                    parsed.get(key).and_then(|v| v.as_str()).map(String::from)
+                };
+                let display_name = pick_str("display_name");
+                let picture_url = pick_str("picture_url");
+                let language = pick_str("language");
                 let cfg = crate::line::LineConfig {
                     binding_token: token,
                     server_url: Some(server_url.clone()),
+                    display_name: display_name.clone(),
+                    picture_url: picture_url.clone(),
+                    language,
                 };
                 if let Err(e) = cfg.save() {
                     let payload = serde_json::json!({
@@ -1111,6 +1135,43 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
             (ctx.dispatch)(payload.to_string());
         }
 
+        "openrouter_free_only_get" => {
+            let enabled = crate::config::AppConfig::load()
+                .map(|c| c.openrouter_free_only)
+                .unwrap_or(false);
+            let payload = serde_json::json!({
+                "type": "openrouter_free_only",
+                "enabled": enabled,
+            });
+            (ctx.dispatch)(payload.to_string());
+        }
+
+        "openrouter_free_only_set" => {
+            let enabled = msg
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let mut cfg = crate::config::ProjectConfig::load().unwrap_or_default();
+            cfg.openrouter_free_only = Some(enabled);
+            let (ok, error) = match cfg.save() {
+                Ok(()) => (true, String::new()),
+                Err(e) => (false, e.to_string()),
+            };
+            let payload = serde_json::json!({
+                "type": "openrouter_free_only_result",
+                "enabled": enabled,
+                "ok": ok,
+                "error": error,
+            });
+            (ctx.dispatch)(payload.to_string());
+            // Reload AppConfig in the live shell so /models sees the
+            // new flag without requiring a restart.
+            let _ = ctx
+                .shared
+                .input_tx
+                .send(crate::shared_session::ShellInput::ReloadConfig);
+        }
+
         // ── KMS sidebar mutators (M6.36 SERVE9f) ───────────────────
         "kms_toggle" => {
             let name = msg
@@ -1252,17 +1313,40 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                     });
                     (ctx.dispatch)(broadcast.to_string());
                     let cat = crate::model_catalogue::EffectiveCatalogue::load();
-                    let models = cat.list_models_for_provider(provider);
+                    let mut models = cat.list_models_for_provider(provider);
+                    models.retain(|(_, e)| e.chat != Some(false));
+                    if provider == "openrouter" && new_cfg.openrouter_free_only {
+                        models.retain(|(_, e)| e.free == Some(true));
+                    }
                     let runtime_loaded =
                         matches!(provider, "ollama" | "ollama-anthropic" | "lmstudio");
                     if models.len() >= 3 && !runtime_loaded {
+                        let kind = crate::providers::ProviderKind::detect(&new_cfg.model);
                         let model_rows: Vec<serde_json::Value> = models
                             .iter()
                             .map(|(id, e)| {
+                                // Canonicalize so the model_set IPC
+                                // receives an id that ProviderKind::detect
+                                // can route (catalogue stores OpenRouter
+                                // ids without the `openrouter/` prefix).
+                                let canonical = match kind {
+                                    Some(k)
+                                        if crate::providers::ProviderKind::detect(id)
+                                            != Some(k) =>
+                                    {
+                                        format!("{provider}/{id}")
+                                    }
+                                    _ => id.clone(),
+                                };
                                 serde_json::json!({
-                                    "id": id,
+                                    "id": canonical,
                                     "context": e.context,
                                     "max_output": e.max_output,
+                                    // Plan-10: surfaced for the
+                                    // OpenRouter "Free only" toggle
+                                    // in the Settings modal. Other
+                                    // providers leave this None.
+                                    "free": e.free,
                                 })
                             })
                             .collect();
@@ -1478,6 +1562,13 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
 
         "sso_login" => {
             let dispatch = ctx.dispatch.clone();
+            // Optional `provider` field: chooses a builtin (google /
+            // azure) when no EE policy is active. Ignored under EE
+            // override — the org-pinned IdP wins regardless.
+            let requested_provider = msg
+                .get("provider")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             tokio::spawn(async move {
                 let policy = match crate::policy::active()
                     .and_then(|a| a.policy.policies.sso.as_ref())
@@ -1485,14 +1576,43 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                 {
                     Some(p) if p.enabled => p,
                     _ => {
-                        let payload = serde_json::json!({
-                            "type": "sso_state",
-                            "enabled": false,
-                            "logged_in": false,
-                            "error": "SSO not enabled in org policy",
-                        });
-                        dispatch(payload.to_string());
-                        return;
+                        // No EE policy → fall back to the standard
+                        // builtin route (Google now; Azure once
+                        // registered). The frontend should always send
+                        // a `provider` field in this mode, but be
+                        // defensive: default to the first configured
+                        // builtin so a misbehaving client doesn't
+                        // silently no-op.
+                        let chosen = requested_provider
+                            .as_deref()
+                            .and_then(crate::sso::builtin::BuiltinProvider::from_id)
+                            .or_else(|| crate::sso::builtin::available().into_iter().next());
+                        let Some(provider) = chosen else {
+                            let payload = serde_json::json!({
+                                "type": "sso_state",
+                                "enabled": true,
+                                "managed": false,
+                                "logged_in": false,
+                                "providers": [],
+                                "error": "no SSO provider configured (set GOOGLE_CLIENT_ID in .env)",
+                            });
+                            dispatch(payload.to_string());
+                            return;
+                        };
+                        match provider.resolve() {
+                            Ok(p) => p,
+                            Err(e) => {
+                                let payload = serde_json::json!({
+                                    "type": "sso_state",
+                                    "enabled": true,
+                                    "managed": false,
+                                    "logged_in": false,
+                                    "error": format!("provider not configured: {e}"),
+                                });
+                                dispatch(payload.to_string());
+                                return;
+                            }
+                        }
                     }
                 };
                 match crate::sso::login(&policy).await {
@@ -1514,8 +1634,18 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
         }
 
         "sso_logout" => {
+            // Clear the EE policy session (if any) and every builtin
+            // session — keeps the keychain clean and the UI in a known
+            // post-logout state regardless of which path produced the
+            // active session. Errors are swallowed: a missing keychain
+            // entry isn't a user-facing failure.
             if let Some(p) = crate::policy::active().and_then(|a| a.policy.policies.sso.as_ref()) {
                 let _ = crate::sso::logout(p);
+            }
+            for provider in crate::sso::builtin::available() {
+                if let Ok(p) = provider.resolve() {
+                    let _ = crate::sso::logout(&p);
+                }
             }
             (ctx.dispatch)(crate::sso::build_state_payload().to_string());
         }

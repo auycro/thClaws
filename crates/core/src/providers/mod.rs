@@ -61,6 +61,13 @@ pub enum ProviderKind {
     AgentSdk,
     OpenAI,
     OpenAIResponses,
+    /// ChatGPT-subscription Codex auth path. Same Responses-API wire
+    /// shape as [`OpenAIResponses`] but targets `chatgpt.com/backend-api/codex`
+    /// with a Bearer access_token (from [`crate::codex_auth`]) plus the
+    /// `chatgpt-account-id` / `originator` / `OpenAI-Beta` headers. Auth
+    /// is read from `~/.config/thclaws/auth/<profile>.json` (auto-imported
+    /// from `~/.codex/auth.json` if absent).
+    ChatGptCodex,
     OpenRouter,
     Gemini,
     Ollama,
@@ -89,6 +96,7 @@ impl ProviderKind {
         Self::AgentSdk,
         Self::OpenAI,
         Self::OpenAIResponses,
+        Self::ChatGptCodex,
         Self::OpenRouter,
         Self::Gemini,
         Self::Ollama,
@@ -113,6 +121,7 @@ impl ProviderKind {
             Self::AgentSdk => "anthropic-agent",
             Self::OpenAI => "openai",
             Self::OpenAIResponses => "openai-responses",
+            Self::ChatGptCodex => "chatgpt-codex",
             Self::OpenRouter => "openrouter",
             Self::Gemini => "gemini",
             Self::Ollama => "ollama",
@@ -138,6 +147,7 @@ impl ProviderKind {
             Self::AgentSdk => "agent/claude-sonnet-4-6",
             Self::OpenAI => "gpt-4o",
             Self::OpenAIResponses => "codex/gpt-5.2-codex",
+            Self::ChatGptCodex => "chatgpt-codex/gpt-5.4",
             Self::OpenRouter => "openrouter/anthropic/claude-sonnet-4-6",
             // Pinned to a versioned ID (matching Anthropic / OpenAI
             // convention) rather than `gemini-flash-latest` — `-latest`
@@ -304,6 +314,9 @@ impl ProviderKind {
             Self::AgentSdk => None, // Uses Claude Code's own auth
             Self::OpenAI => Some("OPENAI_API_KEY"),
             Self::OpenAIResponses => Some("OPENAI_API_KEY"),
+            // ChatGptCodex auths via OAuth access_token stored in
+            // ~/.config/thclaws/auth/<profile>.json — no env var.
+            Self::ChatGptCodex => None,
             Self::OpenRouter => Some("OPENROUTER_API_KEY"),
             Self::Gemini => Some("GEMINI_API_KEY"),
             Self::Ollama => None,
@@ -407,6 +420,7 @@ impl ProviderKind {
             // surprise-switching to a different provider.
             Self::OpenAI
             | Self::OpenAIResponses
+            | Self::ChatGptCodex
             | Self::AgentSdk
             | Self::Ollama
             | Self::OllamaAnthropic
@@ -437,6 +451,11 @@ impl ProviderKind {
             Some(Self::AgentSdk)
         } else if model.starts_with("claude-") {
             Some(Self::Anthropic)
+        } else if model.starts_with("chatgpt-codex/") {
+            // ChatGPT-subscription Codex path — MUST be checked before the
+            // bare `codex/` / `model.contains("codex")` arm below, else
+            // the broader match steals the route.
+            Some(Self::ChatGptCodex)
         } else if model.starts_with("codex/") || model.contains("codex") {
             Some(Self::OpenAIResponses)
         } else if model.starts_with("gpt-")
@@ -564,6 +583,103 @@ pub(crate) fn redact_key(text: &str, key: &str) -> String {
         return text.to_string();
     }
     text.replace(key, "<redacted-api-key>")
+}
+
+/// Turn a provider error string into a one-line human-readable message
+/// the chat UI can show in an error bubble. Handles the common shape
+/// providers surface as `Error::Provider("http <status> <text>: <body>")`,
+/// where `<body>` is usually JSON. OpenRouter's body looks like
+/// `{"error":{"message":"Provider returned error","code":429,
+/// "metadata":{"raw":"..., add your own key to ..."}}}` — the
+/// `metadata.raw` field is the one a human needs to read; the rest is
+/// machine framing the user shouldn't have to skim.
+///
+/// Returns the cleanest available message, prefixed with a status-class
+/// label (`Rate limited`, `Auth failed`, …) when one can be derived
+/// from the HTTP status. Falls back to the original text when nothing
+/// parses.
+pub fn humanize_provider_error(raw: &str) -> String {
+    let trimmed = raw
+        .trim_start_matches("Error: ")
+        .trim_start_matches("provider error: ")
+        .trim();
+    let Some(brace) = trimmed.find('{') else {
+        return raw.to_string();
+    };
+    let head = trimmed[..brace].trim_end_matches(':').trim();
+    let body = &trimmed[brace..];
+
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return raw.to_string();
+    };
+    // Walk the known paths in priority order. OpenRouter exposes the
+    // upstream's human message at `error.metadata.raw`; OpenAI-shape
+    // bodies put it at `error.message`; some compat-layers flatten to
+    // `message`.
+    let extracted = v
+        .pointer("/error/metadata/raw")
+        .and_then(|x| x.as_str())
+        .or_else(|| v.pointer("/error/message").and_then(|x| x.as_str()))
+        .or_else(|| v.pointer("/message").and_then(|x| x.as_str()))
+        .map(|s| s.to_string());
+    let Some(msg) = extracted else {
+        return raw.to_string();
+    };
+
+    let label = if head.contains("429") {
+        "Rate limited"
+    } else if head.contains("401") || head.contains("403") {
+        "Auth failed"
+    } else if head.contains("402") {
+        "Credits required"
+    } else if head.contains("500")
+        || head.contains("502")
+        || head.contains("503")
+        || head.contains("504")
+    {
+        "Provider error"
+    } else if head.starts_with("http ") {
+        "HTTP error"
+    } else {
+        "Error"
+    };
+    format!("{label}: {msg}")
+}
+
+#[cfg(test)]
+mod humanize_tests {
+    use super::humanize_provider_error;
+
+    #[test]
+    fn openrouter_429_extracts_metadata_raw() {
+        let raw = r#"provider error: http 429 Too Many Requests: {"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"google/gemma-4-31b-it:free is temporarily rate-limited upstream. Please retry shortly.","provider_name":"Google AI Studio","is_byok":false}},"user_id":"user_2fB406KYrj4unLbk7vdmuNtcRrF"}"#;
+        let out = humanize_provider_error(raw);
+        assert_eq!(
+            out,
+            "Rate limited: google/gemma-4-31b-it:free is temporarily rate-limited upstream. Please retry shortly."
+        );
+    }
+
+    #[test]
+    fn openai_style_extracts_error_message() {
+        let raw = r#"provider error: http 401 Unauthorized: {"error":{"message":"Invalid API key provided.","type":"invalid_request_error"}}"#;
+        let out = humanize_provider_error(raw);
+        assert_eq!(out, "Auth failed: Invalid API key provided.");
+    }
+
+    #[test]
+    fn unparseable_falls_back_to_original() {
+        let raw = "provider error: connection refused";
+        let out = humanize_provider_error(raw);
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn server_5xx_labels_as_provider_error() {
+        let raw = r#"provider error: http 503 Service Unavailable: {"error":{"message":"Backend is busy"}}"#;
+        let out = humanize_provider_error(raw);
+        assert_eq!(out, "Provider error: Backend is busy");
+    }
 }
 
 /// Optional debug helper: when `THCLAWS_SHOW_RAW=1` (env) or
@@ -801,6 +917,9 @@ pub fn kind_has_credentials(kind: Option<ProviderKind>) -> bool {
 /// timeout` against a possibly-unreachable host).
 pub async fn build_all_models_payload() -> String {
     let cat = crate::model_catalogue::EffectiveCatalogue::load();
+    let free_only_or = crate::config::AppConfig::load()
+        .map(|c| c.openrouter_free_only)
+        .unwrap_or(false);
     let ollama_live: Vec<String> = {
         let base = std::env::var("OLLAMA_BASE_URL")
             .unwrap_or_else(|_| crate::providers::ollama::DEFAULT_BASE_URL.to_string());
@@ -820,7 +939,14 @@ pub async fn build_all_models_payload() -> String {
         let name = kind.name();
         let mut model_ids: std::collections::BTreeMap<String, Option<u32>> =
             std::collections::BTreeMap::new();
+        let is_openrouter = matches!(kind, ProviderKind::OpenRouter);
         for (id, entry) in cat.list_models_for_provider(name) {
+            if entry.chat == Some(false) {
+                continue;
+            }
+            if is_openrouter && free_only_or && entry.free != Some(true) {
+                continue;
+            }
             let canonical = if ProviderKind::detect(&id) == Some(*kind) {
                 id
             } else {

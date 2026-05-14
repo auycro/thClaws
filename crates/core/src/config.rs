@@ -123,6 +123,14 @@ pub struct AppConfig {
     #[serde(default)]
     pub claude_md_compat: bool,
 
+    /// When `true` and the active provider is OpenRouter, both the
+    /// `/models` slash command and the post-key-entry model picker
+    /// hide non-free rows. Persists at the project level so a user
+    /// can keep "free only" on for a side project and off for paid
+    /// work in another repo. Other providers ignore the flag.
+    #[serde(default)]
+    pub openrouter_free_only: bool,
+
     /// Per-skill model recommendations from settings.json. Overrides the
     /// `model:` field declared in the SKILL.md frontmatter for the named
     /// built-in skill. Lets users say "for my extract-and-save runs use
@@ -187,6 +195,7 @@ impl Default for AppConfig {
             mcp_servers: Vec::new(),
             kms_active: Vec::new(),
             claude_md_compat: false,
+            openrouter_free_only: false,
             extract_save_skill_models: None,
             translator_subagent_model: None,
         }
@@ -357,6 +366,11 @@ pub struct ProjectConfig {
     pub show_raw_response: Option<bool>,
     /// Knowledge-base settings — `{ "active": ["name1", ...] }`.
     pub kms: Option<KmsSettings>,
+    /// When set, applies to AppConfig.openrouter_free_only on load.
+    /// Stored as Option so a missing field falls through to the
+    /// compiled default (`false`).
+    #[serde(rename = "openrouterFreeOnly")]
+    pub openrouter_free_only: Option<bool>,
 }
 
 fn null_team_enabled_is_false<'de, D>(d: D) -> std::result::Result<Option<bool>, D::Error>
@@ -387,6 +401,7 @@ impl Default for ProjectConfig {
             team_enabled: Some(false),
             show_raw_response: None,
             kms: None,
+            openrouter_free_only: None,
         }
     }
 }
@@ -493,6 +508,7 @@ impl ProjectConfig {
   "extract_save_skill_models": null,
   "translator_subagent_model": null,
   "claude_md_compat": false,
+  "openrouterFreeOnly": false,
   "kms": { "active": [] }
 }
 "#;
@@ -579,6 +595,9 @@ impl ProjectConfig {
         }
         if let Some(ref m) = self.translator_subagent_model {
             config.translator_subagent_model = Some(m.clone());
+        }
+        if let Some(b) = self.openrouter_free_only {
+            config.openrouter_free_only = b;
         }
     }
 

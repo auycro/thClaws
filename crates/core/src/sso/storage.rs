@@ -71,12 +71,16 @@ impl Session {
 }
 
 /// Persist a session to the keychain. Overwrites any existing entry
-/// for the same issuer.
+/// for the same issuer. Uses [`crate::secrets::keychain_set_raw`]
+/// rather than the policy-respecting `set` because SSO tokens never
+/// belong in `.env` — a user who picked Dotenv for API-key storage
+/// still needs working SSO. The raw helper bypasses the Dotenv
+/// preference and goes straight to the OS keychain.
 pub fn save(session: &Session) -> crate::error::Result<()> {
     let key = cache_key(&session.issuer);
     let body = serde_json::to_string(session)
         .map_err(|e| crate::error::Error::Tool(format!("serialize SSO session: {e}")))?;
-    crate::secrets::set(&key, &body)
+    crate::secrets::keychain_set_raw(&key, &body)
         .map_err(|e| crate::error::Error::Tool(format!("save SSO session: {e}")))
 }
 
@@ -85,7 +89,7 @@ pub fn save(session: &Session) -> crate::error::Result<()> {
 /// (treat as "no session" — the user needs to re-login).
 pub fn load(issuer: &str) -> Option<Session> {
     let key = cache_key(issuer);
-    let raw = crate::secrets::get(&key)?;
+    let raw = crate::secrets::keychain_get_raw(&key)?;
     serde_json::from_str(&raw).ok()
 }
 
@@ -94,11 +98,7 @@ pub fn load(issuer: &str) -> Option<Session> {
 /// shouldn't error).
 pub fn clear(issuer: &str) -> crate::error::Result<()> {
     let key = cache_key(issuer);
-    // The secrets module's set("") effectively blanks an entry; some
-    // keychain backends don't expose delete cleanly. Set an empty
-    // string and rely on `load()` to treat parse-fail as "no session".
-    let _ = crate::secrets::set(&key, "");
-    Ok(())
+    crate::secrets::keychain_clear_raw(&key)
 }
 
 /// Compute the keychain entry name for an issuer. Hashing keeps the

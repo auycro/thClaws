@@ -133,6 +133,8 @@ pub enum ProviderKind {
 | `AgenticPress` | OpenAI Chat | `ap/gemma4-12b` | `ap/` | `AGENTIC_PRESS_LLM_API_KEY` | — | llm.artech.cloud (fixed) | no |
 | `OpenRouter` | OpenAI Chat | `openrouter/anthropic/claude-sonnet-4-6` | `openrouter/` | `OPENROUTER_API_KEY` | — | openrouter.ai (fixed) | no |
 | `DashScope` | OpenAI Chat | `qwen-max` | `qwen`/`qwq-` | `DASHSCOPE_API_KEY` | `DASHSCOPE_BASE_URL` | dashscope.aliyuncs.com/compatible-mode/v1 | no |
+| `QwenCloud` | OpenAI Chat | `qc/qwen-max` | `qc/` | `DASHSCOPE_API_KEY` | `QWENCLOUD_BASE_URL` | dashscope-intl.aliyuncs.com/compatible-mode/v1 | no |
+| `ChatGptCodex` | OpenAI Responses | `chatgpt-codex/gpt-5.4` | `chatgpt-codex/` (checked BEFORE `codex/`) | — (OAuth via Codex CLI auto-imported from `~/.codex/auth.json`) | — | chatgpt.com/backend-api/codex/responses (fixed, undocumented) | no |
 | `ZAi` | OpenAI Chat | `zai/glm-4.6` | `zai/` | `ZAI_API_KEY` | `ZAI_BASE_URL` | api.z.ai/api/coding/paas/v4 | no |
 | `LMStudio` | OpenAI Chat | `lmstudio/llama-3.2-3b-instruct` | `lmstudio/` | none | `LMSTUDIO_BASE_URL` | localhost:1234/v1 | yes |
 | `OpenAICompat` | OpenAI Chat | `oai/gpt-4o-mini` | `oai/` | `OPENAI_COMPAT_API_KEY` | `OPENAI_COMPAT_BASE_URL` | localhost:8000/v1 | yes |
@@ -157,11 +159,13 @@ pub fn detect(model: &str) -> Option<Self> {
     else if model.starts_with("ap/") { Some(Self::AgenticPress) }
     else if model.starts_with("agent/") { Some(Self::AgentSdk) }
     else if model.starts_with("claude-") { Some(Self::Anthropic) }
+    else if model.starts_with("chatgpt-codex/") { Some(Self::ChatGptCodex) }  // BEFORE codex/
     else if model.starts_with("codex/") || model.contains("codex") { Some(Self::OpenAIResponses) }
     else if model.starts_with("gpt-") || model.starts_with("o1-")
          || model.starts_with("o3-") || model.starts_with("o3")
          || model.starts_with("o4-") { Some(Self::OpenAI) }
     else if model.starts_with("gemini-") || model.starts_with("gemma-") { Some(Self::Gemini) }
+    else if model.starts_with("qc/") { Some(Self::QwenCloud) }
     else if model.starts_with("qwen") || model.starts_with("qwq-") { Some(Self::DashScope) }
     else if model.starts_with("deepseek-") { Some(Self::DeepSeek) }
     else if model.starts_with("thaillm/") { Some(Self::ThaiLLM) }

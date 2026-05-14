@@ -1,6 +1,6 @@
 # Chapter 6 — Providers, models & API keys
 
-thClaws talks to **thirteen providers**, auto-detected from the model name.
+thClaws talks to **twenty-one providers**, auto-detected from the model name.
 Switch any time with `/model`, `/provider`, or by clicking the provider/model
 chip in the sidebar (Desktop GUI, v0.7.2+).
 
@@ -13,12 +13,14 @@ chip in the sidebar (Desktop GUI, v0.7.2+).
 | Anthropic Agent SDK | `agent/*` | — (uses Claude Code's own auth) | Drives the `claude` CLI under your Claude Pro / Max subscription instead of API billing. ⚠ thClaws's tool registry doesn't cross the subprocess boundary — the model only sees Claude Code's built-in toolset. KMS / MCP / Agent Teams tools are unreachable from this provider; switch to `claude-*` for those. |
 | OpenAI | `gpt-*`, `o1-*`, `o3*`, `o4-*` | `OPENAI_API_KEY` | Chat Completions; automatic prompt caching |
 | OpenAI Responses | `codex/*` | `OPENAI_API_KEY` | Responses API — newer agentic-native shape |
+| ChatGPT Codex | `chatgpt-codex/*` | — (OAuth via Codex CLI) | Runs Codex models against `chatgpt.com/backend-api/codex/responses`, **billed against your ChatGPT Plus/Pro/Team subscription** instead of a paid OpenAI API key. Auth is auto-imported from the official Codex CLI's `~/.codex/auth.json` (run `codex login` once). Default `chatgpt-codex/gpt-5.4`. Added in v0.9.5 |
 | OpenAI-Compatible | `oai/*` | `OPENAI_COMPAT_API_KEY` (+ `OPENAI_COMPAT_BASE_URL`) | Generic OAI-compat endpoint — point at any LiteLLM/Portkey/Helicone/vLLM/internal-proxy that speaks `/v1/chat/completions`; `oai/` prefix stripped before forwarding |
 | OpenRouter | `openrouter/*` | `OPENROUTER_API_KEY` | Unified gateway to 300+ models across every major LLM vendor |
 | Gemini | `gemini-*`, `gemma-*` | `GEMINI_API_KEY` | Gemma served via Google AI Studio |
 | Ollama | `ollama/*` | — (local) | NDJSON streaming; no auth |
 | Ollama Anthropic | `oa/*` | — (local, v0.14+) | Ollama's Anthropic-compatible `/v1/messages` endpoint |
-| DashScope | `qwen-*`, `qwq-*` | `DASHSCOPE_API_KEY` | Alibaba Qwen; automatic caching |
+| DashScope | `qwen-*`, `qwq-*` | `DASHSCOPE_API_KEY` | Alibaba Qwen mainland endpoint (`dashscope.aliyuncs.com`); automatic caching |
+| QwenCloud | `qc/*` | `DASHSCOPE_API_KEY` (+ `QWENCLOUD_BASE_URL`) | Alibaba DashScope **Singapore** region (`dashscope-intl.aliyuncs.com`). Same Qwen catalogue as DashScope but lower latency from outside mainland China. `qc/` prefix stripped on the wire so the upstream sees the bare `qwen-*` id. Added in v0.9.0 |
 | DeepSeek | `deepseek-*` | `DEEPSEEK_API_KEY` (+ `DEEPSEEK_BASE_URL`) | V4 line: `deepseek-v4-flash`, `deepseek-v4-pro`. Older aliases `deepseek-chat` / `deepseek-reasoner` still work as wire-level aliases |
 | ThaiLLM (NSTDA) | `thaillm/*` | `THAILLM_API_KEY` | Aggregator at `thaillm.or.th` for four 8B Thai-tuned models (OpenThaiGPT, Typhoon-S, Pathumma, THaLLE). Aliases (case-insensitive): `openthaigpt`, `typhoon`, `pathumma`, `thalle` |
 | Z.ai | `zai/*` | `ZAI_API_KEY` (+ `ZAI_BASE_URL`) | GLM Coding Plan endpoint at `api.z.ai`. Default `zai/glm-4.6`; latest `zai/glm-5.1` (202K context) added in v0.8.5. Override `ZAI_BASE_URL` for the general BigModel SKU at `open.bigmodel.cn` |
@@ -328,6 +330,47 @@ Good for:
 Note: OpenRouter adds a small markup on top of each vendor's cost.
 For high-volume production use, go direct to the source provider.
 
+### "Free only" toggle (v0.9.4+)
+
+OpenRouter ships a number of zero-cost models (`google/gemma-*:free`,
+`meta-llama/llama-3.3-70b-instruct:free`, `qwen/qwen3-coder:free`,
+etc. — typically rate-limited by the upstream provider but $0 / $0
+priced). Settings → API Keys → OpenRouter has a **Free only**
+checkbox that filters both the picker AND the `/models` slash command
+to rows the catalogue flagged with `free: true`:
+
+```
+❯ /models
+models — openrouter (29 entries, from catalogue, free only)
+  openrouter/google/gemma-4-31b-it:free               262K
+  openrouter/meta-llama/llama-3.3-70b-instruct:free    65K
+  openrouter/qwen/qwen3-coder:free                    262K
+  …
+```
+
+The flag persists in `.thclaws/settings.json` as
+`openrouterFreeOnly: true`. Toggle off any time to see the full
+catalogue again. Other providers ignore this flag — only OpenRouter
+publishes per-model pricing the catalogue can read.
+
+When `/models` returns fewer rows than you expect, two filters are
+always on regardless of the toggle: (1) rows flagged `chat: false`
+(audio / image / video / embedding generation — Lyria, Imagen,
+gpt-audio, etc.) never appear in the picker because the agent feeds
+the response straight into a chat bubble; (2) the catalogue refresh
+older than 24 h may be missing entries — run `/models refresh` to
+re-seed.
+
+### Canonical model IDs in /models output
+
+`/models` prints fully-qualified, copy-paste-able ids. OpenRouter
+rows show the `openrouter/<vendor>/<model>` prefix even though the
+on-disk catalogue stores them bare, because
+`ProviderKind::detect("google/gemma-…")` returns `None` without the
+prefix and `/model <id>` would error "unknown model provider".
+Anything you copy from `/models` straight into `/model <id>` will
+route correctly.
+
 ## Using a generic OpenAI-compatible endpoint (`oai/*`)
 
 The `OpenAICompat` provider is a single configurable slot for **any
@@ -381,3 +424,74 @@ the EE Phase 3 org-policy `gateway` route.
 If your endpoint also implements `/v1/models`, `/models refresh`
 will populate the catalogue automatically. If it doesn't, the
 refresh fails silently and chat continues to work.
+
+## Using ChatGPT-subscription Codex (`chatgpt-codex/*`)
+
+Runs Codex models against `chatgpt.com/backend-api/codex/responses`,
+**billed against a ChatGPT Plus / Pro / Team subscription** instead
+of a paid OpenAI API key. Same wire path the official Codex CLI
+uses.
+
+Setup is one-time, and thClaws piggy-backs on the official Codex
+CLI's auth:
+
+1. Install the Codex CLI (`npm i -g @openai/codex-cli` or follow
+   their docs).
+2. Run `codex login` once — opens a browser, you sign in to your
+   ChatGPT account, the CLI persists tokens at
+   `~/.codex/auth.json`.
+3. In thClaws: `/model chatgpt-codex/gpt-5.4` (or any other Codex
+   model under your subscription's tier).
+
+thClaws auto-imports the auth file on first use — no separate
+thClaws-side login. When the access token expires, re-run `codex
+login`; thClaws picks up the refreshed file on the next call.
+
+Caveats:
+
+- The endpoint is undocumented. OpenAI can change the wire shape
+  without notice. If you hit a 400 with an unexpected field name,
+  check the [thclaws issues](https://github.com/thClaws/thClaws/issues)
+  before debugging.
+- Subscription rate limits apply (typically much more generous than
+  free API tiers but still finite — heavy automation may hit them).
+- Token refresh is not yet automated inside thClaws (re-run `codex
+  login` when you see auth errors).
+
+Added in v0.9.5 via PR #88. Credits: ported from themion's
+`client_codex.rs`.
+
+## Sign in to thClaws Cloud (Google) — optional
+
+The top-right of the navbar has a **Sign in** button. Signing in
+with Google authenticates you against `cloud.thclaws.ai` and
+unlocks future cloud-side features (paid credit, the cloud gateway
+proxy planned in plan-09 — not yet live as of v0.9.5).
+
+**Important:** thClaws is fully usable without signing in. The
+button is opt-in; nothing breaks if you ignore it.
+
+The standard (non-enterprise) flow uses your own Google OAuth
+project — drop `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` into
+`.env` (or the workspace's environment) before launching:
+
+```sh
+GOOGLE_CLIENT_ID=...apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=GOCSPX-...
+```
+
+Then click **Sign in → Sign in with Google**. Browser opens →
+Google consent → desktop catches the callback → button switches to
+your email + a checkmark. Tokens land in your OS keychain (macOS
+Keychain / Windows Credential Manager / Linux Secret Service),
+**not in `.env`** — even when you've otherwise chosen the dotenv
+backend for API-key storage.
+
+Official thClaws builds (the dmg / msi distributed by the project)
+ship with bundled OAuth credentials so the button works out of the
+box. If you build from source, set the env vars as above.
+
+Enterprises that ship a signed policy file with `policies.sso`
+override the standard Google flow — the navbar shows their IdP
+instead. See the technical manual's SSO doc for the gateway-side
+verification model.

@@ -1,12 +1,63 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { send } from "../hooks/useIPC";
+import { send, subscribe } from "../hooks/useIPC";
 
 /// One row from the catalogue, as the backend ships it.
 export type PickerModel = {
   id: string;
   context?: number | null;
   max_output?: number | null;
+  /// `true` when the upstream provider lists this model as free
+  /// (both prompt + completion token prices = 0). Only populated
+  /// for OpenRouter today; other providers ship `null`.
+  free?: boolean | null;
 };
+
+/// localStorage key for the OpenRouter-only "Free only" toggle.
+/// Server-side `ProjectConfig.openrouterFreeOnly` is the source of
+/// truth — localStorage is only a fast-paint cache so the toggle
+/// renders in its last-known state before the `openrouter_free_only`
+/// IPC reply lands. Setting the flag fires `openrouter_free_only_set`
+/// so server-side `/models` and the post-key picker see it too.
+const OPENROUTER_FREE_ONLY_KEY = "thclaws.openrouter.freeOnly";
+
+export function isOpenRouterFreeOnly(): boolean {
+  try {
+    return localStorage.getItem(OPENROUTER_FREE_ONLY_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+export function setOpenRouterFreeOnly(value: boolean) {
+  try {
+    if (value) localStorage.setItem(OPENROUTER_FREE_ONLY_KEY, "1");
+    else localStorage.removeItem(OPENROUTER_FREE_ONLY_KEY);
+  } catch {
+    // localStorage write can fail in private mode; toggle just
+    // doesn't persist. Acceptable.
+  }
+  send({ type: "openrouter_free_only_set", enabled: value });
+}
+
+/// Ask the server for the canonical flag value and update the
+/// localStorage cache when the reply arrives. Returns the unsubscribe
+/// function so callers can clean up.
+export function refreshOpenRouterFreeOnly(onUpdate: (v: boolean) => void): () => void {
+  const unsub = subscribe((msg) => {
+    if (msg.type === "openrouter_free_only") {
+      const enabled = Boolean((msg as { enabled?: boolean }).enabled);
+      try {
+        if (enabled) localStorage.setItem(OPENROUTER_FREE_ONLY_KEY, "1");
+        else localStorage.removeItem(OPENROUTER_FREE_ONLY_KEY);
+      } catch {
+        // see setOpenRouterFreeOnly note
+      }
+      onUpdate(enabled);
+    }
+  });
+  send({ type: "openrouter_free_only_get" });
+  return unsub;
+}
 
 type Props = {
   provider: string;
@@ -14,6 +65,17 @@ type Props = {
   models: PickerModel[];
   onClose: () => void;
 };
+
+/// Strip the active provider's routing prefix from a model id for
+/// display. Keeps the underlying `m.id` intact so the value sent to
+/// the backend on `model_set` still routes correctly. Only strips
+/// the exact `${provider}/` prefix — incidental matches inside the
+/// rest of the id (e.g. `openrouter/anthropic/claude-...`) are
+/// preserved.
+function displayId(id: string, provider: string): string {
+  const prefix = `${provider}/`;
+  return id.startsWith(prefix) ? id.slice(prefix.length) : id;
+}
 
 /// Format a context window in a tight human form: 200_000 → "200k", etc.
 function formatCtx(n: number | null | undefined): string {
@@ -29,11 +91,23 @@ function formatCtx(n: number | null | undefined): string {
 /// the modal closes. Skipping leaves auto_fallback_model's choice in place.
 export function ModelPickerModal({ provider, current, models, onClose }: Props) {
   const [query, setQuery] = useState("");
+  // Local mirror of the server-side flag, cached in localStorage for
+  // first-paint. Only honoured for OpenRouter (other providers don't
+  // ship `free` data). On mount we ask the server for the canonical
+  // value to correct any drift between cache and ~/.thclaws/settings.
+  const [freeOnly, setFreeOnly] = useState<boolean>(() =>
+    provider === "openrouter" && isOpenRouterFreeOnly()
+  );
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
+
+  useEffect(() => {
+    if (provider !== "openrouter") return;
+    return refreshOpenRouterFreeOnly(setFreeOnly);
+  }, [provider]);
 
   // Esc to skip.
   useEffect(() => {
@@ -46,9 +120,20 @@ export function ModelPickerModal({ provider, current, models, onClose }: Props) 
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return models;
-    return models.filter((m) => m.id.toLowerCase().includes(q));
-  }, [models, query]);
+    let rows = models;
+    if (provider === "openrouter" && freeOnly) {
+      rows = rows.filter((m) => m.free === true);
+    }
+    if (q) {
+      // Match against both the canonical id and its display form so a
+      // search for `gemma-3-27b` hits `openrouter/google/gemma-3-27b-it:free`.
+      rows = rows.filter((m) => {
+        const idLower = m.id.toLowerCase();
+        return idLower.includes(q) || displayId(idLower, provider).includes(q);
+      });
+    }
+    return rows;
+  }, [models, query, provider, freeOnly]);
 
   const pick = (id: string) => {
     send({ type: "model_set", model: id });
@@ -81,6 +166,28 @@ export function ModelPickerModal({ provider, current, models, onClose }: Props) 
         </div>
 
         <div className="px-5 py-3 border-b" style={{ borderColor: "var(--border)" }}>
+          {provider === "openrouter" && (
+            <label
+              className="flex items-center gap-2 text-xs mb-2 select-none cursor-pointer"
+              style={{ color: "var(--text-secondary)" }}
+              title="Filter the list to OpenRouter models marked as $0 prompt + $0 completion."
+            >
+              <input
+                type="checkbox"
+                checked={freeOnly}
+                onChange={(e) => {
+                  setFreeOnly(e.target.checked);
+                  setOpenRouterFreeOnly(e.target.checked);
+                }}
+              />
+              <span>
+                Free only{" "}
+                <span style={{ opacity: 0.7 }}>
+                  ({models.filter((m) => m.free === true).length} of {models.length})
+                </span>
+              </span>
+            </label>
+          )}
           <input
             ref={inputRef}
             type="text"
@@ -138,15 +245,35 @@ export function ModelPickerModal({ provider, current, models, onClose }: Props) 
                       : "transparent")
                   }
                 >
-                  <span className="font-mono truncate">{m.id}</span>
-                  {ctx && (
-                    <span
-                      className="text-xs ml-3 shrink-0"
-                      style={{ color: "var(--text-secondary)" }}
-                    >
-                      {ctx} ctx
-                    </span>
-                  )}
+                  <span
+                    className="font-mono truncate"
+                    title={m.id}
+                  >
+                    {displayId(m.id, provider)}
+                  </span>
+                  <span className="flex items-center gap-2 ml-3 shrink-0">
+                    {m.free === true && (
+                      <span
+                        className="text-[10px] px-1.5 py-0.5 rounded font-medium"
+                        style={{
+                          background: "color-mix(in srgb, #3fb950 20%, transparent)",
+                          color: "#3fb950",
+                          border: "1px solid color-mix(in srgb, #3fb950 40%, transparent)",
+                        }}
+                        title="OpenRouter lists this model at $0 prompt + $0 completion."
+                      >
+                        FREE
+                      </span>
+                    )}
+                    {ctx && (
+                      <span
+                        className="text-xs"
+                        style={{ color: "var(--text-secondary)" }}
+                      >
+                        {ctx} ctx
+                      </span>
+                    )}
+                  </span>
                 </button>
               );
             })

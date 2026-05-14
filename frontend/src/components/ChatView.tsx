@@ -16,7 +16,7 @@ import {
 import { McpAppIframe } from "./McpAppIframe";
 
 type ChatMessage = {
-  role: "user" | "assistant" | "tool" | "system";
+  role: "user" | "assistant" | "tool" | "system" | "error";
   content: string;
   /// `assistant` messages only — accumulated `reasoning_content` from
   /// thinking models (DeepSeek v4/r1, OpenAI o-series, NVIDIA NIM
@@ -281,6 +281,20 @@ export function ChatView({ active, modalOpen }: Props) {
             }
             return [...prev, { role: "assistant", content: msg.text as string }];
           });
+          break;
+        case "chat_error":
+          // Provider / agent error surfaced as its own bubble (red
+          // border, ⚠ glyph) so a 429 / auth-failure / network blow-up
+          // is unambiguously an error rather than blending into the
+          // assistant's reply. Pre-fix the backend folded these into
+          // `chat_text_delta` and users saw a wall of provider JSON
+          // appended to the last assistant bubble.
+          firstByteSeenRef.current = true;
+          setWaitingFirstByte(false);
+          setMessages((prev) => [
+            ...prev,
+            { role: "error", content: msg.text as string },
+          ]);
           break;
         case "chat_thinking_delta":
           firstByteSeenRef.current = true;
@@ -878,6 +892,7 @@ export function ChatView({ active, modalOpen }: Props) {
 
           const isAssistant = msg.role === "assistant";
           const isSystem = msg.role === "system";
+          const isError = msg.role === "error";
           const copied = copiedMessageIndex === i;
           // Restored chat histories can be a wall of tool indicators
           // between user turns; an extra blank line before each user
@@ -890,7 +905,7 @@ export function ChatView({ active, modalOpen }: Props) {
           return (
             <div
               key={i}
-              className={`flex ${msg.role === "user" ? "justify-end" : isSystem ? "justify-center" : "justify-start"}${needsTurnGap ? " pt-4" : ""}`}
+              className={`flex ${msg.role === "user" ? "justify-end" : isSystem || isError ? "justify-center" : "justify-start"}${needsTurnGap ? " pt-4" : ""}`}
             >
               <div
                 className={`group relative max-w-[80%] rounded-lg py-2 pl-3 pr-9 text-sm ${isAssistant ? "" : "whitespace-pre-wrap"}`}
@@ -898,16 +913,24 @@ export function ChatView({ active, modalOpen }: Props) {
                   background:
                     msg.role === "user"
                       ? "var(--chat-user-bg)"
-                      : isSystem
-                        ? "transparent"
-                        : "var(--bg-secondary)",
+                      : isError
+                        ? "color-mix(in srgb, #f85149 12%, transparent)"
+                        : isSystem
+                          ? "transparent"
+                          : "var(--bg-secondary)",
                   color:
                     msg.role === "user"
                       ? "var(--chat-user-fg)"
-                      : isSystem
-                        ? "var(--text-secondary)"
-                        : "var(--text-primary)",
-                  border: isSystem ? "1px solid var(--border)" : "none",
+                      : isError
+                        ? "#f85149"
+                        : isSystem
+                          ? "var(--text-secondary)"
+                          : "var(--text-primary)",
+                  border: isError
+                    ? "1px solid color-mix(in srgb, #f85149 50%, transparent)"
+                    : isSystem
+                      ? "1px solid var(--border)"
+                      : "none",
                   fontFamily: isSystem
                     ? "Menlo, Monaco, 'Courier New', monospace"
                     : "inherit",
@@ -1002,6 +1025,13 @@ export function ChatView({ active, modalOpen }: Props) {
                       {stripThinkBlocks(msg.content)}
                     </ReactMarkdown>
                   </div>
+                ) : isError ? (
+                  <span>
+                    <span aria-hidden="true" style={{ marginRight: 6 }}>
+                      ⚠
+                    </span>
+                    {msg.content}
+                  </span>
                 ) : (
                   msg.content
                 )}

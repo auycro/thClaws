@@ -237,6 +237,8 @@ pub async fn dispatch(
                 max_output: None,
                 source: Some("override".into()),
                 verified_at: None,
+                free: None,
+                chat: None,
             };
             let cat = crate::model_catalogue::EffectiveCatalogue::load();
             let warn = cat.lookup_exact(&key).map(|n| size > n).unwrap_or(false);
@@ -335,6 +337,22 @@ pub async fn dispatch(
             // every non-Ollama provider.
             let mut rows = cat.list_models_for_provider(provider_name);
 
+            // Always drop rows the catalogue flagged as non-chat (e.g.
+            // Lyria → audio, Imagen → image). Rows with `chat: None`
+            // pass through — that's the legacy default for catalogue
+            // sources that don't publish modality info.
+            rows.retain(|(_, e)| e.chat != Some(false));
+
+            // "Free only" toggle: when the user opted in via Settings,
+            // the OpenRouter row list collapses to entries marked
+            // `free: true` (zero prompt + zero completion price). Only
+            // OpenRouter ships the `free` flag — every other provider
+            // is unaffected.
+            let free_only = provider_name == "openrouter" && state.config.openrouter_free_only;
+            if free_only {
+                rows.retain(|(_, e)| e.free == Some(true));
+            }
+
             // Ollama is per-machine, so the catalogue alone can't know what
             // the user has pulled — hit `/api/tags` too and union any new
             // ids (without context until `/model <id>` auto-scans them).
@@ -359,6 +377,8 @@ pub async fn dispatch(
                                             max_output: None,
                                             source: None,
                                             verified_at: None,
+                                            free: None,
+                                            chat: None,
                                         },
                                     ));
                                 }
@@ -375,24 +395,44 @@ pub async fn dispatch(
             }
 
             if rows.is_empty() {
-                emit(
-                    events_tx,
-                    format!("no models catalogued for '{provider_name}'. Run /models refresh."),
-                );
+                if free_only {
+                    emit(
+                        events_tx,
+                        "no free OpenRouter models in the catalogue. Turn off 'Free only' in Settings or run /models refresh."
+                            .to_string(),
+                    );
+                } else {
+                    emit(
+                        events_tx,
+                        format!("no models catalogued for '{provider_name}'. Run /models refresh."),
+                    );
+                }
                 return;
             }
 
             let mut out = format!(
-                "models — {provider_name} ({} entries, from catalogue{})\n",
+                "models — {provider_name} ({} entries, from catalogue{}{})\n",
                 rows.len(),
-                if is_ollama { " + /api/tags" } else { "" }
+                if is_ollama { " + /api/tags" } else { "" },
+                if free_only { ", free only" } else { "" },
             );
             for (id, entry) in &rows {
+                // Print the canonical (routable) id so users can copy a
+                // row verbatim into `/model <id>`. The catalogue stores
+                // OpenRouter / Nvidia / DashScope etc. with bare ids
+                // (e.g. `google/gemma-3-27b-it:free`) but those don't
+                // route through `ProviderKind::detect` without their
+                // provider prefix — pre-fix users hit "unknown model
+                // provider" when copying a row from /models output.
+                let canonical = match crate::providers::ProviderKind::detect(id) {
+                    Some(k) if k.name() == provider_name => id.clone(),
+                    _ => format!("{provider_name}/{id}"),
+                };
                 let ctx = entry
                     .context
                     .map(format_tokens)
                     .unwrap_or_else(|| "—".to_string());
-                out.push_str(&format!("  {:<40} {:>6}\n", id, ctx));
+                out.push_str(&format!("  {:<50} {:>6}\n", canonical, ctx));
             }
             if let Some(note) = live_note {
                 out.push_str(&format!("\n{note}\n"));
@@ -420,15 +460,35 @@ pub async fn dispatch(
                 let runtime_loaded = matches!(prov, "ollama" | "ollama-anthropic" | "lmstudio");
                 if !runtime_loaded {
                     let cat = crate::model_catalogue::EffectiveCatalogue::load();
-                    let models = cat.list_models_for_provider(prov);
+                    let mut models = cat.list_models_for_provider(prov);
+                    models.retain(|(_, e)| e.chat != Some(false));
+                    if prov == "openrouter" && state.config.openrouter_free_only {
+                        models.retain(|(_, e)| e.free == Some(true));
+                    }
                     if models.len() >= 3 {
+                        let kind = crate::providers::ProviderKind::detect(&state.config.model);
                         let model_rows: Vec<serde_json::Value> = models
                             .iter()
                             .map(|(id, e)| {
+                                // Catalogue stores OpenRouter ids without the
+                                // `openrouter/` prefix; ProviderKind::detect
+                                // needs it to route, so canonicalize before
+                                // shipping. React strips the prefix for
+                                // display (see ModelPickerModal).
+                                let canonical = match kind {
+                                    Some(k)
+                                        if crate::providers::ProviderKind::detect(id)
+                                            != Some(k) =>
+                                    {
+                                        format!("{prov}/{id}")
+                                    }
+                                    _ => id.clone(),
+                                };
                                 serde_json::json!({
-                                    "id": id,
+                                    "id": canonical,
                                     "context": e.context,
                                     "max_output": e.max_output,
+                                    "free": e.free,
                                 })
                             })
                             .collect();
@@ -3162,6 +3222,8 @@ async fn switch_model(
                         max_output: None,
                         source: Some(format!("ollama://{base}/api/show ({which})")),
                         verified_at: Some(crate::model_catalogue::today_iso()),
+                        free: None,
+                        chat: None,
                     };
                     match crate::model_catalogue::upsert_cache_entry(provider_key, &model_id, entry)
                     {

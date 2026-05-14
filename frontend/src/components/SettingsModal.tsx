@@ -2,6 +2,11 @@ import { useEffect, useState } from "react";
 import { KeyRound, X, Check, Trash2, Link as LinkIcon } from "lucide-react";
 import { send, subscribe } from "../hooks/useIPC";
 import { SecretsBackendDialog } from "./SecretsBackendDialog";
+import {
+  isOpenRouterFreeOnly,
+  setOpenRouterFreeOnly,
+  refreshOpenRouterFreeOnly,
+} from "./ModelPickerModal";
 
 type KeyStatus = {
   provider: string;
@@ -381,7 +386,37 @@ function renderProviderCard(
           hasKeyRow={Boolean(row.key)}
         />
       )}
+
+      {provider === "openrouter" && <OpenRouterFreeOnlyToggle />}
     </div>
+  );
+}
+
+/// OpenRouter-only inline toggle. When on, both the model picker
+/// and the `/models` slash command hide non-free rows. Persisted
+/// server-side via `openrouter_free_only_set` so the slash-command
+/// handler (server-side rendering) sees the same flag the UI shows.
+/// localStorage is just a fast-paint cache; the on-mount IPC fetch
+/// corrects drift against `.thclaws/settings.json`.
+function OpenRouterFreeOnlyToggle() {
+  const [on, setOn] = useState<boolean>(() => isOpenRouterFreeOnly());
+  useEffect(() => refreshOpenRouterFreeOnly(setOn), []);
+  return (
+    <label
+      className="flex items-center gap-2 mt-2 text-xs select-none cursor-pointer"
+      style={{ color: "var(--text-secondary)" }}
+      title="When on, the model picker and /models slash command show only OpenRouter models with $0 prompt + $0 completion pricing."
+    >
+      <input
+        type="checkbox"
+        checked={on}
+        onChange={(e) => {
+          setOn(e.target.checked);
+          setOpenRouterFreeOnly(e.target.checked);
+        }}
+      />
+      <span>Free only — filter the model picker and /models to $0 / $0 pricing</span>
+    </label>
   );
 }
 

@@ -34,7 +34,7 @@ tried first.
 |---|---|
 | `/help` | Show all built-in commands |
 | `/model [NAME]` | Show current model, or switch to NAME (validated; typos revert) |
-| `/models` | List available models from the current provider |
+| `/models` | List available models from the current provider — prints fully-qualified routable ids (e.g. `openrouter/google/gemma-3-27b-it:free`) so any row pastes straight into `/model <id>`. Non-chat models (audio/image generation) are filtered out automatically; OpenRouter rows also filter when "Free only" is on in Settings. `/models refresh` re-seeds from the upstream provider list |
 | `/provider [NAME]` | Show current provider, or switch |
 | `/providers` | List every provider + its default model |
 | `/save` | Force-save the current session to disk |

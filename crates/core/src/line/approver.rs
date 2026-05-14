@@ -291,19 +291,37 @@ impl ApprovalSink for LineApprover {
             pending.insert(request_id.clone(), tx);
         }
 
-        // Send the prompt. We do this through the *relay's* reply
-        // endpoint by reusing the same request id — that path is
-        // already authenticated via the JWT and falls back to push
-        // when the reply window has elapsed.
+        // Plan-10: if the user has a browser chat open, route the
+        // approval prompt there (free + rich-UI modal). Otherwise
+        // fall back to LINE OA push (Quick Reply chips, quota-
+        // using). Approval prompts are unsolicited — `/reply/:id`
+        // would 404 either way, so we use `/push` (LINE OA) or
+        // `/chat-bridge/event` (browser).
         if let Some(client) = &self.client {
             let prompt = Self::build_prompt(req);
             let buttons = Self::build_buttons(&request_id);
-            if let Err(e) = client
-                .send_reply_with_buttons(&request_id, prompt, buttons)
-                .await
-            {
+
+            if client.has_browser_connected().await {
+                // Browser modal. Envelope shape matches what the
+                // SPA's onmessage dispatch expects (see
+                // static/chat.html `case 'approval_request'`).
+                let envelope = serde_json::json!({
+                    "type": "approval_request",
+                    "id": request_id,
+                    "tool_name": req.tool_name,
+                    "prompt": prompt,
+                    "timeout_secs": self.timeout.as_secs(),
+                });
+                if let Err(e) = client.push_chat_event(envelope).await {
+                    eprintln!("[line] browser approval push failed: {e}; falling back to LINE OA");
+                    if let Err(e) = client.push_with_buttons(prompt, buttons).await {
+                        eprintln!("[line] LINE OA approval prompt ALSO failed: {e}; auto-denying");
+                        self.record_decision_by_id(&request_id, ApprovalDecision::Deny);
+                        return ApprovalDecision::Deny;
+                    }
+                }
+            } else if let Err(e) = client.push_with_buttons(prompt, buttons).await {
                 eprintln!("[line] approval prompt failed to send: {e}; auto-denying");
-                // Clean up the dangling pending entry.
                 self.record_decision_by_id(&request_id, ApprovalDecision::Deny);
                 return ApprovalDecision::Deny;
             }
@@ -327,10 +345,10 @@ impl ApprovalSink for LineApprover {
                 }
                 if let Some(client) = &self.client {
                     let _ = client
-                        .send_reply(
-                            &request_id,
-                            format!("⏰ Approval for {} timed out; auto-denied.", req.tool_name),
-                        )
+                        .push(format!(
+                            "⏰ Approval for {} timed out; auto-denied.",
+                            req.tool_name
+                        ))
                         .await;
                 }
                 ApprovalDecision::Deny

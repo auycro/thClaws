@@ -29,6 +29,7 @@
 //!   `/sso logout`, `/sso status`). GUI sidebar integration follows
 //!   in a Phase 4 follow-up commit.
 
+pub mod builtin;
 pub mod discovery;
 pub mod loopback;
 pub mod pkce;
@@ -485,20 +486,66 @@ fn open_browser(url: &str) -> std::io::Result<()> {
 /// M6.36 SERVE9h — moved from `gui.rs` so the WS transport's
 /// `sso_status` IPC arm can call it from the always-on dispatch table.
 pub fn build_state_payload() -> serde_json::Value {
-    let policy = crate::policy::active()
+    // Enterprise override path: a signed policy file with
+    // `policies.sso.enabled: true` wins over the standard built-in
+    // providers — enterprises that pinned thClaws to their own IdP
+    // expect the Google/Azure buttons to disappear.
+    let ee_policy = crate::policy::active()
         .and_then(|a| a.policy.policies.sso.as_ref())
         .cloned();
-    let policy = match policy {
-        Some(p) if p.enabled => p,
-        _ => {
-            return serde_json::json!({
+    if let Some(p) = ee_policy.filter(|p| p.enabled) {
+        return ee_state_payload(&p);
+    }
+
+    // Standard path: list the builtin providers whose env vars are set
+    // (so the UI knows which buttons to render) and surface the
+    // current session if one exists.
+    let providers: Vec<serde_json::Value> = builtin::available()
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "id": p.id(),
+                "label": p.label(),
+            })
+        })
+        .collect();
+    match builtin::current_session_any() {
+        Some((provider, s)) if !s.is_expired() => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let remaining = s.expires_at.saturating_sub(now);
+            serde_json::json!({
                 "type": "sso_state",
-                "enabled": false,
-                "logged_in": false,
-            });
+                "enabled": true,
+                "managed": false,
+                "logged_in": true,
+                "provider": provider.id(),
+                "issuer": s.issuer,
+                "email": s.email,
+                "name": s.name,
+                "sub": s.sub,
+                "expires_in_secs": remaining,
+                "providers": providers,
+            })
         }
-    };
-    match current_session(&policy) {
+        _ => serde_json::json!({
+            "type": "sso_state",
+            "enabled": true,
+            "managed": false,
+            "logged_in": false,
+            "providers": providers,
+        }),
+    }
+}
+
+/// Enterprise (policy-driven) state payload. Carried out so
+/// `build_state_payload` can branch cleanly. `managed: true` tells the
+/// UI to hide the provider picker and show a single "Sign in" button
+/// pointing at the org's IdP.
+fn ee_state_payload(policy: &SsoPolicy) -> serde_json::Value {
+    match current_session(policy) {
         Some(s) if !s.is_expired() => {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -508,6 +555,7 @@ pub fn build_state_payload() -> serde_json::Value {
             serde_json::json!({
                 "type": "sso_state",
                 "enabled": true,
+                "managed": true,
                 "logged_in": true,
                 "issuer": s.issuer,
                 "email": s.email,
@@ -519,6 +567,7 @@ pub fn build_state_payload() -> serde_json::Value {
         _ => serde_json::json!({
             "type": "sso_state",
             "enabled": true,
+            "managed": true,
             "logged_in": false,
             "issuer": policy.issuer_url,
         }),

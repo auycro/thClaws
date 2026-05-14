@@ -28,8 +28,9 @@ teams.
 | 17 | [Agent teams](ch17-agent-teams.md) |
 | 19 | [Scheduling](ch19-scheduling.md) |
 | 20 | [Background research (`/research`)](ch20-research.md) |
+| 21 | [LINE chat & web browser bridge](ch21-line-and-browser-chat.md) |
 
-> **Part II — Case studies (chapters 21–24)** — applied walkthroughs
+> **Part II — Case studies (chapters 22–25)** — applied walkthroughs
 > for building real projects with thClaws (static sites, Node.js apps,
 > AI agents, deploying to Agentic Press) are in active development and
 > will be added to this manual as each is reviewed and ready.
