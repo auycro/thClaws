@@ -161,28 +161,94 @@ the user back to `/chat` in LINE for a fresh link.
 ```rust
 pub enum Channel {
     Desktop,   // the thClaws Rust client
-    Browser,   // the chat.html SPA
+    Browser,   // the chat.html SPA  (queued for removal — see below)
 }
 ```
 
 The broker multiplexes events keyed by `(line_user_id, channel)`.
 Inbound LINE webhooks publish to `Channel::Desktop`; inbound
-browser keystrokes publish to `Channel::Browser`. Desktop's
-`POST /chat-bridge/event` fans every `ViewEvent` to BOTH channels
-so the browser sees the assistant's response too. The desktop's
+browser keystrokes publish to `Channel::Browser`. The desktop's
 `GET /chat-bridge/has-browser` returns `{browser_connected: bool}`
 so the `LineApprover` can decide between browser modal vs LINE
 Quick Reply at approval time.
 
-### History replay
+**v0.1.19 (line-server) Channel::Browser fan-out moved to Redis
+Stream.** Pre-fix the broker also routed every desktop-emitted
+`ViewEvent` to `Channel::Browser` via in-pod `mpsc` (fast) plus a
+Redis pubsub fallback (slow), and `/chat-ws` registered with the
+broker to receive that fan-out. As of [`1036c5d`](https://github.com/thClaws/thClaws/commit/1036c5d):
 
-`POST /chat-bridge/event` also `XADD MAXLEN ~50` to a Redis stream
-`chat_hist:{user}`. On every fresh browser connect, `/chat-ws`
-sends a `session_info` envelope followed by `XRANGE - +` of the
-stream, so the browser SPA can re-render the last ~50 events
-(assistant deltas, tool calls, approval prompts) even on
-mid-session reconnects. Empty history loads (new sessions) skip
-the replay block entirely.
+- `POST /chat-bridge/event` calls `chat_hist_push` (XADD only) —
+  no `broker.route(Channel::Browser, …)` anymore.
+- `/chat-ws` does NOT register/deregister with the broker for
+  Browser. After the history-replay block (next section), it
+  spawns a tail task that `XREAD BLOCK`s on the same stream and
+  forwards bytes to the WS via a local `mpsc`.
+- `Channel::Desktop` still routes through the broker — only the
+  Browser fan-out moved.
+
+Why: cluster runs N replicas, Traefik load-balances POSTs across
+them. Pre-fix, a `POST` landing on pod-A while the browser's WS
+held on pod-B took the slow Redis-pubsub path and could arrive
+out of order with a subsequent `POST` that LB'd back to pod-B.
+Redis Stream serialises XADDs server-side with monotonic stream
+IDs, so ordering is global across pods regardless of which replica
+handled the POST. Pre-fix the cluster had to stay at 1 replica;
+post-fix it's HA-safe.
+
+Latency cost: ~1-2ms per event for the Redis round-trip (vs ~10µs
+in-pod mpsc). At Anthropic's ~30 tok/s emission cadence (33ms
+between tokens), unmeasurable.
+
+Failure-mode shift: a Redis outage now drops Browser-bound chat
+broadcast E2E. Pre-fix the local mpsc partially survived a Redis
+outage (Desktop channel kept working, Browser kept working
+in-pod). Cluster currently runs a single Redis replica
+(`thclaws-line-redis` PVC); follow-up if we want 5-nines on the
+broadcast path is to layer in Redis Sentinel or a managed Redis.
+
+Plan-10 follow-up (tracked): collapse the `Channel::Browser`
+variant out of `broker.rs` once the new Stream path is confirmed
+in production. Keeping it in the enum for now to avoid an API
+churn while the migration settles.
+
+### History replay + tail subscribe
+
+Single Redis Stream `chat_hist:{line_user_id}` is the source of
+truth for everything the browser SPA renders.
+
+**Write path.** `POST /chat-bridge/event` issues `XADD MAXLEN ~50`
+on every event (assistant deltas, tool calls, approval prompts,
+session-info envelopes). The `MAXLEN ~50` keeps each user's
+stream bounded.
+
+**Read path.** When `/chat-ws` upgrades:
+
+1. `chat_hist_load_with_ids` runs `XRANGE - +` and replays the
+   ~50 history entries to the WS as a single batch, capturing
+   each event's stream ID.
+2. The last replayed stream ID becomes the `tail_cursor`.
+3. A tail task spawns on a dedicated `redis::aio::Connection`
+   (the multiplexed connection used elsewhere can't hold a
+   blocking command). The task loops:
+   `chat_hist_tail` → `XREAD BLOCK 0 STREAMS chat_hist:{user} <cursor>`
+   → forward parsed events to a local `mpsc` → advance `cursor`
+   to the last seen ID.
+4. The WS's `select!` main loop drains that mpsc as a
+   single-producer source — ordering preserved by construction.
+5. On WS disconnect, the tail task is aborted and the dedicated
+   Redis connection drops.
+
+Empty history loads (new sessions) skip the replay block but
+still spawn the tail task — anything XADDed after connect is
+delivered live. Mid-session reconnect re-runs the replay (so the
+user sees the last ~50 events again) and resumes the tail from
+whatever stream ID is most recent at that moment.
+
+Helpers `parse_chat_hist_entries` and
+`parse_chat_hist_entries_with_ids` (in `store.rs`) factor the
+shared XRANGE / XREAD response shape so the load and tail paths
+stay byte-identical.
 
 ### Approval routing
 
@@ -253,6 +319,33 @@ vs the never-opened case ("This chat link can't open") that
 distinguishes "stale forwarded link" from "session timed out
 mid-life". Either way the user's next action is the same — type
 `/chat` in LINE again.
+
+## File uploads (v0.9.6)
+
+LINE attachments (image / video / file) and browser-chat paperclip uploads both land in `<workspace>/uploads/` via the same `crate::uploads` helpers used by `--serve`. The wire path differs by surface:
+
+**LINE path.** When the LINE webhook fires with a message of type `image` / `video` / `file`, the relay POSTs an `upload_ref` envelope down the desktop's WS:
+
+```json
+{
+  "type": "upload_ref",
+  "request_id": "...",
+  "line_message_id": "5234...",
+  "filename": "IMG_1234.jpg",
+  "size": 2841234,
+  "mime": "image/jpeg"
+}
+```
+
+The desktop calls LINE's Messaging API `GET /v2/bot/message/<id>/content` with the channel access token, streams the bytes to `<workspace>/uploads/<unique_path(filename)>`, then dispatches the same `render_upload_message("line", &saved)` synthetic chat message the `--serve` path uses. The agent sees a uniform event — it doesn't know whether the bytes came from a phone, a browser drag-and-drop, or `POST /upload`.
+
+**Browser-chat path.** `chat.thclaws.ai`'s SPA submits via `POST /chat-bridge/upload` (multipart, same shape as `--serve`'s `/upload`). The relay forwards the bytes to the desktop over the WS as a binary frame tagged with the metadata; the desktop saves them locally and emits the synthetic message identically.
+
+**Caps + collision.** Both paths reuse the constants from `crate::uploads` — `UPLOAD_MAX_BYTES = 25 * 1024 * 1024`, `UPLOAD_MAX_FILES = 5`, `_n` suffix on collision. Exceeding the byte cap surfaces in LINE as a relay-sent error bubble; in the browser as a toast.
+
+**Channel access token.** The LINE fetch needs the OA's long-lived token. The relay holds it and stamps the desktop's `upload_ref` envelope with a short-lived signed URL (S3-style presigned shape) — the desktop never sees the raw token. Today's impl is "relay-fetches-then-streams" since presigned LINE URLs don't exist for `/message/<id>/content`; a future tweak could route via S3-cached objects to offload the relay.
+
+**AGENT.md hook.** `<workspace>/uploads/AGENT.md` is consulted on the next agent turn through the normal CLAUDE.md / AGENT.md cascade — no special wiring at the upload layer. The synthetic chat message is what triggers the agent loop; whatever the loop reads from `AGENT.md` decides what happens next.
 
 ## Workspace-only
 

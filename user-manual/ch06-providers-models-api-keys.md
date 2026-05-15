@@ -1,6 +1,6 @@
 # Chapter 6 — Providers, models & API keys
 
-thClaws talks to **twenty-one providers**, auto-detected from the model name.
+thClaws talks to **twenty-two providers**, auto-detected from the model name.
 Switch any time with `/model`, `/provider`, or by clicking the provider/model
 chip in the sidebar (Desktop GUI, v0.7.2+).
 
@@ -10,12 +10,13 @@ chip in the sidebar (Desktop GUI, v0.7.2+).
 |---|---|---|---|
 | Agentic Press | `ap/*` | `AGENTIC_PRESS_LLM_API_KEY` | OpenAI-compatible gateway; many backends under one key |
 | Anthropic | `claude-*` | `ANTHROPIC_API_KEY` | Extended thinking, prompt caching (system + tools) |
-| Anthropic Agent SDK | `agent/*` | — (uses Claude Code's own auth) | Drives the `claude` CLI under your Claude Pro / Max subscription instead of API billing. ⚠ thClaws's tool registry doesn't cross the subprocess boundary — the model only sees Claude Code's built-in toolset. KMS / MCP / Agent Teams tools are unreachable from this provider; switch to `claude-*` for those. |
+| Anthropic Agent SDK | `agent/*` | — (uses Claude Code's own auth) | Drives the `claude` CLI under your Claude Pro / Max subscription instead of API billing. v0.9.6 added an in-process MCP bridge so the model gets thClaws's tool registry (KMS, Memory, MCP-contributed, Bash, Edit, …) in addition to Claude Code's built-ins — no need to switch to `claude-*` for tool parity. Task / Team / Skill / Plan / AskUserQuestion are intentionally not bridged. |
 | OpenAI | `gpt-*`, `o1-*`, `o3*`, `o4-*` | `OPENAI_API_KEY` | Chat Completions; automatic prompt caching |
 | OpenAI Responses | `codex/*` | `OPENAI_API_KEY` | Responses API — newer agentic-native shape |
 | ChatGPT Codex | `chatgpt-codex/*` | — (OAuth via Codex CLI) | Runs Codex models against `chatgpt.com/backend-api/codex/responses`, **billed against your ChatGPT Plus/Pro/Team subscription** instead of a paid OpenAI API key. Auth is auto-imported from the official Codex CLI's `~/.codex/auth.json` (run `codex login` once). Default `chatgpt-codex/gpt-5.4`. Added in v0.9.5 |
 | OpenAI-Compatible | `oai/*` | `OPENAI_COMPAT_API_KEY` (+ `OPENAI_COMPAT_BASE_URL`) | Generic OAI-compat endpoint — point at any LiteLLM/Portkey/Helicone/vLLM/internal-proxy that speaks `/v1/chat/completions`; `oai/` prefix stripped before forwarding |
 | OpenRouter | `openrouter/*` | `OPENROUTER_API_KEY` | Unified gateway to 300+ models across every major LLM vendor |
+| OpenCodeGo | `opencode-go/*` | `OPENCODE_GO_API_KEY` | opencode.ai subscription gateway. Single base URL serves three wire shapes (OpenAI-compatible for GLM/Kimi/DeepSeek/MiMo, Anthropic-compatible for MiniMax M2.x, Alibaba-compatible for Qwen3.x Plus); the provider auto-routes by model id. Added in v0.9.6 |
 | Gemini | `gemini-*`, `gemma-*` | `GEMINI_API_KEY` | Gemma served via Google AI Studio |
 | Ollama | `ollama/*` | — (local) | NDJSON streaming; no auth |
 | Ollama Anthropic | `oa/*` | — (local, v0.14+) | Ollama's Anthropic-compatible `/v1/messages` endpoint |
@@ -461,37 +462,72 @@ Caveats:
 Added in v0.9.5 via PR #88. Credits: ported from themion's
 `client_codex.rs`.
 
-## Sign in to thClaws Cloud (Google) — optional
+## Sign in to thClaws Cloud — optional
 
-The top-right of the navbar has a **Sign in** button. Signing in
-with Google authenticates you against `cloud.thclaws.ai` and
-unlocks future cloud-side features (paid credit, the cloud gateway
-proxy planned in plan-09 — not yet live as of v0.9.5).
+The top-right of the navbar has a **Sign in** button. As of v0.9.6
+the dropdown offers two IdPs:
+
+- **Sign in with Google** — for personal Google / Workspace accounts.
+- **Sign in with Microsoft** — for Microsoft 365 / Azure Entra
+  accounts (multi-tenant — any Entra org works without per-tenant
+  registration). Personal Microsoft accounts (Outlook, Hotmail) also
+  work via the same `/common` endpoint.
+
+Either path authenticates you against `gateway.thclaws.ai` and
+unlocks cloud-gateway features (per-provider proxying, shared
+credit pool — see the **thClaws Gateway** section below).
 
 **Important:** thClaws is fully usable without signing in. The
 button is opt-in; nothing breaks if you ignore it.
 
-The standard (non-enterprise) flow uses your own Google OAuth
-project — drop `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` into
-`.env` (or the workspace's environment) before launching:
+### From source — point at your own OAuth project
+
+Drop the matching `*_CLIENT_ID` / `*_CLIENT_SECRET` pair into `.env`
+(or the workspace's environment) before launching:
 
 ```sh
+# Google (web/native app — needs both ID and secret)
 GOOGLE_CLIENT_ID=...apps.googleusercontent.com
 GOOGLE_CLIENT_SECRET=GOCSPX-...
+
+# Microsoft Entra (public/native client — PKCE-only, no secret)
+AZURE_CLIENT_ID=00000000-0000-0000-0000-000000000000
 ```
 
-Then click **Sign in → Sign in with Google**. Browser opens →
-Google consent → desktop catches the callback → button switches to
-your email + a checkmark. Tokens land in your OS keychain (macOS
-Keychain / Windows Credential Manager / Linux Secret Service),
-**not in `.env`** — even when you've otherwise chosen the dotenv
-backend for API-key storage.
+Azure is a **public** client and runs PKCE without a secret. The
+Entra app registration needs "Allow public client flows = Yes" and
+`http://localhost` as a redirect URI (no port — Entra matches any
+ephemeral port). The full operator walkthrough lives in
+[`docs/azure-setting.md`](../docs/azure-setting.md).
 
-Official thClaws builds (the dmg / msi distributed by the project)
-ship with bundled OAuth credentials so the button works out of the
-box. If you build from source, set the env vars as above.
+Click the button → browser opens → consent screen → desktop catches
+the callback → the button switches to your email + a checkmark.
+Tokens land in your OS keychain (macOS Keychain / Windows Credential
+Manager / Linux Secret Service), **not in `.env`** — even when
+you've chosen the dotenv backend for API-key storage.
+
+### From the official dmg / msi
+
+Bundled OAuth credentials are baked into the official builds via CI
+secret injection (`BUNDLED_GOOGLE_CLIENT_ID`,
+`BUNDLED_GOOGLE_CLIENT_SECRET`, `BUNDLED_AZURE_CLIENT_ID` are read
+at compile time). The Sign-in button works out of the box — no
+`.env` setup needed.
+
+### No keychain prompt on first launch
+
+Reading the OS keychain triggers an access-prompt the first time a
+freshly-signed binary touches an entry, even when the entry doesn't
+exist. v0.9.6 added a small marker file at
+`~/.config/thclaws/sso-known.json` that lists issuers you've actually
+signed into; startup consults the marker before probing the keychain,
+so users who never sign in (and dotenv-backend users for whom SSO is
+irrelevant) see zero prompts. The marker contains no secrets — just
+a denormalised "yes, there's a session for X" hint.
+
+### Enterprise override
 
 Enterprises that ship a signed policy file with `policies.sso`
-override the standard Google flow — the navbar shows their IdP
-instead. See the technical manual's SSO doc for the gateway-side
-verification model.
+override the standard Google/Microsoft buttons — the navbar shows
+their IdP instead. See the technical manual's SSO doc for the
+gateway-side verification model.

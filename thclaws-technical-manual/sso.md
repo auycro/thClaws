@@ -4,9 +4,10 @@
 against any standards-compliant IdP. As of v0.9.5 it ships in two
 modes:
 
-- **Standard** — built-in providers (Google now, Azure stubbed)
-  resolved from env-supplied `*_CLIENT_ID` / `*_CLIENT_SECRET`. No
-  policy file required. Surfaced via the navbar `LoginButton`.
+- **Standard** — built-in providers (Google + Azure, both live as of
+  v0.9.6) resolved from env-supplied `*_CLIENT_ID` / `*_CLIENT_SECRET`
+  with CI-bundled fallbacks via `build.rs`. No policy file required.
+  Surfaced via the navbar `LoginButton`.
 - **Enterprise** — a signed `policy.policies.sso` block pins
   thClaws to an org-managed IdP and overrides the standard
   picker. Same OIDC code path; different policy origin.
@@ -76,7 +77,7 @@ deliberate seam.
 ```rust
 pub enum BuiltinProvider {
     Google,
-    Azure, // stubbed: env keys + issuer wired, awaiting OAuth registration
+    Azure,
 }
 
 impl BuiltinProvider {
@@ -90,6 +91,10 @@ impl BuiltinProvider {
     pub fn issuer_url(&self) -> &'static str {
         match self {
             Self::Google => "https://accounts.google.com",
+            // `common` tenant accepts both work/school (`tid:oid` subject
+            // namespace) and personal MSA accounts. Multi-tenant is the
+            // default — Azure SSO works for users in any Entra tenant
+            // without per-org registration.
             Self::Azure  => "https://login.microsoftonline.com/common/v2.0",
         }
     }
@@ -103,14 +108,26 @@ pub fn current_session_any() -> Option<(BuiltinProvider, Session)>; // first sto
 ```
 
 **Why env vars rather than baked constants:** Google + Azure
-desktop client_secrets are non-confidential per their own docs
-(see "Threat model" below), but distributing them through `.env`
-lets each installation point at its own OAuth project. The
-official thClaws dmg / msi bundles credentials via CI secret
-injection — `build.rs` reads `BUNDLED_GOOGLE_CLIENT_ID` /
-`BUNDLED_GOOGLE_CLIENT_SECRET` from CI env and exposes them via
-`option_env!`. `resolve()` priority: runtime env (`.env` / shell
-export) > bundled (`option_env!`) > error with configure hint.
+desktop client_ids are non-confidential per their own docs (see
+"Threat model" below), but distributing them through `.env` lets
+each installation point at its own OAuth project. The official
+thClaws dmg / msi bundles credentials via CI secret injection —
+`build.rs` reads `BUNDLED_GOOGLE_CLIENT_ID`,
+`BUNDLED_GOOGLE_CLIENT_SECRET`, and `BUNDLED_AZURE_CLIENT_ID` from
+CI env and exposes them via `option_env!`. `resolve()` priority:
+runtime env (`.env` / shell export) > bundled (`option_env!`) >
+error with configure hint.
+
+**Azure is a public client.** Microsoft Entra desktop apps run
+PKCE without a client secret — there's no `BUNDLED_AZURE_CLIENT_SECRET`
+because Azure's token endpoint actively rejects one for native /
+mobile registrations with "Allow public client flows" enabled.
+The `AZURE_CLIENT_SECRET` env slot in `env_keys()` exists only so
+the `(id_key, secret_key)` pair is uniform across providers; the
+secret resolver returns `None` for Azure and `resolve_client_secret`
+threads that through to the OIDC token exchange. See
+[`docs/azure-setting.md`](../docs/azure-setting.md) for the
+operator-side Entra app-registration walkthrough.
 
 ---
 
@@ -177,6 +194,50 @@ keychain regardless.
 
 ---
 
+## 5b. Startup keychain prompt avoidance (v0.9.6)
+
+Reading the keychain on macOS / Windows triggers an OS access
+prompt the first time a freshly-signed binary touches an item —
+**even when the item doesn't exist**. Pre-fix, startup walked every
+configured `BuiltinProvider` (Google, Azure, …) and called
+`keychain_get_raw` for each, prompting users who had never signed
+in (and users on the dotenv backend whose SSO setup is irrelevant
+to them).
+
+The fix is a plaintext marker file at
+`~/.config/thclaws/sso-known.json`:
+
+```json
+{
+  "issuers": [
+    "https://accounts.google.com"
+  ]
+}
+```
+
+`storage::save` adds the issuer to the marker; `storage::clear`
+removes it. `storage::load` consults the marker before touching
+the keychain — issuers not on the list return `None` immediately
+without an OS call:
+
+```rust
+pub fn load(issuer: &str) -> Option<Session> {
+    if !is_known(issuer) {
+        return None;  // skip keychain probe entirely
+    }
+    let key = cache_key(issuer);
+    let raw = crate::secrets::keychain_get_raw(&key)?;
+    serde_json::from_str(&raw).ok()
+}
+```
+
+Nothing sensitive lives in the marker — just a denormalised
+"yes, there's a session for X" hint. The keychain remains the
+source of truth for the actual tokens; the marker is purely a
+cache-bypass for the prompt-trigger probe.
+
+---
+
 ## 6. State payload + IPC
 
 `build_state_payload()` returns one of three shapes:
@@ -229,12 +290,12 @@ the focus event when they return forces a state refresh.
 
 ---
 
-## 7. Gateway-side verification (plan-09)
+## 7. Gateway-side verification
 
 `sso::decode_id_token_claims(jwt)` parses claims **without verifying
 the signature** — its doc-comment explicitly delegates verification
-to the gateway. For plan-09 (thClaws Cloud Gateway), the Axum
-`verify_id_token` middleware does the full check:
+to the gateway. The Axum `verify_id_token` middleware in the
+workspace-only `crates/gateway/` service does the full check:
 
 ```rust
 async fn verify_id_token(req: Request, next: Next) -> Response {

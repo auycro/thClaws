@@ -34,11 +34,32 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// + dropped corrupt line" — but corrupt lines are still corrupt
 /// data. Locking eliminates the interleave entirely. Acquire
 /// exclusive lock before each write; release at scope end via Drop.
+///
+/// ## Issue #90: Windows `os error 5` on lock acquisition
+///
+/// The open call MUST include `.read(true)`. On Windows, `append(true)`
+/// alone produces a handle with the access mask
+/// `FILE_GENERIC_WRITE & !FILE_WRITE_DATA` — i.e. `FILE_APPEND_DATA +
+/// FILE_WRITE_ATTRIBUTES + ...`, no `GENERIC_READ`. The Win32
+/// `LockFileEx` API the `fs2` crate calls under the hood requires the
+/// file handle to have `GENERIC_READ` or `GENERIC_WRITE` access; an
+/// append-only handle fails the access check and returns
+/// `ERROR_ACCESS_DENIED` (os error 5). Symptom on Windows: every
+/// session save fails with `save failed: config error: session lock:
+/// Access is denied. (os error 5)`, JSONL files end up zero bytes,
+/// session restore shows empty history. POSIX `flock` doesn't have
+/// this requirement, so macOS / Linux work fine with append-only.
+/// Adding `.read(true)` fixes Windows without any behavior change on
+/// POSIX. See <https://github.com/thClaws/thClaws/issues/90>.
 fn append_locked<F>(path: &Path, write: F) -> Result<()>
 where
     F: FnOnce(&mut File) -> std::io::Result<()>,
 {
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)?;
     // `lock_exclusive` blocks until acquired. Cheap on uncontested
     // path (single process). On contention, waits for the other
     // process's append to complete.
@@ -506,6 +527,17 @@ impl Session {
                     // snapshot events (restore-on-load fires the
                     // broadcaster which writes a fresh snapshot —
                     // not user activity). Same rule for goal_snapshot.
+                }
+                "provider_state" => {
+                    // Provider-side session id capture (Agent SDK
+                    // resume support). Doesn't carry a message body
+                    // or activity timestamp — meta scan ignores it
+                    // entirely. The full load_from path consumes it
+                    // for the provider_session_id field on Session.
+                    // Pre-fix, the unrecognised `_` arm flagged
+                    // every AgentSdk session's file as "1 corrupt
+                    // line" on every sidebar refresh (May 2026 user
+                    // report).
                 }
                 "user" | "assistant" | "system" => {
                     if let Some(ts) = val.get("timestamp").and_then(|v| v.as_u64()) {
@@ -1256,6 +1288,30 @@ mod tests {
     use crate::types::{ContentBlock, Role};
     use tempfile::tempdir;
 
+    /// Issue #90 regression: pre-fix, `append_locked` opened the
+    /// JSONL with `.create(true).append(true)` only. On Windows that
+    /// hands `LockFileEx` a handle without `GENERIC_READ`, the
+    /// API returns `ERROR_ACCESS_DENIED` (os error 5), and every
+    /// session save fails. POSIX `flock` doesn't have that
+    /// requirement, so macOS / Linux passed even with the old code
+    /// — but the test still pins the contract: two back-to-back
+    /// calls succeed AND both writes land in the file. If
+    /// `append_locked` ever drops `.read(true)` again, this test
+    /// keeps passing on POSIX but the Windows CI job (or any
+    /// Windows user) breaks on first save. The body is the same
+    /// shape on every OS so the test is cross-platform.
+    #[test]
+    fn append_locked_acquires_and_releases_for_repeat_writes() {
+        let td = tempdir().unwrap();
+        let path = td.path().join("session.jsonl");
+
+        append_locked(&path, |f| f.write_all(b"line-1\n")).expect("first append");
+        append_locked(&path, |f| f.write_all(b"line-2\n")).expect("second append");
+
+        let body = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(body, "line-1\nline-2\n");
+    }
+
     fn sample_messages() -> Vec<Message> {
         vec![
             Message::user("hello"),
@@ -1497,6 +1553,46 @@ mod tests {
         // plan_snapshot's 99999 timestamp must NOT bump updated_at —
         // M6.16.1 fix preserved.
         assert_eq!(streamed.updated_at, 1300);
+    }
+
+    /// Regression for the May 2026 user report: every session file
+    /// created by an Agent SDK turn writes a `provider_state` event
+    /// carrying the upstream session_id. The meta scanner used by
+    /// the sidebar refresh fell through to the unknown-event arm and
+    /// counted each one as "1 corrupt line(s)", producing a yellow
+    /// stderr line per session on every list refresh.
+    #[test]
+    fn load_meta_from_recognises_provider_state_without_warning() {
+        let td = tempdir().unwrap();
+        let path = td.path().join("sess-provider-state.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"header","id":"sess-ps","model":"agent/claude-sonnet-4-6","cwd":"/tmp","created_at":1000}"#,
+                "\n",
+                r#"{"type":"user","content":[{"type":"text","text":"hi"}],"timestamp":1100}"#,
+                "\n",
+                r#"{"type":"provider_state","provider_session_id":"abcd1234","timestamp":1150}"#,
+                "\n",
+                r#"{"type":"assistant","content":[{"type":"text","text":"hello"}],"timestamp":1200}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        // No way to assert "no eprintln" directly from a unit test,
+        // but we can assert the meta scan parses correctly and the
+        // message count doesn't include provider_state.
+        let meta = Session::load_meta_from(&path).unwrap();
+        assert_eq!(meta.id, "sess-ps");
+        assert_eq!(
+            meta.message_count, 2,
+            "provider_state must NOT count as a message"
+        );
+        assert_eq!(
+            meta.updated_at, 1200,
+            "provider_state must NOT bump updated_at"
+        );
     }
 
     /// M6.24 BUG M3: load_meta_from of a compacted session reports

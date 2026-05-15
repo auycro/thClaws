@@ -1,0 +1,41 @@
+# thClaws --serve in a container.
+#
+# Usage:
+#   1. Drop a `.env` file alongside this compose file with whichever
+#      provider keys you want available inside the agent
+#      (ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, etc.).
+#   2. cd into your project directory.
+#   3. `docker compose up` (or `docker compose up -d` to detach).
+#   4. Open http://localhost:8443 in your browser.
+#
+# The current directory is mounted at /workspace — the agent treats
+# that as its project folder and writes session/plan/team state to
+# ./.thclaws/ on the host.
+#
+# Default bind is 127.0.0.1:8443 so the port is reachable only from
+# the host. Drop the 127.0.0.1: prefix to expose to the LAN — only
+# safe behind your own auth (reverse proxy, SSH tunnel, VPN). The
+# container itself has no application-level auth.
+
+services:
+  thclaws:
+    image: thclaws/thclaws:latest
+    # Uncomment to build locally instead of pulling:
+    # build:
+    #   context: .
+    container_name: thclaws
+    ports:
+      - "127.0.0.1:8443:8443"
+    volumes:
+      - ./:/workspace
+      - thclaws-config:/root/.config/thclaws
+    # Drop the `required: false` line if you pin an old Compose
+    # version (<2.24); the workaround there is `touch .env` before
+    # `up`. Newer Compose treats a missing optional env_file as empty.
+    env_file:
+      - path: .env
+        required: false
+    restart: unless-stopped
+
+volumes:
+  thclaws-config:

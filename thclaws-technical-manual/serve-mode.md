@@ -218,9 +218,50 @@ Any frontend feature whose handler hasn't migrated still works in the desktop GU
 
 - **Snapshot frame for reconnect** — Phase 1A target; needs `ShellInput::SnapshotRequest` plumbing (described in §5)
 - **Handler-arm migration long tail** — ~60 arms remaining (see §8)
-- **HTTP `/upload`** — base64-over-WS works for image paste; HTTP endpoint would help for large binary uploads
+- ~~HTTP `/upload`~~ shipped in v0.9.6 — see §10b below.
 - **Multi-tab snapshot consistency** — when a 2nd tab opens, both tabs see live events but the 2nd tab gets no snapshot of state-so-far (paired with the snapshot-frame work)
 - **Auth beyond SSH tunnel** — Phase 2 design; today defer to network layer (Tailscale / Cloudflare / reverse proxy)
 - **Project-scoped memory** — `~/.config/thclaws/memory/` stays user-scoped; not an issue for the deploy story (those are personal facts, not project facts) but worth noting
 
 The webapp is **useful today** for slash-command-driven workflows + chat. Rich features (file tab, team tab, settings, plan sidebar buttons, KMS sidebar) unlock as the handler-arm migration completes.
+
+---
+
+## 10b. File upload (`POST /upload`)
+
+Multipart-form HTTP endpoint added alongside the WS in v0.9.6. Each part lands at `<workspace>/uploads/<name>`; `crate::uploads` owns the path-safety, collision-suffix, and size-cap logic.
+
+```rust
+// server.rs:191
+.route("/upload", post(serve_upload))
+
+// uploads.rs:28
+pub const UPLOAD_MAX_BYTES: u64 = 25 * 1024 * 1024;  // 25 MB per file
+pub const UPLOAD_MAX_FILES: usize = 5;               // per request
+pub const UPLOADS_DIRNAME: &str = "uploads";
+
+pub fn unique_path(dir: &Path, filename: &str) -> PathBuf;
+```
+
+**Request shape:** standard `multipart/form-data` body. Each part's `Content-Disposition` filename is sanitised (path-traversal segments stripped) before passing through `unique_path`, which appends `_n` before the extension on collision (`notes.md` → `notes_1.md` → `notes_2.md`).
+
+**Response:** JSON describing the saved files:
+
+```json
+{
+  "uploads": [
+    {"original": "screenshot.png", "saved": "screenshot.png", "size": 184231},
+    {"original": "notes.md",       "saved": "notes_1.md",     "size": 412}
+  ]
+}
+```
+
+**Synthetic chat message:** after the response, the server calls `render_upload_message("serve", &saved)` and pushes the rendered text through the same `ShellInput::ChatText` pipeline the WS uses. The agent sees an indistinguishable "user said X" event — including the file paths it can now `Read` — without the WS having to carry the file bytes.
+
+**Wire-format keys:**
+
+- **Field name:** any. The handler iterates `multipart.next_field()` and uses the part's filename, not the field name.
+- **Workspace target:** `IpcContext.workspace` (set at server boot from `--serve`'s cwd).
+- **No auth beyond SSH-tunnel posture:** same trust model as the WS — Phase 1 expects localhost-only or reverse-proxy fronting.
+
+**Test (`server::tests::upload_post_saves_to_workspace_uploads_dir`):** boots a server against a `tempdir` workspace, POSTs two parts with the same filename, asserts both land + the second carries the `_1` suffix.

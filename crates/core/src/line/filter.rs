@@ -114,24 +114,31 @@ fn strip_ansi(input: &str) -> String {
 /// - `[tool: NAME …]` bracket marker (terminal-rendered indicator)
 /// - Lone `✓` lines (tool-success checkmarks)
 fn strip_tool_narration(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for line in input.split('\n') {
-        let trimmed = line.trim_start();
-        let starts_with_bullet = trimmed.starts_with('⏺')
-            || trimmed.starts_with('🔧')
-            || trimmed.starts_with("🛠️")
-            || trimmed.starts_with('🛠')
-            || trimmed.starts_with('🔨');
-        let starts_with_tool_bracket =
-            trimmed.starts_with("[tool:") || trimmed.starts_with("[tool ");
-        let is_lone_check = trimmed == "✓" || trimmed.starts_with("✓ ×");
-        if starts_with_bullet || starts_with_tool_bracket || is_lone_check {
-            continue;
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    out
+    // Split → filter → join. Earlier impl pushed `\n` after every
+    // line including the last, which for streaming chunks meant
+    // every token (most of which contain no `\n`) gained a trailing
+    // newline. The accumulated text in the browser bubble ended up
+    // as `word1\nword2\nword3…` and the frontend's marked.parse
+    // turned every `\n` into a <br>. Bug surfaced in Screenshot18
+    // (May 2026). The fix preserves the input's exact newline
+    // topology: present newlines stay, absent newlines aren't
+    // invented.
+    let kept: Vec<&str> = input
+        .split('\n')
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            let starts_with_bullet = trimmed.starts_with('⏺')
+                || trimmed.starts_with('🔧')
+                || trimmed.starts_with("🛠️")
+                || trimmed.starts_with('🛠')
+                || trimmed.starts_with('🔨');
+            let starts_with_tool_bracket =
+                trimmed.starts_with("[tool:") || trimmed.starts_with("[tool ");
+            let is_lone_check = trimmed == "✓" || trimmed.starts_with("✓ ×");
+            !(starts_with_bullet || starts_with_tool_bracket || is_lone_check)
+        })
+        .collect();
+    kept.join("\n")
 }
 
 #[cfg(test)]
@@ -211,6 +218,36 @@ mod tests {
         // Thai text inside an ANSI-styled run should survive.
         let input = "\x1b[33mสวัสดีครับ\x1b[0m — done.";
         assert_eq!(filter_for_line(input), "สวัสดีครับ — done.");
+    }
+
+    #[test]
+    fn clean_for_stream_preserves_no_trailing_newline() {
+        // Regression for Screenshot18: streaming chunks (a single
+        // token, no embedded `\n`) used to gain a trailing `\n`
+        // because strip_tool_narration appended `\n` after every
+        // line. The browser SPA accumulated those into "word\n\
+        // next\n…" and rendered <br> between every word.
+        assert_eq!(clean_for_stream(" hello"), " hello");
+        assert_eq!(clean_for_stream("see"), "see");
+        // A genuine trailing newline in the input still survives.
+        assert_eq!(clean_for_stream("see\n"), "see\n");
+        // Embedded newlines also pass through.
+        assert_eq!(
+            clean_for_stream("first line\nsecond line"),
+            "first line\nsecond line"
+        );
+    }
+
+    #[test]
+    fn clean_for_stream_still_drops_tool_narration() {
+        // The fix should NOT have weakened tool-narration removal.
+        // Drop the bullet line; the join collapses the gap so two
+        // kept lines remain `\n`-separated.
+        assert_eq!(
+            clean_for_stream("⏺ Read(/x.rs)\nThe file says foo."),
+            "The file says foo."
+        );
+        assert_eq!(clean_for_stream("a\n✓\nb"), "a\nb");
     }
 
     #[test]

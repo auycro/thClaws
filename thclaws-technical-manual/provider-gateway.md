@@ -1,5 +1,7 @@
 # Gateway Overlay (EE)
 
+> **Not the same as [`provider-thclaws-gateway.md`](provider-thclaws-gateway.md).** That doc covers the user-toggled per-provider proxy that ships in v0.9.6 and rewrites base URL + auth value while preserving each provider's native wire shape. This doc covers the enterprise-policy gateway substitution that replaces every cloud provider with a single OpenAI-Chat-Completions client pointed at LiteLLM / Portkey / Helicone / etc. Same name, two different mechanisms in two different files (`providers/gateway.rs` vs `providers/thclaws_gateway.rs`).
+
 `gateway.rs` (`providers/gateway.rs`, 201 LOC) is **not a `Provider` impl**. It's a transparent overlay that runs INSIDE `build_provider` (`repl.rs:1204`) and rewrites which provider gets returned when an org policy declares `policies.gateway.enabled: true`.
 
 When active, the gateway replaces every cloud provider with a single `OpenAIProvider` pointing at the org's gateway URL (LiteLLM, Portkey, Helicone, internal proxy). The user's per-provider API keys are ignored; the gateway's own credentials are used. Local providers (Ollama, OllamaAnthropic, LMStudio, AgentSdk) bypass when `read_only_local_models_allowed: true`.

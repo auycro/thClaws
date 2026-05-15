@@ -22,7 +22,9 @@ The `claude` CLI ships with:
 - All the per-tool execution Claude Code already does (Read, Write, Bash, Grep, etc.)
 - The user's existing Claude subscription (no separate API billing)
 
-Wrapping it as a Provider lets thClaws invoke Claude Code as a single backend without re-implementing any of that. Everything between thClaws's user input and Claude Code's tools happens inside the `claude` subprocess — thClaws's own tool registry doesn't dispatch anything for `agent/` model turns.
+Wrapping it as a Provider lets thClaws invoke Claude Code as a single backend without re-implementing any of that. Pre-v0.9.6, *everything* between thClaws's user input and Claude Code's tools happened inside the `claude` subprocess — thClaws's own tool registry didn't dispatch anything for `agent/` model turns, which made KMS / Memory / MCP / Plan / Team tools unreachable from `agent/*` models.
+
+**v0.9.6 added an in-process MCP bridge** (see §5b). thClaws now sends its own tools to Claude Code as `mcp__thclaws__<name>` entries via the Agent SDK's `mcp_message` control_request channel; dispatch happens back in the host process where the tools, hooks, and approval gate live. The user gets subscription-billed Claude Code + the full thClaws tool registry — both at once, no compromise.
 
 The trade-off: the subprocess cycle is heavier than HTTP (spawn `claude` per turn), and stdin/stdout JSON framing is more fragile than SSE. But for users who want Claude Code's full feature set inside thClaws's UI, it's the right hatch.
 
@@ -122,15 +124,15 @@ The 30s timeout error message includes the `claude --version` hint because outda
 
 `session_id: ""` is the user envelope's id field; the `--resume <sid>` flag does the actual session tracking. The CLI accepts the empty string here as "use whatever session is active."
 
-### Stage 4: Close stdin, stream stdout
+### Stage 4: Keep stdin open, stream stdout, service MCP requests
 
 ```rust
-drop(stdin);
+// stdin stays alive — bridge tools may need to round-trip with claude.
 ```
 
-We have no bidirectional hooks / SDK MCP servers, so closing stdin signals EOF and lets the CLI commit the session file cleanly once the turn finishes.
+**v0.9.6 change:** stdin is **not** closed after the user envelope. The MCP bridge (see §5b) needs a bidirectional channel — Claude Code sends `control_request { subtype: "mcp_message" }` frames at any point during the turn whenever the model invokes a `mcp__thclaws__<name>` tool, and we must write a `control_response` back on stdin before the model can continue. The CLI commits the session file on EOF, which we send after `{"type": "result"}` lands.
 
-Then loop reading stdout until either `{"type": "result"}` (terminal) or EOF.
+Then loop reading stdout until either `{"type": "result"}` (terminal) or EOF — servicing `mcp_message` frames mid-stream as they arrive.
 
 ---
 
@@ -149,7 +151,12 @@ match msg_type {
         }
     }
     "user" => {} // tool_result echoes — model already has them server-side
-    "control_request" => {} // permission prompts (shouldn't fire with bypassPermissions)
+    "control_request" => {
+        // Two subtypes today:
+        //   "mcp_message" — bridge dispatch. Handled by §5b.
+        //   anything else — no-op (permission prompts shouldn't fire
+        //                   under bypassPermissions).
+    }
     "control_response" => {}
     "result" => {
         let usage = parse_usage(&v);
@@ -186,6 +193,105 @@ Key choices:
 ```
 
 Cache fields ARE captured — Claude Code surfaces Anthropic's prompt caching counters even though thClaws didn't manage the cache directly.
+
+---
+
+## 5b. MCP bridge (v0.9.6)
+
+**Problem solved:** earlier AgentSdk turns ran Claude Code's built-in toolset only — thClaws's KMS / Memory / MCP-contributed / Plan / Side-channel tools were unreachable from `agent/*` models because the tool registry didn't cross the subprocess boundary. Switching to `claude-*` to use those tools meant losing the subscription billing AgentSdk provides.
+
+**Mechanism:** an **in-process SDK MCP server** (`crate::sdk_mcp`, ~250 LOC) wraps the thClaws `ToolRegistry` and surfaces tools to Claude Code as `mcp__thclaws__<name>`. Claude Code dispatches them as it would any MCP tool — but the wire path is the existing Agent SDK `control_request { subtype: "mcp_message" }` channel, not a separate stdio MCP server. No second subprocess, no socket wiring.
+
+### CLI invocation deltas
+
+```rust
+// agent_sdk.rs:164-174
+let mcp_config = crate::sdk_mcp::mcp_config_value();
+cmd.arg("--mcp-config").arg(mcp_config.to_string());
+let patterns = crate::sdk_mcp::allowed_tool_patterns(tools);
+cmd.arg("--allowedTools").arg(patterns.join(","));
+```
+
+- `--mcp-config <json>` — declares a single MCP server named `thclaws` of type `sdk` (in-process). Claude Code recognises this as a host-callback server and routes calls back on stdin.
+- `--allowedTools mcp__thclaws__Read,mcp__thclaws__Edit,…` — the explicit allow-list of bridged tool names. **No Claude-built-in tools are in the list.** The previous "allow everything" posture is gone; the model only sees what we send.
+
+```rust
+pub const SERVER_NAME: &str = "thclaws";
+pub const PROTOCOL_VERSION: &str = "2024-11-05";
+
+pub fn bridged_tool_names(registry: &ToolRegistry) -> Vec<String>;
+pub fn allowed_tool_patterns(registry: &ToolRegistry) -> Vec<String>;
+pub fn mcp_config_value() -> Value;
+pub async fn handle_mcp_message(registry: Arc<ToolRegistry>, msg: &Value) -> Value;
+```
+
+### Wire protocol
+
+Three JSON-RPC methods, identical shape to what `claude-agent-sdk-python` implements (`_handle_sdk_mcp_request` in the upstream SDK):
+
+| Method | Direction | Body |
+|---|---|---|
+| `initialize` | CLI → host | `{}` |
+| `tools/list` | CLI → host | `{}` |
+| `tools/call` | CLI → host | `{ "name": "Read", "arguments": { ... } }` |
+
+The host's response shape:
+
+```json
+// initialize
+{ "result": { "protocolVersion": "2024-11-05", "serverInfo": { "name": "thclaws", "version": "0.9.6" } } }
+
+// tools/list
+{ "result": { "tools": [{ "name": "Read", "description": "...", "inputSchema": { ... } }, ...] } }
+
+// tools/call (success)
+{ "result": { "content": [{ "type": "text", "text": "<tool output>" }] } }
+
+// tools/call (error)
+{ "result": { "content": [{ "type": "text", "text": "<error msg>" }], "isError": true } }
+```
+
+### Read loop integration
+
+```rust
+// agent_sdk.rs:390+
+"control_request" => {
+    let subtype = v.pointer("/request/subtype").and_then(|x| x.as_str()).unwrap_or("");
+    if subtype == "mcp_message" {
+        let server_name = v.pointer("/request/server_name").and_then(|x| x.as_str()).unwrap_or("");
+        if server_name == crate::sdk_mcp::SERVER_NAME {
+            let mcp_msg = v.pointer("/request/message").cloned().unwrap_or(Value::Null);
+            let mcp_resp = match &bridge_tools {
+                Some(reg) => crate::sdk_mcp::handle_mcp_message(reg.clone(), &mcp_msg).await,
+                None => /* registry-missing error */,
+            };
+            // Write control_response back on stdin
+            let response = json!({
+                "type": "control_response",
+                "response": { "request_id": v.pointer("/request_id"), "subtype": "success",
+                              "response": { "mcp_response": mcp_resp } }
+            });
+            stdin.write_all(format!("{response}\n").as_bytes()).await?;
+        }
+    }
+}
+```
+
+### Tool filter
+
+`sdk_mcp::bridged_tool_names` excludes tools that depend on parent-process state Claude Code can't model:
+
+- **Task** — recursive subagent spawner; would dispatch on the host but the model thinks it's local.
+- **Team\*** — multi-process teammate orchestration via `.thclaws/team/`; doesn't fit a single-shot turn.
+- **Skill** — rewrites the next turn at the host level; Claude Code's loop doesn't honor the rewrite.
+- **EnterPlanMode / ExitPlanMode / SubmitPlan / UpdatePlanStep** — plan-mode state machine the host owns.
+- **AskUserQuestion** — needs the GUI question modal; no surface inside the SDK subprocess.
+
+Everything else (Bash, Read, Edit, Write, KMS\*, Memory\*, MCP-contributed tools, TodoWrite, the Web\* family, ResearchKickoff, etc.) is bridged. The list is computed per-turn from the live registry, so MCP-contributed tools that landed via `/mcp install` mid-session are reachable on the next AgentSdk turn without restart.
+
+### Tradeoff captured in the design
+
+The bridge keeps AgentSdk's subscription-billing benefit while restoring tool parity with `claude-*`. The cost is two stdin/stdout round-trips per tool call instead of one in-process function call — measurable for tool-heavy turns but negligible for chat-paced use.
 
 ---
 
@@ -244,7 +350,7 @@ Falls back to the Anthropic API for the catalogue. Re-prefixes ids with `agent/`
 - **One subprocess per turn.** Heavy compared to HTTP. Spawn cost: ~50-150ms on a warm machine. Acceptable for chat-paced use, slow for batch.
 - **Server-side history.** Claude Code's session file at `~/.claude/sessions/<uuid>.jsonl` is what holds the actual conversation. thClaws's local session JSONL ([`sessions.md`](sessions.md)) is parallel — both record the same turns but neither is authoritative. Switching `agent/` ↔ `claude-` providers within one thClaws session means the local history will replay against Anthropic's API on the non-AgentSdk turns, ignoring whatever Claude Code remembers.
 - **`--permission-mode bypassPermissions`.** Disables Claude Code's per-tool permission prompts. Means: when an `agent/` turn runs Bash/Edit/Write, thClaws's approval gate ([`permissions.md`](permissions.md)) NEVER fires (the dispatch happens inside `claude`, not thClaws's tool registry), AND Claude Code's own approval gate is suppressed. The user gets no per-call approval signal for AgentSdk turns. If you want approval gating, use `claude-` (Anthropic provider direct) instead of `agent/`.
-- **Tool calls are opaque.** thClaws sees `tool_use` blocks as dim `🔧 [name]` markers, doesn't get to inspect the input or veto. The actual tool result goes back to the model server-side. If a tool errors, thClaws sees nothing — Claude Code retries or surfaces the error in subsequent assistant text.
+- **Tool calls are partially opaque.** For thClaws-bridged tools (`mcp__thclaws__*`), the host runs the call in-process — same hooks, same approval gate, same on-disk state. For any Claude-built-in tool that might fire under the bridged registry's gaps (none currently exposed since `--allowedTools` is restricted to the bridge set), thClaws sees `tool_use` blocks as dim `🔧 [name]` markers without inspecting input. Pre-v0.9.6 this was the only path; post-v0.9.6 it's the residual path for any tool we deliberately keep out of the bridge.
 - **`session_id` persists across `/load` (post-fix).** Pre-fix, the captured Claude-side UUID lived only in `Arc<Mutex<Option<String>>>` on the provider instance — when a thClaws session was reopened the provider got `None`, never passed `--resume <uuid>`, and the SDK started a brand-new conversation that saw only the latest user message. The model appeared to forget every prior turn. The fix added a `provider_state` JSONL event ([`sessions.md`](sessions.md#provider-state-event)) capturing the UUID after every turn that surfaced a new id, plus `Provider::provider_session_id` / `set_provider_session_id` trait methods so the worker can read/write the slot. `save_history` in `shared_session` writes the event when the value changes; the GUI `/load` and CLI `/resume` paths call `agent.provider().set_provider_session_id(loaded.provider_session_id.clone())` BEFORE swapping `state.session` so the next `stream()` passes `--resume <uuid>` and the SDK restores its server-side history. To start a fresh SDK conversation explicitly, swap the model away and back (`/model claude-sonnet-4-6` then `/model agent/claude-sonnet-4-6`) — `build_provider` constructs a fresh `AgentSdkProvider` with `None` session id and the next save writes a `provider_state: null` event.
 - **Stream-end without `result`.** The defensive MessageStop covers crash / kill scenarios. If the CLI exits cleanly without `result` (e.g. user revoked subscription mid-turn), the agent gets `MessageStop { usage: None }` which renders as "0 tokens" but otherwise works.
 - **`CLAUDE_BIN` env override.** Useful for testing against a local debug build of `claude`, or pointing at a versioned binary (`/usr/local/bin/claude-1.5.0`). The default `claude` resolves via `PATH`.
@@ -255,8 +361,8 @@ Falls back to the Anthropic API for the catalogue. Re-prefixes ids with `agent/`
 
 ## 9. What's NOT supported
 
-- **Bidirectional hooks.** The protocol allows the CLI to call back into the host via `control_request` (e.g. for permission prompts, hook callbacks). thClaws acknowledges these as no-ops — bypassPermissions covers the permission case; user-defined hooks would require wiring stdin to stay open and a request-handler loop.
-- **SDK MCP servers** (in-process MCP servers exposed to Claude Code via stdin). Closing stdin after the user message kills any chance of these.
+- **Bidirectional permission prompts / user-defined hooks.** stdin now stays open (for the MCP bridge — see §5b), so this is technically wireable. Today only `control_request { subtype: "mcp_message" }` is serviced; permission prompts are still suppressed via `bypassPermissions`, and user-defined hook callbacks aren't routed. Adding either is a straightforward arm in the §5b read loop.
+- ~~SDK MCP servers~~ — shipped in v0.9.6. See §5b.
 - **Custom CLI flags.** `--output-format`, `--input-format`, `--verbose`, `--permission-mode`, `--system-prompt`, `--model`, `--resume` are the only flags set. Power-user flags (`--mcp`, `--no-bundled-prompt`, `--allowed-tools`, etc.) would need provider-level wiring.
 - **Multi-turn within one subprocess.** Each `stream()` call spawns a new `claude` process. The CLI supports multi-turn within one stdin/stdout stream; thClaws doesn't take advantage. Adds latency but simplifies state management.
 - **Concurrent turns.** The `Arc<Mutex<Option<String>>>` session_id is single-slot — running two `stream()` calls concurrently would race on it. The agent loop is single-threaded per session so this isn't a concrete bug today.

@@ -125,7 +125,17 @@ jobs:
         # platform coverage on Windows comes from the Release workflow
         # (which builds the binary successfully on windows-latest / -11-arm).
         # TODO: add Windows back when tests are hardened for path separators.
-        os: [ubuntu-latest, macos-latest]
+        #
+        # macos-latest is currently broken in CI: the runner image
+        # ships rustup-init at a PATH location that shadows the cargo
+        # installed by dtolnay/rust-toolchain@stable, so every cargo
+        # invocation fails with "unexpected argument 'build'". Same
+        # failure on every recent release tag. macOS build coverage
+        # comes from the Release workflow (which uses an explicit
+        # cargo-install path and works). Drop macos here until the
+        # runner image is fixed upstream OR we pin an action that
+        # explicitly handles the shadow.
+        os: [ubuntu-latest]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

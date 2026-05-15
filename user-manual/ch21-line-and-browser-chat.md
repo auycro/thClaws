@@ -141,6 +141,51 @@ surface is currently open:
   pops up as usual. Phone/browser routing is additive, not a
   replacement.
 
+## Uploading files from the phone or browser
+
+You can attach files from either surface — the desktop saves them
+into `<workspace>/uploads/` and an `AGENT.md` in that directory
+tells the agent what to do with the file. Added in v0.9.6.
+
+**Caps:**
+- **25 MB per file** (`UPLOAD_MAX_BYTES`).
+- **5 files per message** (`UPLOAD_MAX_FILES`).
+- Any MIME type — text, image, PDF, archive. The desktop doesn't
+  unpack or transform; it just lands the bytes in the workspace.
+
+**Filename collisions** are resolved by appending `_n` before the
+extension. If you upload `notes.md` and `notes.md` already exists,
+the second lands as `notes_1.md`; a third as `notes_2.md`. Original
+filenames are preserved (modulo path-traversal sanitisation —
+`../../etc/passwd` lands as `passwd`).
+
+**From the browser chat** (`chat.thclaws.ai`): drag-and-drop files
+onto the chat surface, or click the paperclip icon next to the
+composer. The desktop sends a synthetic chat message describing
+the upload (filename + size) followed by a `Read the file and
+respond.` directive line, so the agent treats the drop as a
+request to act on the contents — not just an FYI. (Pre-v0.9.7,
+the synth was purely informational and some models would reply
+"what would you like me to do with this?". Project-level
+`AGENT.md` / `CLAUDE.md` can override the directive if that
+behavior was actually what you wanted.)
+
+**From LINE**: send the file as a normal LINE attachment (photo,
+video, file). The relay forwards the upload reference via the
+broker channel; the desktop fetches the bytes from LINE's CDN
+using the channel access token and saves them locally. The agent
+then sees the same synthetic message shape as the browser path,
+including the same `Read the file and respond.` directive.
+
+**Where to control behavior:** drop an `AGENT.md` at
+`<workspace>/uploads/AGENT.md` (or at the workspace root if you
+prefer one rule for everything). The agent reads it as part of
+the standard CLAUDE.md / AGENT.md cascade and applies whatever
+directives it contains: "OCR every uploaded PDF and stash the
+text under `kms/sources/`", "auto-rename screenshots from `Photo
+2026-…` to a slug", etc. Without an `AGENT.md`, the file just
+sits there waiting for you to tell the agent what to do next.
+
 ## Privacy and trust boundary
 
 - **Desktop never proxies upstream LLM calls through the relay.**
@@ -198,5 +243,9 @@ most recent webhook activity.
   menu install) — operator-side work documented in
   [`docs/line-rich-menu-setup.md`](../../docs/line-rich-menu-setup.md)
   and the plan-08 workspace docs.
-- Cloud gateway (paid SaaS proxy) — that's plan-09, still in
-  planning; see the workspace `dev-plan/09-cloud-gateway.md`.
+- Cloud gateway (paid SaaS proxy) — shipped in v0.9.6 as
+  `gateway.thclaws.ai`. See [Chapter 6](ch06-providers-models-api-keys.md)
+  for the user-facing sign-in + per-provider toggle, and the
+  technical manual's
+  [`provider-thclaws-gateway.md`](../../thclaws-technical-manual/provider-thclaws-gateway.md)
+  for the wire shape.

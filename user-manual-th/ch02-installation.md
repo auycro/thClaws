@@ -72,30 +72,54 @@ local ล้วน ๆ" ด้านล่าง
 
 ### macOS
 
-1. ดาวน์โหลด `thclaws-<version>-<arch>-apple-darwin.tar.gz` ที่ตรงกับเครื่อง
+**แนะนำ — universal `.dmg` installer**
+
+1. ดาวน์โหลด `thclaws-<version>-universal-apple-darwin.dmg` —
+   ไฟล์เดียวรองรับทั้ง Apple Silicon และ Intel ไม่ต้องเลือก
+   architecture
+2. ดับเบิลคลิก `.dmg` แล้วลาก **thClaws** ไปยังโฟลเดอร์
+   **Applications** เมื่อหน้าต่าง installer เปิดขึ้น
+3. เปิด thClaws จาก Launchpad หรือ Spotlight ครั้งแรก Gatekeeper
+   อาจขึ้นว่า "thClaws can't be opened because Apple cannot check
+   it for malicious software" — กด **OK** จากนั้นเข้า **System
+   Settings → Privacy & Security** เลื่อนลงไปที่ข้อความเรื่อง
+   thClaws แล้วกด **Open Anyway** macOS จะจำตัวเลือกไว้
+4. แอป desktop จะติดตั้ง CLI shim ของ `thclaws` และ `thclaws-cli`
+   ลงใน `$PATH` ตอนเปิดครั้งแรก (ผ่านเมนู **Install CLI tools** ถ้า
+   ไม่ทำให้อัตโนมัติ) หลังจากนั้นเรียก `thclaws` กับ `thclaws-cli`
+   ได้จากทุก terminal
+
+แค่นั้น — ไม่ต้องแก้ `PATH` ไม่ต้องล้าง `xattr`
+
+<details>
+<summary><strong>ติดตั้งแบบ manual (ทางเลือกสำรอง)</strong> — สำหรับเครื่อง headless / SSH / สั่งผ่าน script ที่รัน GUI installer ไม่ได้</summary>
+
+1. ดาวน์โหลด tarball ตาม architecture:
+   `thclaws-<version>-aarch64-apple-darwin.tar.gz` (Apple Silicon) หรือ
+   `thclaws-<version>-x86_64-apple-darwin.tar.gz` (Intel)
 2. แตกไฟล์แล้วย้าย binary ไปยัง `PATH` ของคุณ:
 
    ```bash
    $ tar -xzf ~/Downloads/thclaws-*-apple-darwin.tar.gz
    $ mkdir -p ~/.local/bin
-   $ mv thclaws ~/.local/bin/
-   $ chmod +x ~/.local/bin/thclaws
+   $ mv thclaws thclaws-cli ~/.local/bin/
+   $ chmod +x ~/.local/bin/thclaws ~/.local/bin/thclaws-cli
    ```
 
-3. ถ้า `~/.local/bin` ยังไม่อยู่ใน `PATH` ให้เพิ่มบรรทัดนี้ใน `~/.zshrc`
-   (หรือ `~/.bashrc`) แล้วเปิด terminal ใหม่:
+3. ถ้า `~/.local/bin` ยังไม่อยู่ใน `PATH` ให้เพิ่มบรรทัดนี้ใน
+   `~/.zshrc` (หรือ `~/.bashrc`) แล้วเปิด terminal ใหม่:
 
    ```bash
    export PATH="$HOME/.local/bin:$PATH"
    ```
 
-4. เมื่อเปิดใช้งานครั้งแรก Gatekeeper ของ macOS อาจบล็อก binary ที่
-   ไม่ได้ sign ("cannot be opened because the developer cannot be
-   verified") ให้ล้าง flag quarantine ครั้งเดียวจบ:
+4. ล้าง flag quarantine ของ Gatekeeper ครั้งเดียวให้ binary รันได้:
 
    ```bash
-   $ xattr -d com.apple.quarantine ~/.local/bin/thclaws
+   $ xattr -d com.apple.quarantine ~/.local/bin/thclaws ~/.local/bin/thclaws-cli
    ```
+
+</details>
 
 ### Linux
 
@@ -114,6 +138,29 @@ local ล้วน ๆ" ด้านล่าง
 
 ### Windows
 
+**แนะนำ — `.msi` installer**
+
+1. ดาวน์โหลด `.msi` ที่ตรงกับเครื่อง:
+   - **`thclaws-<version>-x86_64-pc-windows-msvc.msi`** สำหรับ
+     Windows บน Intel / AMD (กรณีทั่วไป)
+   - **`thclaws-<version>-aarch64-pc-windows-msvc.msi`** สำหรับ
+     Windows on ARM (Surface Pro X, Snapdragon X laptop ฯลฯ)
+2. ดับเบิลคลิก `.msi` — installer เป็นแบบ per-user (ไม่ต้องใส่
+   admin password) จะวาง binary ไว้ที่
+   `%LOCALAPPDATA%\Programs\thclaws` เพิ่ม path นั้นเข้า user
+   `PATH` ให้อัตโนมัติ พร้อมสร้าง shortcut ในเมนู Start
+3. เปิด PowerShell หรือ terminal ใหม่ — `thclaws` กับ `thclaws-cli`
+   พร้อมใช้บน `PATH` แล้ว เปิด GUI ได้จากเมนู Start
+
+Windows SmartScreen อาจขึ้น "Windows protected your PC" ตอนรัน
+ครั้งแรกเพราะ binary ยังไม่ได้ sign — กด **More info → Run
+anyway**
+
+แค่นั้น — ไม่ต้องแก้ `PATH` ไม่ต้องเข้า dialog environment variables
+
+<details>
+<summary><strong>ติดตั้งแบบ manual (ทางเลือกสำรอง)</strong> — กรณีไม่อยากใช้ installer (เช่น portable install บน USB stick, automation pipeline, policy ของบริษัทบล็อก <code>.msi</code>)</summary>
+
 > **`%LOCALAPPDATA%` คืออะไร** — เป็น environment variable ของ Windows
 > ที่ expand เป็น `C:\Users\<username>\AppData\Local` ดังนั้น
 > `%LOCALAPPDATA%\Programs\thclaws` จะกลายเป็น
@@ -130,6 +177,83 @@ local ล้วน ๆ" ด้านล่าง
    - Start → "Edit environment variables for your account"
    - Path → Edit → New → `%LOCALAPPDATA%\Programs\thclaws`
    - OK → เปิดหน้าต่าง PowerShell / terminal ใหม่
+
+</details>
+
+## รันผ่าน Docker
+
+สำหรับ headless server, CI runner หรือสภาพแวดล้อม strict
+enterprise ที่ติดตั้ง Rust + Node + GTK/WebKit2GTK บน host
+โดยตรงไม่ได้ — มี image ทางการบน Docker Hub ที่ bundle binary
+`thclaws` ตัวเดียวกัน รัน `--serve` เป็น default และเข้าถึง
+project folder บน host ผ่าน volume bind mount
+
+```bash
+# Pull image
+$ docker pull thclaws/thclaws:latest
+
+# cd เข้าไปใน project ของคุณ จากนั้น:
+$ docker run --rm -it \
+    -v "$(pwd)":/workspace \
+    -p 127.0.0.1:8443:8443 \
+    thclaws/thclaws:latest
+```
+
+เปิด `http://localhost:8443` ในเบราว์เซอร์
+
+> **เพิ่ม API key** — ถ้าตั้งใน shell ไว้แล้ว key จะ pass ผ่านเข้า
+> container อัตโนมัติ ถ้าจะ inject key ต่อ container ให้เพิ่ม
+> `--env-file .env` ในคำสั่ง run แล้วใส่ `ANTHROPIC_API_KEY=…`,
+> `OPENAI_API_KEY=…` ฯลฯ ในไฟล์ `.env` ที่ `pwd` หรือจะตั้ง key
+> ภายหลังจาก settings UI ในเบราว์เซอร์ก็ได้ — thClaws เขียนลง
+> `.thclaws/settings.json` ใน mount ก็จะ persist ข้าม container
+> restart **หมายเหตุ:** Docker จะ error (`open .env: no such file
+> or directory`) ถ้า pass `--env-file .env` แล้วไฟล์ไม่มีจริง —
+> `touch .env` ก่อนหรือไม่ก็ถอด flag ออก folder ที่ mount ไว้
+จะปรากฏเป็น `/workspace` ใน container thClaws จะเขียน state ของ
+session / plan / team / KMS ลงที่ `./.thclaws/` บน host —
+container restart ก็ไม่หาย
+
+สำหรับการรันยาว ๆ มี `docker-compose.yml` แถมมาในรีโป:
+
+```yaml
+services:
+  thclaws:
+    image: thclaws/thclaws:latest
+    ports: ["127.0.0.1:8443:8443"]
+    volumes:
+      - ./:/workspace
+      - thclaws-config:/root/.config/thclaws
+    env_file: [.env]
+    restart: unless-stopped
+volumes:
+  thclaws-config:
+```
+
+`docker compose up -d` รันขึ้น `docker compose logs -f thclaws`
+ดู log สด ๆ
+
+ข้อสังเกต:
+
+- `--serve` **ไม่มี auth ระดับ application** ใน v0.1 ให้ bind ที่
+  `127.0.0.1` ฝั่ง host แล้วเข้าจากระยะไกลผ่าน SSH tunnel
+  (`ssh -L 8443:localhost:8443 server`) หรือเอา reverse proxy +
+  auth ของคุณเองมาวางหน้า
+- Tag: `:latest` (รุ่น ship ล่าสุด) และ `:edge` (current `main`)
+  pin release tag (เช่น `:0.9.9`) สำหรับ deploy ที่ reproducible
+- Image เป็น multi-arch (`linux/amd64` + `linux/arm64`) `docker
+  pull` เลือก variant ให้อัตโนมัติตาม host
+- API key มาจาก block `--env-file` / `env_file`, env shell ของ
+  host ที่ pass ผ่าน Docker หรือที่อยู่ใน `.thclaws/.env` ของ
+  project ที่ mount เข้ามา — container ไม่มี keychain
+- container รันเป็น root โดย default เพื่อให้เขียน bind-mount
+  บน Linux ได้โดยไม่ต้อง juggle UID override ด้วย `user:
+  "1000:1000"` ใน compose ถ้าใจไม่สบาย
+
+เทคนิคเพิ่มเติม (build chain, ทำไม image ถึงมี GTK + WebKit2GTK
+runtime, workflow ของการ publish) อยู่ที่
+[`docker.md`](../thclaws-technical-manual/docker.md) ใน
+technical manual
 
 ## ทางเลือก: Ollama สำหรับใช้งาน local ล้วน ๆ
 

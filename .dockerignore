@@ -1,0 +1,46 @@
+# Build artifacts
+target/
+**/target/
+node_modules/
+**/node_modules/
+frontend/dist/
+dist/
+**/dist/
+
+# Version control
+.git/
+.gitignore
+.github/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Local config / secrets
+.env
+.env.*
+.thclaws/
+.worktrees/
+
+# CI + docs that don't need to enter the build context
+docs/
+user-manual/
+user-manual-img/
+user-manual-th/
+thclaws-technical-manual/
+paperclip-adapter/
+CHANGELOG.md
+CONTRIBUTING.md
+CODE_OF_CONDUCT.md
+SECURITY.md
+ENTERPRISE.md
+README.md
+LICENSE-APACHE
+LICENSE-MIT
+
+# Docker meta
+Dockerfile
+docker-compose.yml
+.dockerignore

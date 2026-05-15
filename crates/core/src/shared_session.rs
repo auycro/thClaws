@@ -1944,19 +1944,67 @@ async fn run_worker(
                     // LINE chat, and the tool calls themselves
                     // are already gated through the LineApprover
                     // when LineGated mode is active.
+                    //
+                    // Plan-10 fan-out (browser chat).
+                    //
+                    // History: an earlier implementation called
+                    // `tokio::spawn` per delta to POST the envelope
+                    // to /chat-bridge/event. That detached each
+                    // POST as an independent task, which raced
+                    // through reqwest's connection pool — the relay
+                    // received envelopes in non-deterministic
+                    // order, and any POST that hit a transient
+                    // error was eprintln'd and silently lost. The
+                    // browser bubble accumulated a scrambled,
+                    // partial transcript (May 2026 user report).
+                    //
+                    // Fix: a dedicated *sequencer* task pulls from
+                    // an unbounded mpsc and POSTs envelopes one at
+                    // a time, awaiting completion between sends.
+                    // Order is preserved end-to-end (single TCP
+                    // path → in-order arrival at the relay →
+                    // relay's local mpsc + single-task WS handler
+                    // are already in-order). The unbounded channel
+                    // keeps the broadcast-bus consumer (this loop)
+                    // non-blocking even if HTTP RTT spikes.
+                    let bridge_tx = bridge_client.as_ref().map(|client| {
+                        let (tx, mut rx) =
+                            tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+                        let client = client.clone();
+                        tokio::spawn(async move {
+                            while let Some(envelope) = rx.recv().await {
+                                // Single-shot retry covers transient
+                                // failures (connection reset during
+                                // pool churn, brief 502 from a relay
+                                // mid-rollout). Permanent failures
+                                // (4xx, sustained outage) still
+                                // surface as eprintln after one retry
+                                // and the chunk is lost — that's
+                                // a separate Phase-2 hardening item.
+                                if let Err(first) = client.push_chat_event(envelope.clone()).await {
+                                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                                    if let Err(second) = client.push_chat_event(envelope).await {
+                                        eprintln!(
+                                            "[line] chat-bridge push failed (retry exhausted): \
+                                             first={first}, second={second}"
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                        tx
+                    });
+
                     let mut buf = String::new();
                     while let Ok(ev) = event_rx.recv().await {
-                        // Plan-10 fan-out (browser chat). Spawned
-                        // detached so HTTP latency doesn't slow
-                        // event accumulation for the OA path.
-                        if let Some(client) = &bridge_client {
+                        if let Some(tx) = &bridge_tx {
                             if let Some(envelope) = view_event_to_chat_envelope(&ev) {
-                                let c = client.clone();
-                                tokio::spawn(async move {
-                                    if let Err(e) = c.push_chat_event(envelope).await {
-                                        eprintln!("[line] chat-bridge push failed: {e}");
-                                    }
-                                });
+                                // UnboundedSender::send only fails
+                                // if the receiver dropped — which
+                                // means the sequencer task has
+                                // already exited. Ignore: the turn
+                                // will end shortly anyway.
+                                let _ = tx.send(envelope);
                             }
                         }
                         match ev {
@@ -1979,6 +2027,14 @@ async fn run_worker(
                             _ => {}
                         }
                     }
+                    // Drop the tx so the sequencer task can drain
+                    // its queue and exit cleanly. The outer
+                    // `collector.await` later will block until both
+                    // this task and the sequencer it owns finish —
+                    // we don't await the sequencer directly because
+                    // we want it to keep flushing in the background
+                    // while the caller proceeds.
+                    drop(bridge_tx);
                     buf
                 });
                 // Mark this turn as LINE-driven so AskUserQuestion
@@ -3521,10 +3577,19 @@ fn view_event_to_chat_envelope(ev: &ViewEvent) -> Option<serde_json::Value> {
             // truncate-free variant suitable for per-chunk
             // streaming.
             let cleaned = crate::line::clean_for_stream(text);
-            // After cleaning, a chunk might be entirely whitespace
-            // or empty (e.g. it contained ONLY a tool-narration
-            // line). Skip so the browser doesn't render a blank.
-            if cleaned.trim().is_empty() {
+            // Drop ONLY if the strip pipeline produced an exactly
+            // empty string (e.g. chunk was nothing but a
+            // tool-narration line that the filter ate whole).
+            //
+            // Earlier this condition was `cleaned.trim().is_empty()`,
+            // which also dropped chunks that were pure whitespace
+            // (single space, single newline). That broke streams
+            // where Anthropic emits a standalone space/newline
+            // token between two word tokens: the browser
+            // accumulated "wordAwordB" because the separator
+            // chunk was silently dropped. Surfaced in the same
+            // May 2026 report as the ordering bug.
+            if cleaned.is_empty() {
                 return None;
             }
             Some(json!({ "type": "assistant_delta", "text": cleaned }))

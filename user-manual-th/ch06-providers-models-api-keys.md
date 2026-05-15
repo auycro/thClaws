@@ -15,6 +15,7 @@ thClaws คุยกับ **provider ได้ทั้งหมดสิบส
 | OpenAI Responses | `codex/*` | `OPENAI_API_KEY` | Responses API — รูปแบบ agentic-native ที่ใหม่กว่า |
 | OpenAI-Compatible | `oai/*` | `OPENAI_COMPAT_API_KEY` (+ `OPENAI_COMPAT_BASE_URL`) | endpoint OAI-compat แบบ generic — ชี้ไป LiteLLM/Portkey/Helicone/vLLM/proxy ภายในองค์กร ที่พูด `/v1/chat/completions` ได้; prefix `oai/` ถูก strip ก่อน forward |
 | OpenRouter | `openrouter/*` | `OPENROUTER_API_KEY` | gateway รวม เข้าถึง model 300+ ตัวจากผู้ให้บริการ LLM รายใหญ่ทุกเจ้า |
+| OpenCodeGo | `opencode-go/*` | `OPENCODE_GO_API_KEY` | gateway subscription ของ opencode.ai มี base URL เดียวให้บริการสาม wire shape (OpenAI-compatible สำหรับ GLM/Kimi/DeepSeek/MiMo, Anthropic-compatible สำหรับ MiniMax M2.x, Alibaba-compatible สำหรับ Qwen3.x Plus); provider auto-route จาก model id เพิ่มใน v0.9.6 |
 | Gemini | `gemini-*`, `gemma-*` | `GEMINI_API_KEY` | Gemma ให้บริการผ่าน Google AI Studio |
 | Ollama | `ollama/*` | — (local) | NDJSON streaming; ไม่ต้อง auth |
 | Ollama Anthropic | `oa/*` | — (local, v0.14+) | endpoint `/v1/messages` ของ Ollama ที่เข้ากันกับ Anthropic |
