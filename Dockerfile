@@ -68,6 +68,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # ──────────────────────────────────────────────────────────────────────
 FROM ${RUNTIME_BASE} AS runtime
 
+# Run as non-root. Override USER_UID/USER_GID at build time so files
+# written to the bind-mounted /workspace are owned by your host user:
+#   docker build \
+#     --build-arg USER_UID=$(id -u) \
+#     --build-arg USER_GID=$(id -g) ...
+ARG USERNAME=thclaws
+ARG USER_UID=1000
+ARG USER_GID=1000
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgtk-3-0 \
         libwebkit2gtk-4.1-0 \
@@ -77,15 +86,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
+# Create group + user matching host UID/GID
+RUN groupadd --gid ${USER_GID} ${USERNAME} \
+    && useradd --uid ${USER_UID} \
+               --gid ${USER_GID} \
+               --create-home \
+               --shell /bin/bash \
+               ${USERNAME}
+
 COPY --from=builder /usr/local/bin/thclaws /usr/local/bin/thclaws
 
 WORKDIR /workspace
+
 EXPOSE 8443
 
 ENV THCLAWS_INSIDE_DOCKER=1
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8443/healthz || exit 1
+
+# Switch to non-root user
+USER ${USER_UID}:${USER_GID}
 
 ENTRYPOINT ["thclaws"]
 CMD ["--serve", "--bind", "0.0.0.0", "--port", "8443"]

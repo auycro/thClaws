@@ -184,12 +184,28 @@ pub async fn run_with_engine(
         workspace: Arc::new(workspace),
     };
 
+    // Loopback-only safety check for the API auth-bypass token. The
+    // bypass mode (`THCLAWS_API_TOKEN=disable-auth`) makes the OpenAI
+    // endpoints reachable to anyone who can hit the socket — refuse to
+    // start if the bind isn't loopback, so a misconfigured deploy fails
+    // loud instead of silently exposing the agent runtime.
+    if crate::api_v1::auth_is_bypassed() && !is_loopback(&config.bind) {
+        return Err(crate::error::Error::Tool(format!(
+            "THCLAWS_API_TOKEN=disable-auth is only allowed on a loopback bind, but server is bound to {}. \
+             Set a real token or use --bind 127.0.0.1.",
+            config.bind
+        )));
+    }
+
     let app = Router::new()
         .route("/", get(serve_index))
         .route("/healthz", get(serve_health))
         .route("/ws", get(ws_handler))
         .route("/upload", post(serve_upload))
-        .with_state(state);
+        .with_state(state)
+        // /v1/* OpenAI-compatible endpoints. Merged at the end so the
+        // existing routes win on path collisions (none today).
+        .merge(crate::api_v1::router());
 
     let listener = tokio::net::TcpListener::bind(&config.bind)
         .await
@@ -203,6 +219,10 @@ pub async fn run_with_engine(
         .await
         .map_err(|e| crate::error::Error::Tool(format!("serve: {e}")))?;
     Ok(())
+}
+
+fn is_loopback(addr: &SocketAddr) -> bool {
+    addr.ip().is_loopback()
 }
 
 async fn serve_index() -> impl IntoResponse {

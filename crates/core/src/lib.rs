@@ -6,6 +6,9 @@
 
 pub mod agent;
 pub mod agent_defs;
+/// OpenAI-compatible HTTP API surface mounted on `--serve` (see
+/// `dev-plan/19-thclaws-openai-compat.md`).
+pub mod api_v1;
 pub mod branding;
 pub mod cancel;
 mod cli_completer;
