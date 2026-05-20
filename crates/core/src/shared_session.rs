@@ -2459,12 +2459,20 @@ pub(crate) fn save_history(agent: &Agent, session: &mut Session, store: &Option<
 }
 
 pub(crate) fn build_session_list(store: &Option<SessionStore>, current_id: &str) -> String {
+    // Was capped at 20 — but the sidebar shows the top 10 in the default
+    // view and the rest are reachable only via the search box (#95 part
+    // b). Bumping to 200 gives heavy users a meaningful searchable
+    // window (each entry is ~100 bytes JSON ⇒ ~20KB payload, fine over
+    // WebSocket). For workspaces with >200 sessions, a future change can
+    // move filtering server-side; for now the on-disk list() ordering
+    // (most-recently-updated first; see SessionStore::list) keeps the
+    // newest 200 visible.
     let sessions: Vec<serde_json::Value> = store
         .as_ref()
         .and_then(|s| s.list().ok())
         .unwrap_or_default()
         .into_iter()
-        .take(20)
+        .take(200)
         .map(|s| {
             serde_json::json!({
                 "id": s.id,
