@@ -2791,7 +2791,7 @@ pub fn built_in_commands() -> &'static [BuiltInCommand] {
         BuiltInCommand { name: "provider",  description: "Switch provider to its default model",      category: "Model", usage: "NAME" },
         BuiltInCommand { name: "providers", description: "List all supported providers",              category: "Model", usage: "" },
         BuiltInCommand { name: "thinking",  description: "Set extended-thinking token budget",        category: "Model", usage: "BUDGET" },
-        BuiltInCommand { name: "permissions", description: "Show or set the permission mode",         category: "Model", usage: "[auto|ask]" },
+        BuiltInCommand { name: "permissions", description: "Show or set the permission mode",         category: "Model", usage: "[auto|ask|linegated]" },
         BuiltInCommand { name: "plan",        description: "Toggle plan mode (read-only + sidebar)", category: "Model", usage: "[enter|exit|status]" },
 
         // Context / memory / knowledge
@@ -6443,7 +6443,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                             PermissionMode::LineGated => "linegated",
                         };
                         println!(
-                            "{COLOR_DIM}permissions: {label} (auto = never prompt, ask = prompt on mutating tools, plan = read-only exploration, linegated = prompt routed to LINE chat){COLOR_RESET}"
+                            "{COLOR_DIM}permissions: {label} (auto = never prompt, ask = prompt on mutating tools, plan = read-only exploration; mutating tools blocked, linegated = approval routed to LINE chat — auto-active while LINE is paired, see chapter 21){COLOR_RESET}"
                         );
                     } else {
                         match mode.as_str() {
@@ -6461,8 +6461,19 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                                 );
                                 println!("{COLOR_DIM}permissions → ask{COLOR_RESET}");
                             }
+                            "linegated" | "line" => {
+                                // LINE bridge state lives in the
+                                // shared_session worker (GUI / --serve);
+                                // the CLI REPL doesn't host one. Tell the
+                                // user where to go instead of leaving them
+                                // wondering whether the command silently
+                                // worked.
+                                println!(
+                                    "{COLOR_YELLOW}linegated is only available in GUI / --serve mode (CLI REPL doesn't host the LINE bridge — see chapter 21){COLOR_RESET}"
+                                );
+                            }
                             _ => {
-                                println!("{COLOR_YELLOW}usage: /permissions auto|ask{COLOR_RESET}");
+                                println!("{COLOR_YELLOW}usage: /permissions auto|ask|linegated{COLOR_RESET}");
                             }
                         }
                     }

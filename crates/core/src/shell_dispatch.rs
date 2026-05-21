@@ -626,18 +626,34 @@ pub async fn dispatch(
                     events_tx,
                     format!(
                         "permissions: {cur} (auto = never prompt, ask = prompt on mutating tools, \
-                         plan = read-only exploration; mutating tools blocked)"
+                         plan = read-only exploration; mutating tools blocked, \
+                         linegated = approval routed to LINE chat — auto-active while LINE is paired, \
+                         see chapter 21)"
                     ),
                 );
             } else {
-                let persisted = match mode.as_str() {
+                // Three settable modes here:
+                // - auto / ask → persisted to settings.json; survive restart.
+                // - linegated → transient, only valid while LINE bridge is
+                //   live (otherwise the approver has nowhere to route to);
+                //   not persisted because next session may not have LINE.
+                //
+                // Auto/ask MUST also restore the desktop approver when LINE
+                // is currently bridged. Otherwise `state.approver` stays as
+                // the LineApprover and Ask-mode prompts still route to LINE
+                // — the very thing the user just opted out of by typing
+                // `/permissions ask`. (Bug surfaced when a user ran
+                // `/permissions ask` mid-LINE-session and Write kept getting
+                // denied because LINE never answered.)
+                match mode.as_str() {
                     "auto" | "yolo" => {
                         state.agent.permission_mode = crate::permissions::PermissionMode::Auto;
                         crate::permissions::set_current_mode_and_broadcast(
                             crate::permissions::PermissionMode::Auto,
                         );
                         state.config.permissions = "auto".into();
-                        Some("auto")
+                        restore_desktop_approver_if_line_bridged(state);
+                        persist_permission_mode("auto", events_tx);
                     }
                     "ask" | "default" => {
                         state.agent.permission_mode = crate::permissions::PermissionMode::Ask;
@@ -645,27 +661,44 @@ pub async fn dispatch(
                             crate::permissions::PermissionMode::Ask,
                         );
                         state.config.permissions = "ask".into();
-                        Some("ask")
+                        restore_desktop_approver_if_line_bridged(state);
+                        persist_permission_mode("ask", events_tx);
+                    }
+                    "linegated" | "line" => {
+                        // Only valid while the LINE bridge is connected.
+                        // `state.line_session.is_some()` is the canonical
+                        // signal — and it also gives us the LINE approver
+                        // handle (line_session.approver) so we can swap it
+                        // back in even after a prior `/permissions ask`
+                        // pulled state.approver back to the desktop.
+                        if let Some(handle) = state.line_session.as_ref() {
+                            state.agent.permission_mode =
+                                crate::permissions::PermissionMode::LineGated;
+                            crate::permissions::set_current_mode_and_broadcast(
+                                crate::permissions::PermissionMode::LineGated,
+                            );
+                            state.approver = handle.approver.clone()
+                                as std::sync::Arc<dyn crate::permissions::ApprovalSink>;
+                            // Don't touch state.config.permissions or
+                            // settings.json — `linegated` is a runtime
+                            // state, not a persisted policy.
+                            emit(
+                                events_tx,
+                                "permissions → linegated (approvals route to LINE; not persisted)"
+                                    .into(),
+                            );
+                        } else {
+                            emit(
+                                events_tx,
+                                "linegated requires the LINE bridge to be connected first \
+                                 (Settings → LINE Connect, see chapter 21)"
+                                    .into(),
+                            );
+                        }
                     }
                     _ => {
-                        emit(events_tx, "usage: /permissions auto|ask".into());
-                        None
+                        emit(events_tx, "usage: /permissions auto|ask|linegated".into());
                     }
-                };
-                if let Some(m) = persisted {
-                    // Persist so a restart lands on the same policy.
-                    let mut project = crate::config::ProjectConfig::load().unwrap_or_default();
-                    project.set_permissions_mode(m);
-                    let save_note = match project.save() {
-                        Ok(()) => "saved to .thclaws/settings.json",
-                        Err(_) => "warning: could not save to .thclaws/settings.json",
-                    };
-                    let label = if m == "auto" {
-                        "permissions → auto (no prompts)"
-                    } else {
-                        "permissions → ask"
-                    };
-                    emit(events_tx, format!("{label} ({save_note})"));
                 }
             }
         }
@@ -3327,6 +3360,44 @@ fn doctor_report(state: &WorkerState) -> String {
 
 fn emit(events_tx: &broadcast::Sender<ViewEvent>, text: String) {
     let _ = events_tx.send(ViewEvent::SlashOutput(text));
+}
+
+/// When LINE is currently bridged and the user just chose `auto` or
+/// `ask`, swap `state.approver` back to the pre-LINE (desktop) approver
+/// so future approval prompts surface locally rather than getting
+/// pushed to the user's phone. The LINE session itself stays connected
+/// — sidebar pill stays green and `/permissions linegated` can pull
+/// the LINE approver back out of `state.line_session.approver`.
+///
+/// No-op when LINE isn't bridged (the approver is already a desktop
+/// one) or when `line_pre_approver` is unset (shouldn't happen — they
+/// move in lockstep with `line_pre_mode` — but the check is cheap).
+fn restore_desktop_approver_if_line_bridged(state: &mut WorkerState) {
+    if state.line_session.is_some() {
+        if let Some(desktop) = state.line_pre_approver.clone() {
+            state.approver = desktop;
+        }
+    }
+}
+
+/// Persist `auto` / `ask` (the only two settable-and-persistent modes)
+/// to `.thclaws/settings.json` and emit a confirmation. Pulled out of
+/// the `/permissions` handler so the `linegated` arm — which must
+/// NOT touch settings.json — doesn't have to inline-duplicate the
+/// shared path.
+fn persist_permission_mode(mode: &str, events_tx: &broadcast::Sender<ViewEvent>) {
+    let mut project = crate::config::ProjectConfig::load().unwrap_or_default();
+    project.set_permissions_mode(mode);
+    let save_note = match project.save() {
+        Ok(()) => "saved to .thclaws/settings.json",
+        Err(_) => "warning: could not save to .thclaws/settings.json",
+    };
+    let label = if mode == "auto" {
+        "permissions → auto (no prompts)"
+    } else {
+        "permissions → ask"
+    };
+    emit(events_tx, format!("{label} ({save_note})"));
 }
 
 /// Multi-byte-aware truncation for one-line research-job display.

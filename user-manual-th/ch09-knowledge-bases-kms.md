@@ -125,6 +125,73 @@ Wrote pages/oauth-client-credentials.md, added entry to index.md, appended to lo
 
 ทำได้ผ่านภาษาธรรมชาติทั้งหมด slash command คือ shortcut
 
+## Self-improving AI Agent (auto-learn)
+
+ถ้าอยากให้ agent **เรียนรู้จากตัวเอง** อัตโนมัติทุก session โดยไม่ต้องสั่ง
+`/kms ingest` หรือ `/kms reconcile` ด้วยตัวเอง เปิด flag เดียวใน
+`.thclaws/settings.json`:
+
+```json
+{
+  "autoLearn": true
+}
+```
+
+เมื่อ flag นี้ on:
+
+1. **ปลายทุก session** (กดปุ่ม "new session" หรือปิด GUI) — thClaws
+   จะสรุปบทสนทนานั้นเป็น KMS page ใหม่ใน KMS ชื่อ `self_learn`
+   (สร้างให้อัตโนมัติครั้งแรก scope = project)
+2. **ตามรอบเวลา (default ทุก 6 ชั่วโมง)** — หลัง ingest เสร็จ จะรัน
+   `/kms reconcile self_learn --apply` แก้ contradictions ระหว่าง
+   page ใน KMS นั้น
+
+นั่นแค่นั้น — ใช้ปริมิทีฟที่เรียนรู้ไปแล้วในบทนี้ (`/kms ingest $`,
+`/kms reconcile`) อัตโนมัติ ไม่มี agent ใหม่ ไม่มี prompt ใหม่
+
+### ทำไม `self_learn` KMS เป็น KMS แยก
+
+auto-learn ไม่แตะ KMS ที่คุณ curate เอง (`notes`, `client-api`,
+อะไรก็ตามที่อยู่ใน `kms.active`) — เขียนเฉพาะ `self_learn` เท่านั้น
+เหตุผล:
+
+- **คุมเสียงรบกวน** — session บางอันไม่ได้มี insight ทุกครั้ง ไม่อยากให้
+  KMS หลักโดน pollute
+- **reset ง่าย** — เลิกชอบสิ่งที่ agent เรียนรู้? `rm -rf
+  .thclaws/kms/self_learn/` แล้วเริ่มใหม่
+- **review แยกได้** — `git diff .thclaws/kms/self_learn/` ดูเฉพาะที่
+  agent เรียนรู้จากตัวเอง, `git diff .thclaws/kms/notes/` ดูเฉพาะที่
+  คุณ curate เอง
+
+### Setting เพิ่มเติม
+
+| key | default | meaning |
+|---|---|---|
+| `autoLearn` | `false` | สวิตช์หลัก (opt-in) |
+| `autoLearnKms` | `"self_learn"` | เปลี่ยนชื่อ KMS ปลายทางได้ ถ้ามี KMS ชื่อนั้นอยู่แล้วใช้ตัวเดิม |
+| `autoLearnReconcileHours` | `6` | ระยะห่างขั้นต่ำระหว่าง reconcile (เซ็ต `0` = reconcile ทุก session) |
+
+### Quality gate
+
+session ที่สั้นกว่า **5 messages** จะถูกข้าม (ไม่ใช่ทุกการเปิด-ปิด app
+มี insight) คุณเห็น log ของแต่ละครั้งที่
+`~/.config/thclaws/auto-learn.log`:
+
+```
+2026-05-20T08:15:00Z ingest ok: session=sess-abc123 kms=self_learn page=auth-jwt-design
+2026-05-20T08:15:42Z reconcile ok: kms=self_learn (next due in 6h)
+2026-05-20T09:02:11Z skip ingest: session sess-def456 only had 3 messages (threshold 5)
+```
+
+### ใช้ได้ที่ไหน
+
+ตอนนี้ (v0.13.0) — **Desktop GUI** และ **Webapp** (`--serve` + browser)
+ทั้งสองใช้ worker เดียวกันที่ดูแล lifecycle ของ session ส่วน CLI REPL
+และ print mode (`-p`) ยังไม่ trigger อัตโนมัติ — ใช้ `session_end`
+hook ใน settings ผูกเองได้
+
+ดูบทถัด ๆ ไปสำหรับ `session_end` hook ใน [บทที่ 13](ch13-hooks.md)
+
 ## Multi-KMS: ผูก KMS ชุดใดก็ได้เข้ากับการสนทนา
 
 รายการ KMS ที่ active ของโปรเจกต์อยู่ใน `.thclaws/settings.json`:
@@ -165,7 +232,13 @@ surface เต็ม จัดกลุ่มตาม purpose
 - **Lifecycle**: `/kms new`, `/kms use`, `/kms off`
 - **Capture**: `/kms ingest`, `/kms dump`, `/kms file-answer`
 - **Maintenance**: `/kms lint`, `/kms wrap-up`, `/kms reconcile`, `/kms migrate`
+- **Cross-link**: `/kms link`
+- **รวม KMS**: `/kms merge`
 - **Decision support**: `/kms challenge`
+- **ลบ**: `/kms drop`
+
+subcommand ส่วนใหญ่รับ alias สั้น ๆ (เช่น `add` แทน `ingest`,
+`rm` แทน `drop`) — alias จะระบุไว้ใต้ header ของแต่ละ section ด้านล่าง
 
 ### `/kms` (หรือ `/kms list`)
 
@@ -182,7 +255,7 @@ surface เต็ม จัดกลุ่มตาม purpose
 
 ### `/kms show NAME`
 
-พิมพ์ `index.md` ของ KMS ออกมาให้ดูว่ามีอะไรบ้าง
+พิมพ์ `index.md` ของ KMS ออกมาให้ดูว่ามีอะไรบ้าง Aliases: `cat`
 
 ```
 ❯ /kms show notes
@@ -194,7 +267,7 @@ surface เต็ม จัดกลุ่มตาม purpose
 
 ### `/kms new [--project] NAME`
 
-สร้าง KMS ใหม่พร้อมไฟล์ starter ให้ในตัว (รวมถึง `manifest.json`)
+สร้าง KMS ใหม่พร้อมไฟล์ starter ให้ในตัว (รวมถึง `manifest.json`) Aliases: `create`
 
 ```
 ❯ /kms new meeting-notes
@@ -209,7 +282,7 @@ created KMS 'design-decisions' (project) → ./.thclaws/kms/design-decisions
 
 ### `/kms use NAME`
 
-ผูก KMS เข้ากับโปรเจกต์ปัจจุบัน ระบบจะลงทะเบียน tool `KmsRead` / `KmsSearch` / `KmsWrite` / `KmsAppend` / `KmsDelete` เข้า session ทันที พร้อมแทรก `index.md` เข้า system prompt — ไม่ต้อง restart ใช้ได้ทั้ง CLI REPL และ GUI ทั้งสองแท็บ
+ผูก KMS เข้ากับโปรเจกต์ปัจจุบัน ระบบจะลงทะเบียน tool `KmsRead` / `KmsSearch` / `KmsWrite` / `KmsAppend` / `KmsDelete` เข้า session ทันที พร้อมแทรก `index.md` เข้า system prompt — ไม่ต้อง restart ใช้ได้ทั้ง CLI REPL และ GUI ทั้งสองแท็บ Aliases: `on`
 
 ```
 ❯ /kms use notes
@@ -218,7 +291,7 @@ KMS 'notes' attached (tools registered; available this turn)
 
 ### `/kms off NAME`
 
-ถอด KMS ออก มีผลทันทีเช่นกัน — เมื่อถอด KMS ตัวสุดท้ายออก tool ของ KMS จะถูกลบจาก registry เพื่อไม่ให้ model เห็นเป็นทางเลือก
+ถอด KMS ออก มีผลทันทีเช่นกัน — เมื่อถอด KMS ตัวสุดท้ายออก tool ของ KMS จะถูกลบจาก registry เพื่อไม่ให้ model เห็นเป็นทางเลือก Aliases: `unuse`
 
 ```
 ❯ /kms off archived-docs
@@ -227,7 +300,7 @@ KMS 'archived-docs' detached (system prompt updated)
 
 ### `/kms ingest NAME <file-or-url-or-$>`
 
-เพิ่ม source เข้า KMS ระบบจับชนิดของ source อัตโนมัติแล้ว route ไปยัง ingest path ที่ถูกต้อง split สองขั้น: bytes ดิบไปอยู่ที่ `sources/<alias>.<ext>` (immutable), stub page ไปอยู่ที่ `pages/<alias>.md` พร้อม frontmatter ที่ชี้ย้อนกลับไปที่ source จากนั้นคุณ enrich stub ผ่าน prompting ตามปกติหรือ `/kms ingest --force` อีกที
+เพิ่ม source เข้า KMS ระบบจับชนิดของ source อัตโนมัติแล้ว route ไปยัง ingest path ที่ถูกต้อง split สองขั้น: bytes ดิบไปอยู่ที่ `sources/<alias>.<ext>` (immutable), stub page ไปอยู่ที่ `pages/<alias>.md` พร้อม frontmatter ที่ชี้ย้อนกลับไปที่ source จากนั้นคุณ enrich stub ผ่าน prompting ตามปกติหรือ `/kms ingest --force` อีกที Aliases: `add`
 
 | รูปแบบ source | สิ่งที่ระบบทำ |
 |---|---|
@@ -272,7 +345,7 @@ source target พิเศษ `$` trigger **agent turn** ที่สรุป c
 
 ### `/kms dump NAME <text>`
 
-บันทึกเนื้อหา freeform แล้วให้ระบบจัดเส้นทางให้เอง agent จะแบ่ง dump เป็น chunk ย่อย ๆ (หนึ่ง decision หนึ่ง observation หนึ่ง source ใหม่ ต่อหนึ่ง chunk) ประกาศแผนการ route ออกมาเป็นข้อความก่อน แล้วค่อยรัน `KmsWrite` / `KmsAppend` จริง
+บันทึกเนื้อหา freeform แล้วให้ระบบจัดเส้นทางให้เอง agent จะแบ่ง dump เป็น chunk ย่อย ๆ (หนึ่ง decision หนึ่ง observation หนึ่ง source ใหม่ ต่อหนึ่ง chunk) ประกาศแผนการ route ออกมาเป็นข้อความก่อน แล้วค่อยรัน `KmsWrite` / `KmsAppend` จริง Aliases: `capture`
 
 > ต้องมี KMS tools — รัน `/kms use <name>` ก่อนถ้ายังไม่มี KMS attached ถ้าไม่มี KMS active คำสั่งนี้จะ refuse พร้อม error ที่ชัดเจน
 
@@ -333,7 +406,7 @@ alias ของ `/kms lint`: `/kms check`, `/kms doctor`
 
 ### `/kms wrap-up NAME [--fix]`
 
-review ตอนจบ session รวม lint กับการสแกนหา stale-marker page — page ที่ถูกแปะเครื่องหมาย `> ⚠ STALE: source <alias> was re-ingested on YYYY-MM-DD` จากการ re-ingest cascade รอให้ refresh เนื้อหาตาม source ใหม่
+review ตอนจบ session รวม lint กับการสแกนหา stale-marker page — page ที่ถูกแปะเครื่องหมาย `> ⚠ STALE: source <alias> was re-ingested on YYYY-MM-DD` จากการ re-ingest cascade รอให้ refresh เนื้อหาตาม source ใหม่ Aliases: `wrapup`, `wrap`
 
 ```
 ❯ /kms wrap-up notes
@@ -354,7 +427,7 @@ next steps: ask the agent to refresh stale pages and fix lint issues, or run `/k
 
 ### `/kms reconcile NAME [<focus>] [--apply]`
 
-แก้ contradiction อัตโนมัติ ส่งงานให้ subagent **`kms-reconcile`** ที่ติดมาในตัว ทำงาน 4 pass (claims / entities / decisions / source-freshness) จัดประเภทแต่ละจุด (clear-winner / ambiguous / evolution) แล้วทั้ง rewrite page ที่ outdated พร้อม `## History` section หรือสร้าง `Conflict — <topic>.md` ให้ user ตัดสินสำหรับเคสที่ ambiguous จริง ๆ ค่าเริ่มต้น dry-run; `--apply` ลงมือเขียนจริง arg ตำแหน่งที่สองเป็น focus ที่ narrow pass ลงเฉพาะ topic ใช้ได้เฉพาะ GUI
+แก้ contradiction อัตโนมัติ ส่งงานให้ subagent **`kms-reconcile`** ที่ติดมาในตัว ทำงาน 4 pass (claims / entities / decisions / source-freshness) จัดประเภทแต่ละจุด (clear-winner / ambiguous / evolution) แล้วทั้ง rewrite page ที่ outdated พร้อม `## History` section หรือสร้าง `Conflict — <topic>.md` ให้ user ตัดสินสำหรับเคสที่ ambiguous จริง ๆ ค่าเริ่มต้น dry-run; `--apply` ลงมือเขียนจริง arg ตำแหน่งที่สองเป็น focus ที่ narrow pass ลงเฉพาะ topic ใช้ได้เฉพาะ GUI Aliases: `resolve`
 
 > ต้องมี KMS tools — รัน `/kms use <name>` ก่อนถ้ายังไม่มี KMS attached
 
@@ -384,7 +457,7 @@ tool whitelist ของ `kms-reconcile` **แคบกว่า `dream`** — `
 
 ### `/kms migrate NAME [--apply]`
 
-migration ของ schema ค่าเริ่มต้นเป็นแบบ dry-run (พิมพ์แผนออกมาเฉย ๆ ไม่เขียน) ใส่ `--apply` เพื่อลงมือจริง idempotent — รันบน KMS ที่อยู่เวอร์ชันล่าสุดแล้วจะรายงาน `already at schema version X — nothing to migrate`
+migration ของ schema ค่าเริ่มต้นเป็นแบบ dry-run (พิมพ์แผนออกมาเฉย ๆ ไม่เขียน) ใส่ `--apply` เพื่อลงมือจริง idempotent — รันบน KMS ที่อยู่เวอร์ชันล่าสุดแล้วจะรายงาน `already at schema version X — nothing to migrate` Aliases: `upgrade`
 
 ```
 ❯ /kms migrate legacy-notes
@@ -433,6 +506,116 @@ incident เก่าใน vault ชี้ว่า failure mode อยู่�
 ```
 
 prompt บอก agent ตรง ๆ ว่า "อย่ายอม" — push back ถ้า vault ให้กระสุนมาถาม ผลลัพธ์เป็นการวิเคราะห์ ไม่มีการเขียนกลับเข้า vault
+
+### `/kms link [<name>] [--apply] [--llm] [--min-len N]`
+
+แทรก link `[[wiki-style]]` ข้าม page ใน KMS อัตโนมัติ ถ้าไม่ใส่
+ชื่อ จะ iterate ทุก KMS ที่อยู่ใน `kms_active` ของ session
+ปัจจุบัน Aliases: `autolink`, `cross-link`
+
+**deterministic เป็น default** — scan หัวข้อ `## Goal` / `## Links`
+และ body ของแต่ละ page หา occurrence ของ stem ของ page อื่น
+(case-insensitive, ระวัง word boundary) แล้ว rewrite เป็น
+`[[page-stem]]` `--min-len N` (default `4`) ตัด link ที่สั้นกว่า
+N ตัวอักษรออก กัน noise แบบ `[[api]]` ที่จะ carpet ทั่ว page
+
+**`--llm` switch ไปใช้ LLM-driven pass per page** — ส่ง page ไป
+ผ่าน model ปัจจุบันพร้อม KMS index เป็น context ให้ surface โอกาส
+cross-link ที่ deterministic หาไม่เจอ ("session" ↔ "conversation",
+"token" ↔ "API key" ฯลฯ) ช้ากว่า (provider call ต่อ page) แต่
+จับ semantic match ได้
+
+**default เป็น dry-run** ใส่ `--apply` ถึงจะ write จริง
+
+```
+❯ /kms link notes
+/kms link notes (deterministic, dry-run): scanned 23 page(s), 8 would gain link(s), 19 link insertion(s) total.
+    oauth-flow: "session" → [[session-management]]
+    oauth-flow: "refresh token" → [[token-refresh]]
+    incident-2026-01-12: "auth flow" → [[oauth-flow]]
+    …
+  re-run with --apply to write the changes.
+
+❯ /kms link notes --apply
+/kms link notes (deterministic, applied): scanned 23 page(s), 8 modified, 19 link insertion(s) total.
+```
+
+ใช้หลัง `/kms ingest` run ใหม่ ๆ เพื่อทอ page ใหม่เข้าใน graph
+เดิม หรือหลัง `/kms merge` เมื่อชุดที่รวมแล้วนิ่งแล้ว
+
+### `/kms merge <src> <dst>`
+
+รวม KMS สองตัวเข้าด้วยกัน — copy ทุก page, source, และ index
+entry จาก `src` ไป `dst` พร้อม collision handling Aliases:
+`combine`
+
+- **page ชนชื่อ** → page ที่เข้ามาใหม่ถูก rename เป็น
+  `<stem>-1.md` (หรือ `-2`, `-3`, …) ตัว original ของ destination
+  ชนะ
+- **aggregator page** (page ที่มี `aggregator: true` ใน
+  frontmatter เช่น `architecture.md`) จะถูก **รวม** (combine)
+  แทนการ rename — body ของ src จะถูก append ใต้ body ของ dst
+  เพื่อไม่ให้ overview page consolidated แตกออกจากกัน
+- **source file** ใน `sources/` ทำตามกฎ rename-on-collision
+  เดียวกัน
+- **index entry** ใน `dst/index.md` ถูก append ทุก page ใหม่
+
+`src` **คงไว้ตามเดิม** — merge ไม่ destructive ฝั่ง source ให้
+verify ก่อนค่อย cleanup
+
+```
+❯ /kms merge old-notes new-notes
+merged 'old-notes' → 'new-notes': 47 page(s) copied (3 renamed, 2 combined), 14 source(s) copied (1 renamed), 47 index entr(ies) added.
+  aggregator pages combined (src body appended under dst body):
+    architecture.md
+    decisions.md
+  collision renames (kept original on dst, incoming was renamed):
+    page: oauth-flow.md → oauth-flow-1.md
+    page: session-id.md → session-id-1.md
+    page: README.md → README-1.md
+    source: spec.pdf → spec-1.pdf
+  'old-notes' is left intact; run `/kms drop old-notes` once you've verified.
+
+suggested workflow now:
+  /kms wrap-up new-notes --fix       # fix broken links + STALE markers
+  /kms link new-notes                # dry-run preview of auto-links
+  /kms link new-notes --apply        # write the wikilinks
+  /kms reconcile new-notes --apply   # resolve contradictions across pages
+  /kms drop old-notes --force        # remove the source KMS once happy
+```
+
+output แนะนำ sequence cleanup ตามธรรมชาติ — `wrap-up --fix` patch
+link ที่หักจากการ rename, `link --apply` ทอ page ใหม่เข้า graph,
+`reconcile --apply` แก้ contradiction กรณี KMS สองตัวคุย topic
+เดียวกันแบบไม่ตรงกัน แล้วค่อย `drop --force` retire KMS ต้นทาง
+
+### `/kms drop NAME [--force]`
+
+destructive — ลบ directory tree ทั้ง KMS (`<scope>/.thclaws/kms/<name>/`
+หรือ `~/.config/thclaws/kms/<name>/`) Aliases: `delete`, `rm`
+
+**default เป็น dry-run** ถ้าไม่ใส่ `--force` จะ print ว่าจะลบ
+page กี่ตัว source กี่ตัว แต่ไม่ touch ดิสก์:
+
+```
+❯ /kms drop archived-notes
+/kms drop archived-notes: dry-run (would remove 12 page(s), 3 source(s) from /Users/you/.config/thclaws/kms/archived-notes).
+  re-run with --force to delete.
+
+❯ /kms drop archived-notes --force
+deleted KMS 'archived-notes' (12 page(s), 3 source(s)) from /Users/you/.config/thclaws/kms/archived-notes.
+```
+
+`--force` ยัง detach KMS ออกจาก `kms_active` ของ session ด้วย
+(ไม่งั้น system prompt rebuild รอบหน้าจะ fail ตอน resolve ชื่อที่
+ค้างอยู่) sidebar GUI refresh ทันที KMS ที่ drop หายจาก Knowledge
+section
+
+ไม่มี undo — directory หายไปหลัง `--force` ถ้า KMS อยู่ใน git
+(project-scope ที่ commit ไว้) recover ด้วย `git checkout` ได้
+ไม่งั้นหายเลย แนะนำให้ pair กับ `/kms merge` ก่อน ถ้าทำ
+consolidation เพื่อให้มี copy ใน destination KMS ก่อน drop ตัว
+ต้นทาง
 
 ## Schema versioning และกฎ frontmatter
 
@@ -671,7 +854,7 @@ Browser sidebar มีปุ่ม "Graph View" เหนือ list page คล
 
 ### `/kms html NAME [OUT]` — single-file interactive site
 
-สร้าง HTML site แบบ self-contained จาก page ของ KMS เขียนลง workspace (default `./<NAME>-site/index.html`) ต่างจาก in-app viewer ตรงที่นี่เป็น **derived artifact** ที่แชร์, commit git, host บน S3, หรือส่งให้เพื่อนได้ — ไม่ต้อง depend thClaws
+สร้าง HTML site แบบ self-contained จาก page ของ KMS เขียนลง workspace (default `./<NAME>-site/index.html`) ต่างจาก in-app viewer ตรงที่นี่เป็น **derived artifact** ที่แชร์, commit git, host บน S3, หรือส่งให้เพื่อนได้ — ไม่ต้อง depend thClaws Aliases: `site`, `export`
 
 Agent ทำงาน 3 phase:
 

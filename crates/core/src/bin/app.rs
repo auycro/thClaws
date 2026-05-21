@@ -138,6 +138,35 @@ enum Command {
     /// manually to test schedules without installing the supervisor
     /// (Ctrl-C to stop).
     Daemon,
+    /// Deploy the current project's `.thclaws/` (skills, MCP, plugins,
+    /// KMS, AGENTS.md, settings.json) to a running `thclaws --serve`
+    /// pod. Sessions / memory / team-runtime on the pod side are
+    /// preserved across deploys. See dev-plan/28 for the contract.
+    Deploy {
+        /// Pod base URL (e.g. https://co-test.thcompany.ai). Required.
+        #[arg(long)]
+        pod: String,
+        /// Bearer token for the pod's /v1/* API. Falls back to
+        /// $THCLAWS_DEPLOY_TOKEN if unset.
+        #[arg(long)]
+        token: Option<String>,
+        /// Include `.thclaws/memory/` in the upload (private agent
+        /// notes — opt-in).
+        #[arg(long)]
+        include_memory: bool,
+        /// Don't reject stdio MCP entries. They'll fail to start on
+        /// the pod side; useful only for iterating on the cloud config.
+        #[arg(long)]
+        allow_stdio_mcp: bool,
+        /// Print what would upload (file list + bytes) without sending.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the diff handshake and always upload the full bundle.
+        /// Default is to query /v1/deploy/manifest first and only ship
+        /// changed files (Phase 2 from dev-plan/28).
+        #[arg(long)]
+        full: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -267,6 +296,27 @@ async fn main() {
                     std::process::exit(1);
                 }
             }
+        }
+        Some(Command::Deploy {
+            pod,
+            token,
+            include_memory,
+            allow_stdio_mcp,
+            dry_run,
+            full,
+        }) => {
+            let code = thclaws_core::deploy_client::run(
+                thclaws_core::deploy_client::DeployArgs {
+                    pod,
+                    token,
+                    include_memory,
+                    allow_stdio_mcp,
+                    dry_run,
+                    full,
+                },
+            )
+            .await;
+            std::process::exit(code);
         }
         None => {}
     }
