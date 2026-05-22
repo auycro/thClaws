@@ -102,8 +102,8 @@ export function SettingsMenu({
     {
       id: "api-keys",
       icon: <KeyRound size={12} />,
-      label: "Provider API keys",
-      hint: "Manage keys stored in the OS keychain",
+      label: "Settings & API keys",
+      hint: "Provider keys, gateway, deploy target, auto-learn",
     },
     {
       id: "line-connect",

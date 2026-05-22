@@ -29,6 +29,8 @@ pub mod commands;
 pub mod compaction;
 pub mod config;
 pub mod context;
+#[cfg(feature = "cost_bridge")]
+pub mod cost_bridge;
 pub mod deploy_client;
 pub mod dotenv;
 pub mod endpoints;
@@ -65,6 +67,7 @@ pub mod policy;
 pub mod prompts;
 pub mod providers;
 pub mod recent_dirs;
+pub mod remote_agent;
 pub mod repl;
 pub mod research;
 pub mod sandbox;

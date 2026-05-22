@@ -166,6 +166,14 @@ enum Command {
         /// changed files (Phase 2 from dev-plan/28).
         #[arg(long)]
         full: bool,
+        /// Skip the auto-restart after a successful deploy. By
+        /// default the client POSTs /v1/restart so the pod
+        /// re-initialises MCP servers, plugin runtimes, skill caches,
+        /// and the system prompt. Pass --no-restart to keep the
+        /// running --serve process up across the deploy (rare: hot
+        /// config edits the snapshot doesn't read).
+        #[arg(long = "no-restart")]
+        no_restart: bool,
     },
 }
 
@@ -304,17 +312,17 @@ async fn main() {
             allow_stdio_mcp,
             dry_run,
             full,
+            no_restart,
         }) => {
-            let code = thclaws_core::deploy_client::run(
-                thclaws_core::deploy_client::DeployArgs {
-                    pod,
-                    token,
-                    include_memory,
-                    allow_stdio_mcp,
-                    dry_run,
-                    full,
-                },
-            )
+            let code = thclaws_core::deploy_client::run(thclaws_core::deploy_client::DeployArgs {
+                pod,
+                token,
+                include_memory,
+                allow_stdio_mcp,
+                dry_run,
+                full,
+                restart: !no_restart,
+            })
             .await;
             std::process::exit(code);
         }

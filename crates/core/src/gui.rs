@@ -303,6 +303,16 @@ pub(crate) fn update_mcp_tool_count(server_name: &str, count: usize) {
     }
 }
 
+/// Wipe every stored MCP tool count. Used by `ChangeCwd` before the
+/// new project's MCP servers respawn — a same-named server in the
+/// new project would otherwise display the old project's tool count
+/// until its own `McpReady` event lands.
+pub(crate) fn clear_mcp_tool_counts() {
+    if let Ok(mut map) = mcp_tool_counts().lock() {
+        map.clear();
+    }
+}
+
 /// Build the `[{name, tools}]` array that the sidebar consumes for
 /// the MCP servers list. Shared by `build_mcp_update_payload` AND
 /// by both `initial_state` builders (`gui.rs` desktop bootstrap +

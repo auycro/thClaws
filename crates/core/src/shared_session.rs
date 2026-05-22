@@ -130,6 +130,13 @@ pub enum ShellInput {
     /// worker keeps holding the stale one — the exact mismatch users
     /// see as "sidebar says openai but error mentions anthropic."
     ReloadConfig,
+    /// The user just saved an AGENTS.md / CLAUDE.md (folder or global
+    /// scope) via the GUI's instructions editor. Rebuild the running
+    /// session's system prompt in place so the next turn sees the
+    /// updated instructions — no restart, no `/new` required.
+    /// Lighter than [`Self::ReloadConfig`] (no provider rebuild) — only
+    /// touches `state.system_prompt`.
+    InstructionsChanged,
     /// Widget-initiated tool call from an embedded MCP App. The
     /// originating widget called `app.callServerTool({name, arguments})`;
     /// we look up the qualified tool in the registry, run it, and
@@ -486,6 +493,13 @@ pub struct SharedSessionHandle {
     /// deferred startup (MCP spawn, etc.) can start making user-facing
     /// prompts. Calling `signal()` multiple times is fine.
     pub ready_gate: Arc<ReadyGate>,
+    /// Mid-turn user input queue (issue #106). IPC pushes messages
+    /// here while the agent is busy; the agent drains them at the
+    /// next tool_result boundary. The same Arc is wired into the
+    /// agent via `Agent::use_injection_queue` on every agent
+    /// construction so a queue submission survives a session reload
+    /// or cwd change.
+    pub injection_queue: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 
 impl SharedSessionHandle {
@@ -579,6 +593,22 @@ pub struct WorkerState {
     /// session is active.
     pub line_pre_mode: Option<crate::permissions::PermissionMode>,
     pub line_pre_approver: Option<std::sync::Arc<dyn crate::permissions::ApprovalSink>>,
+    /// Externally-held mid-turn injection queue (issue #106). Kept on
+    /// the state so `rebuild_agent` can re-wire it onto the new agent
+    /// — without this, a `/model` swap or other rebuild would orphan
+    /// the queue and any pending message would be lost.
+    pub injection_queue: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    /// Running USD cost accumulator. Updated after each AgentEvent::Done
+    /// via `EffectiveCatalogue::compute_cost_usd`; surfaced through the
+    /// `/cost` slash command and pushed to the Cardputer display via
+    /// `cost_bridge`. Zeroed by `/cost reset` or by a buddy-side reset.
+    pub session_cost_usd: f64,
+    /// Optional BLE bridge to a thClaws-Cost Cardputer. `Some` whenever
+    /// the worker spawned a bridge at startup (default for both CLI and
+    /// GUI modes when the `cost_bridge` feature is on); `None` when the
+    /// feature is compiled out so the field is harmless to reference.
+    #[cfg(feature = "cost_bridge")]
+    pub cost_bridge: Option<crate::cost_bridge::CostBridge>,
 }
 
 /// M6.29: handle to a running `/loop` task.
@@ -626,6 +656,10 @@ impl WorkerState {
         self.agent = new_agent;
         self.agent.permission_mode = prev_perm;
         self.agent.thinking_budget = prev_thinking;
+        // Re-wire the externally-held injection queue (#106) so
+        // anything queued during the rebuild doesn't get orphaned on
+        // the old agent's Vec.
+        self.agent.use_injection_queue(self.injection_queue.clone());
         if let Some(h) = prev_history {
             self.agent.set_history(h);
         }
@@ -633,11 +667,16 @@ impl WorkerState {
     }
 
     /// Recompute the system prompt from the current `config` (picks up
-    /// updated `kms_active`, `team_enabled`, memory, skills, etc.).
-    /// Call after any dispatcher mutation that should land in the next
-    /// turn's system prompt.
+    /// updated `kms_active`, `team_enabled`, memory, skills, etc.) AND
+    /// push it into the live Agent so the next provider.stream call
+    /// sees it. Pre-fix this only updated `self.system_prompt`; the
+    /// Agent's captured `system` was stale until a full rebuild
+    /// (`/reload` or a model swap). Saving folder instructions from
+    /// the Settings menu emitted "system prompt rebuilt" but the new
+    /// content didn't actually reach the model until a restart.
     pub fn rebuild_system_prompt(&mut self) {
         self.system_prompt = build_system_prompt(&self.config, &self.cwd, &self.skill_store);
+        self.agent.set_system(self.system_prompt.clone());
     }
 }
 
@@ -939,11 +978,16 @@ pub fn spawn_with_approver(
     let (events_tx, _) = broadcast::channel::<ViewEvent>(256);
     let cancel = crate::cancel::CancelToken::new();
     let ready_gate = Arc::new(ReadyGate::new());
+    // Mid-turn injection queue (issue #106) — shared between the IPC
+    // layer (push) and the agent inside the worker (drain).
+    let injection_queue: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
 
     let events_tx_for_thread = events_tx.clone();
     let cancel_for_thread = cancel.clone();
     let input_tx_for_poller = input_tx.clone();
     let gate_for_thread = ready_gate.clone();
+    let injection_queue_for_worker = injection_queue.clone();
     std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -954,6 +998,7 @@ pub fn spawn_with_approver(
                 cancel_for_thread,
                 approver,
                 gate_for_thread,
+                injection_queue_for_worker,
             ));
         }));
         if let Err(payload) = result {
@@ -974,6 +1019,7 @@ pub fn spawn_with_approver(
         events_tx,
         cancel,
         ready_gate,
+        injection_queue,
     }
 }
 
@@ -984,6 +1030,7 @@ async fn run_worker(
     cancel: crate::cancel::CancelToken,
     approver: std::sync::Arc<dyn crate::permissions::ApprovalSink>,
     ready_gate: Arc<ReadyGate>,
+    injection_queue: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 ) {
     let cwd = std::env::current_dir().unwrap_or_default();
     let config = AppConfig::load().unwrap_or_default();
@@ -1363,6 +1410,13 @@ async fn run_worker(
         .with_approver(approver.clone())
         .with_cancel(cancel.clone())
         .with_hooks(hooks_arc.clone());
+    // Wire the externally-held injection queue (issue #106). The
+    // handle hands the same Arc to the IPC layer; the agent drains
+    // from it at every tool_result boundary. Doing this BEFORE the
+    // first turn (and on every subsequent rebuild — see ChangeCwd
+    // and similar paths) means a queued message can't be lost to
+    // an agent reconstruction.
+    agent.use_injection_queue(injection_queue.clone());
     // Respect the user's configured permission mode (project
     // `.thclaws/settings.json` can set it to "ask"). Without this the
     // GUI's Ask mode flag had no effect because the Agent was built
@@ -1501,6 +1555,7 @@ async fn run_worker(
         lead_log,
         cancel: cancel.clone(),
         active_loop: None,
+        injection_queue: injection_queue.clone(),
         // Init true: the very first /loop /goal continue firing
         // happens before any turn has run, so the suppression check
         // would otherwise gate the loop forever on iteration 0.
@@ -1510,6 +1565,9 @@ async fn run_worker(
         line_session: None,
         line_pre_mode: None,
         line_pre_approver: None,
+        session_cost_usd: 0.0,
+        #[cfg(feature = "cost_bridge")]
+        cost_bridge: Some(crate::cost_bridge::spawn()),
     };
 
     // M6.35 HOOK2: fire session_start hook now that WorkerState is
@@ -2274,6 +2332,23 @@ async fn run_worker(
                     }
                 }
             }
+            ShellInput::InstructionsChanged => {
+                // The Settings menu's AGENTS.md editor (global or folder
+                // scope) just saved. ProjectContext::discover re-runs
+                // on rebuild and picks up the new file content. No
+                // provider rebuild needed — only the system prompt
+                // changes. Subsequent turns use the fresh prompt; an
+                // already in-flight turn keeps the snapshot it
+                // captured (per the agent loop's `let system =
+                // self.system.clone();` pattern), which is the right
+                // behavior — don't yank context out from under the
+                // model mid-thought.
+                state.rebuild_system_prompt();
+                let _ = events_tx.send(ViewEvent::SlashOutput(
+                    "[instructions] system prompt rebuilt — new content applies on next turn"
+                        .into(),
+                ));
+            }
             ShellInput::ChangeCwd(new_cwd) => {
                 // No-op short-circuit: the StartupModal's "Start"
                 // button sends `set_cwd` even when the path is
@@ -2388,6 +2463,90 @@ async fn run_worker(
                     state.config.model,
                     prev_model
                 )));
+
+                // Tear down the OLD project's MCP servers and spawn
+                // the NEW project's. Pre-fix the cwd-change reloaded
+                // config (so the sidebar listed the new project's
+                // mcp.json entries) but never re-ran the startup
+                // spawn loop — entries showed up with "(0) tools"
+                // forever. Hits anyone who launches thClaws from
+                // the macOS Dock and then picks a project that has
+                // MCP servers, since the initial cwd has no MCP and
+                // the project switch is the user's first chance to
+                // see them.
+                let prefixes_to_drop: Vec<String> = state
+                    .mcp_clients
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "{}{}",
+                            crate::mcp::sanitize_tool_name_segment(c.name()),
+                            crate::mcp::MCP_NAME_SEPARATOR
+                        )
+                    })
+                    .collect();
+                let tool_names_to_remove: Vec<String> = state
+                    .tool_registry
+                    .names()
+                    .iter()
+                    .filter(|n| prefixes_to_drop.iter().any(|p| n.starts_with(p)))
+                    .map(|n| n.to_string())
+                    .collect();
+                for name in tool_names_to_remove {
+                    state.tool_registry.remove(&name);
+                }
+                // Dropping the Arc<McpClient>s here releases the
+                // last refs the worker holds; the subprocesses
+                // exit shortly after as their stdio is closed.
+                state.mcp_clients.clear();
+                crate::gui::clear_mcp_tool_counts();
+
+                // Spawn each MCP server in the new project — same
+                // `tokio::spawn` + ShellInput::McpReady fan-out as
+                // worker startup, so the McpReady handler does the
+                // registry + rebuild + sidebar update.
+                for server_cfg in state.config.mcp_servers.clone() {
+                    let approver_for_spawn = state.approver.clone();
+                    let input_tx_for_spawn = input_tx_self.clone();
+                    tokio::spawn(async move {
+                        let server_name = server_cfg.name.clone();
+                        match crate::mcp::McpClient::spawn_with_approver(
+                            server_cfg,
+                            Some(approver_for_spawn),
+                        )
+                        .await
+                        {
+                            Ok(client) => match client.list_tools().await {
+                                Ok(tool_infos) => {
+                                    let _ = input_tx_for_spawn.send(ShellInput::McpReady {
+                                        server_name,
+                                        client,
+                                        tools: tool_infos,
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = input_tx_for_spawn.send(ShellInput::McpFailed {
+                                        server_name,
+                                        error: format!("list_tools failed: {e}"),
+                                    });
+                                }
+                            },
+                            Err(e) => {
+                                let _ = input_tx_for_spawn.send(ShellInput::McpFailed {
+                                    server_name,
+                                    error: e.to_string(),
+                                });
+                            }
+                        }
+                    });
+                }
+
+                // Push the empty-counts payload now so the sidebar
+                // immediately reflects the new project's server
+                // list. McpReady → McpUpdate will overwrite with
+                // real counts as each spawn completes.
+                let payload = crate::gui::build_mcp_update_payload();
+                let _ = events_tx.send(ViewEvent::McpUpdate(payload.to_string()));
             }
         }
     }
@@ -3070,6 +3229,14 @@ async fn drive_turn_stream(
             Ok(AgentEvent::Thinking(s)) => {
                 let _ = events_tx.send(ViewEvent::AssistantThinkingDelta(s));
             }
+            Ok(AgentEvent::UserMessageInjected { text }) => {
+                // Surface the drained mid-turn user message as a
+                // normal user-bubble event (issue #106). The
+                // frontend's optimistic queued bubble matches by
+                // content and flips its badge from "queued" to
+                // "delivered" on this event.
+                let _ = events_tx.send(ViewEvent::UserPrompt(text));
+            }
             Ok(AgentEvent::ToolCallStart { name, input, .. }) => {
                 state.last_turn_made_tool_calls = true;
                 let label = format_tool_label(&name, &input);
@@ -3104,6 +3271,33 @@ async fn drive_turn_stream(
                 let tracker =
                     crate::usage::UsageTracker::new(crate::usage::UsageTracker::default_path());
                 tracker.record(provider_name, &state.config.model, &usage);
+
+                // Cost accounting (GUI parity with the CLI REPL). Drain
+                // any pending buddy resets first so a mid-turn Backspace
+                // on the Cardputer takes effect before this turn's
+                // contribution lands. Then accumulate, then push the new
+                // total to the buddy if a bridge is attached.
+                #[cfg(feature = "cost_bridge")]
+                if let Some(ref mut bridge) = state.cost_bridge {
+                    while bridge.rx_reset.try_recv().is_ok() {
+                        state.session_cost_usd = 0.0;
+                    }
+                }
+                let token_usage = crate::model_catalogue::TokenUsage {
+                    prompt_tokens: usage.input_tokens,
+                    completion_tokens: usage.output_tokens,
+                    cached_input_tokens: usage.cache_read_input_tokens.unwrap_or(0),
+                    cache_creation_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
+                    reasoning_tokens: usage.reasoning_output_tokens.unwrap_or(0),
+                };
+                let catalogue = crate::model_catalogue::EffectiveCatalogue::load();
+                if let Some(c) = catalogue.compute_cost_usd(&state.config.model, &token_usage) {
+                    state.session_cost_usd += c;
+                }
+                #[cfg(feature = "cost_bridge")]
+                if let Some(ref bridge) = state.cost_bridge {
+                    let _ = bridge.tx_cost.send(state.session_cost_usd);
+                }
 
                 // If a skill applied a model override this turn, emit
                 // a revert chat note so the user sees the active
@@ -3437,6 +3631,14 @@ async fn handle_team_messages(
             }
             Ok(AgentEvent::Thinking(s)) => {
                 let _ = events_tx.send(ViewEvent::AssistantThinkingDelta(s));
+            }
+            Ok(AgentEvent::UserMessageInjected { text }) => {
+                // Surface the drained mid-turn user message as a
+                // normal user-bubble event (issue #106). The
+                // frontend's optimistic queued bubble matches by
+                // content and flips its badge from "queued" to
+                // "delivered" on this event.
+                let _ = events_tx.send(ViewEvent::UserPrompt(text));
             }
             Ok(AgentEvent::ToolCallStart { name, input, .. }) => {
                 let label = format_tool_label(&name, &input);

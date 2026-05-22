@@ -780,6 +780,26 @@ pub async fn dispatch(
                 format!("(session-only) {key} = {value} — applied to runtime only; edit .thclaws/settings.json for persistence"),
             );
         }
+        SlashCommand::Cost { reset } => {
+            if reset {
+                state.session_cost_usd = 0.0;
+                #[cfg(feature = "cost_bridge")]
+                if let Some(ref bridge) = state.cost_bridge {
+                    let _ = bridge.tx_cost.send(0.0);
+                }
+                emit(events_tx, "session cost reset".into());
+            } else if state.session_cost_usd > 0.0 {
+                emit(
+                    events_tx,
+                    format!("session cost: ${:.4}", state.session_cost_usd),
+                );
+            } else {
+                emit(
+                    events_tx,
+                    "session cost: $0.0000 (no priced turns yet)".into(),
+                );
+            }
+        }
         SlashCommand::Compact => {
             let history = state.agent.history_snapshot();
             let compacted = crate::compaction::compact(&history, state.agent.budget_tokens / 2);
@@ -804,6 +824,26 @@ pub async fn dispatch(
                     compacted.len()
                 ),
             );
+        }
+        SlashCommand::Reload => {
+            emit(
+                events_tx,
+                "[reload] re-executing thclaws — in-memory state will be reset, on-disk sessions survive…".into(),
+            );
+            let events_tx_clone = events_tx.clone();
+            // Hand off to a detached task so the slash dispatcher can
+            // return cleanly and the SlashOutput message reaches the
+            // user before the process image is replaced. exec() on
+            // Unix only returns on error; on success there's nothing
+            // to clean up because we've stopped existing.
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                let err = crate::util::reexec_self();
+                let _ = events_tx_clone.send(ViewEvent::SlashOutput(format!(
+                    "[reload] re-exec failed: {err}"
+                )));
+            });
+            return;
         }
         SlashCommand::Fork => {
             // Flush the current session to disk so the archive reflects
@@ -2492,9 +2532,54 @@ pub async fn dispatch(
             };
             persist_and_register_mcp(state, events_tx, cfg, user).await;
         }
+        SlashCommand::McpReauth { name } => {
+            let events_tx_clone = events_tx.clone();
+            // OAuth discovery + DCR are HTTP calls — run off the
+            // dispatcher thread so the UI stays responsive while the
+            // user consents in their browser (laptop) or follows the
+            // public callback link (pod).
+            tokio::spawn(async move {
+                let sink = |line: String| {
+                    let _ = events_tx_clone.send(ViewEvent::SlashOutput(line));
+                };
+                match crate::mcp::reauth_server(&name, None).await {
+                    Ok(crate::mcp::ReauthOutcome::Completed(msg)) => sink(msg),
+                    Ok(crate::mcp::ReauthOutcome::Pending {
+                        auth_url,
+                        server_name,
+                    }) => {
+                        sink(format!(
+                            "[mcp] click to authorize '{server_name}':\n{auth_url}"
+                        ));
+                        sink(
+                            "[mcp] the redirect lands on the pod; this slash command exits as soon as the link is open. Watch the chat for `[mcp] reauth complete` after you consent."
+                                .to_string(),
+                        );
+                    }
+                    Err(e) => sink(format!("[mcp] reauth failed: {e}")),
+                }
+            });
+        }
         SlashCommand::McpRemove { name, user } => {
             match crate::config::remove_mcp_server(&name, user) {
-                Ok((true, p)) => {
+                Ok((true, p, removed_url)) => {
+                    // Also drop the cached OAuth token for the removed
+                    // server's URL. Leaving it behind would let a
+                    // future re-`/mcp add` of the same URL silently
+                    // reuse a token the user thought they'd cleared.
+                    let token_msg = if let Some(url) = removed_url {
+                        let mut store = crate::oauth::TokenStore::load();
+                        let had_token = store.get(&url).is_some();
+                        store.remove(&url);
+                        store.save();
+                        if had_token {
+                            " + cached OAuth token cleared"
+                        } else {
+                            ""
+                        }
+                    } else {
+                        ""
+                    };
                     // We can't cleanly remove just this server's tools
                     // from the live registry (they're interleaved with
                     // other MCP tools by name and we don't track the
@@ -2503,7 +2588,7 @@ pub async fn dispatch(
                     emit(
                         events_tx,
                         format!(
-                            "mcp '{name}' removed from {} (tools active in this session will be dropped on restart)",
+                            "mcp '{name}' removed from {}{token_msg} (tools active in this session will be dropped on restart)",
                             p.display()
                         ),
                     );
@@ -2513,7 +2598,7 @@ pub async fn dispatch(
                     // explicitly removed it.
                     broadcast_mcp_update(events_tx);
                 }
-                Ok((false, p)) => emit(
+                Ok((false, p, _)) => emit(
                     events_tx,
                     format!("no server named '{name}' in {}", p.display()),
                 ),
@@ -3066,6 +3151,61 @@ pub async fn dispatch(
                 Ok(id) => emit(events_tx, format!("✓ dreaming (id: {id})")),
                 Err(e) => emit(events_tx, format!("/dream: {e}")),
             }
+        }
+        SlashCommand::Deploy {
+            pod,
+            token,
+            dry_run,
+            full,
+            include_memory,
+            allow_stdio_mcp,
+            restart,
+        } => {
+            // Defaults from the configured deploy target (settings.json
+            // + keychain). Explicit /deploy --pod / --token win.
+            let resolved_pod = pod.clone().or_else(crate::remote_agent::url);
+            let resolved_token = token.clone().or_else(crate::remote_agent::token);
+            let Some(pod_url) = resolved_pod else {
+                emit(
+                    events_tx,
+                    "[deploy] REMOTE_AGENT_URL not set — open Settings → Provider API keys → Deploy target, or pass --pod <URL>".into(),
+                );
+                return;
+            };
+            let Some(token_val) = resolved_token else {
+                emit(
+                    events_tx,
+                    "[deploy] REMOTE_AGENT_TOKEN not set — open Settings → Provider API keys → Deploy target, or pass --token <T>".into(),
+                );
+                return;
+            };
+            let events_tx_clone = events_tx.clone();
+            tokio::spawn(async move {
+                let args = crate::deploy_client::DeployArgs {
+                    pod: pod_url,
+                    token: Some(token_val),
+                    include_memory,
+                    allow_stdio_mcp,
+                    dry_run,
+                    full,
+                    restart,
+                };
+                // Pipe deploy progress / errors into the same SlashOutput
+                // event stream the rest of /<command> output uses, so
+                // the user sees the actual upload events / failure
+                // reason inline instead of having to switch to the
+                // terminal thclaws was launched from.
+                let sink_tx = events_tx_clone.clone();
+                let sink = move |line: &str, level: crate::deploy_client::DeployLog| {
+                    let _ = level; // (level distinction is for stdio sinks; chat
+                                   // surface renders them all the same)
+                    let _ = sink_tx.send(ViewEvent::SlashOutput(line.to_string()));
+                };
+                let code = crate::deploy_client::run_with_sink(args, sink).await;
+                let _ = events_tx_clone.send(ViewEvent::SlashOutput(format!(
+                    "[deploy] finished (exit code {code})"
+                )));
+            });
         }
         SlashCommand::Unknown(detail) => {
             emit(events_tx, format!("unknown command: {detail}"));

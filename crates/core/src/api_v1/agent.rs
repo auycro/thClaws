@@ -264,6 +264,9 @@ async fn agent_run_stream(
                     })));
                 }
                 Ok(AgentEvent::IterationStart { .. }) => {}
+                Ok(AgentEvent::UserMessageInjected { text }) => {
+                    yield Ok(named_event("user_message_injected", json!({ "text": text })));
+                }
                 Ok(AgentEvent::Done { stop_reason, usage }) => {
                     yield Ok(named_event("usage", json!({
                         "prompt_tokens": usage.input_tokens,

@@ -177,6 +177,12 @@ pub enum SlashCommand {
         key: String,
         value: String,
     },
+    /// Session-level cost counter shown alongside the per-turn token
+    /// line. `reset: true` zeroes the accumulator; `reset: false`
+    /// prints the current value.
+    Cost {
+        reset: bool,
+    },
     Save,
     Load(String),
     Sessions,
@@ -305,6 +311,14 @@ pub enum SlashCommand {
         name: String,
         user: bool,
     },
+    /// `/mcp reauth <name>` — re-authorize a remote (HTTP) MCP server.
+    /// Clears any cached token for that server and runs a fresh OAuth
+    /// flow: laptop opens the user's browser, pod surfaces a clickable
+    /// auth URL whose redirect lands on `/v1/oauth/callback`. See
+    /// `api_v1::oauth_callback` for the pod-side flow.
+    McpReauth {
+        name: String,
+    },
     Plugins,
     PluginInstall {
         url: String,
@@ -347,6 +361,13 @@ pub enum SlashCommand {
     /// session's on-disk JSONL has grown past the working threshold
     /// and continuing in-place would keep bloating the file.
     Fork,
+    /// `/reload` — re-execute the current thclaws binary in place.
+    /// Drops in-memory state (MCP handles, system prompt, skill
+    /// caches, current chat) and starts fresh; on-disk sessions
+    /// survive so the user can resume. Works the same on pod
+    /// (--serve) and laptop (GUI/CLI). For a real container restart
+    /// that picks up a new image, use `/deploy --restart` instead.
+    Reload,
     Doctor,
     Skills,
     /// Org-policy SSO subcommands (Phase 4).
@@ -597,6 +618,24 @@ pub enum SlashCommand {
         /// while. Also widens the targeted-reconciliation scope (Pass
         /// 3b inside dream.md) to every page Pass 3 touched.
         all_sessions: bool,
+    },
+    /// `/deploy [--pod URL] [--token TOKEN] [--dry-run] [--full]
+    /// [--include-memory] [--allow-stdio-mcp] [--no-restart]` — ship
+    /// the current project's .thclaws/ to a thclaws --serve pod.
+    /// URL + token default to the configured deploy target
+    /// (remote_agent_url + remote-agent-token keychain entry). The
+    /// pod is restarted by default after the swap so MCP servers,
+    /// plugin runtimes, skill caches, and the system prompt
+    /// re-initialise; pass --no-restart to keep the running process
+    /// up. See dev-plan/28.
+    Deploy {
+        pod: Option<String>,
+        token: Option<String>,
+        dry_run: bool,
+        full: bool,
+        include_memory: bool,
+        allow_stdio_mcp: bool,
+        restart: bool,
     },
     Unknown(String),
 }
@@ -1110,8 +1149,19 @@ fn parse_mcp_subcommand(args: &str) -> SlashCommand {
                 _ => SlashCommand::Unknown("usage: /mcp install [--user] <name>".into()),
             }
         }
+        "reauth" | "login" => {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            match parts.as_slice() {
+                [name] => SlashCommand::McpReauth {
+                    name: (*name).to_string(),
+                },
+                _ => SlashCommand::Unknown(
+                    "usage: /mcp reauth <name>  (re-authorize a remote MCP server)".into(),
+                ),
+            }
+        }
         other => SlashCommand::Unknown(format!(
-            "unknown mcp subcommand: '{other}' (try: /mcp, /mcp add, /mcp remove, /mcp marketplace, /mcp search, /mcp info, /mcp install)"
+            "unknown mcp subcommand: '{other}' (try: /mcp, /mcp add, /mcp remove, /mcp reauth, /mcp marketplace, /mcp search, /mcp info, /mcp install)"
         )),
     }
 }
@@ -1290,7 +1340,15 @@ pub fn parse_slash(input: &str) -> Option<SlashCommand> {
         "cwd" | "pwd" => SlashCommand::Cwd,
         "thinking" => SlashCommand::Thinking(args.to_string()),
         "compact" => SlashCommand::Compact,
+        "cost" => match args {
+            "" => SlashCommand::Cost { reset: false },
+            "reset" | "clear" | "zero" => SlashCommand::Cost { reset: true },
+            other => SlashCommand::Unknown(format!(
+                "unknown /cost subcommand: '{other}' (try: /cost, /cost reset)"
+            )),
+        },
         "fork" => SlashCommand::Fork,
+        "reload" | "restart" => SlashCommand::Reload,
         "doctor" | "diag" => SlashCommand::Doctor,
         "sso" => match args.trim() {
             "" | "status" => SlashCommand::Sso {
@@ -1385,6 +1443,7 @@ pub fn parse_slash(input: &str) -> Option<SlashCommand> {
         "schedule" | "sched" => parse_schedule_subcommand(args),
         "agent" => parse_agent_subcommand(args),
         "agents" => SlashCommand::AgentsList,
+        "deploy" => parse_deploy_subcommand(args),
         "dream" => {
             // Parse `--all` flag (order-insensitive). Anything else is
             // the focus topic. `/dream auth --all` and `/dream --all
@@ -1422,6 +1481,66 @@ pub fn parse_slash(input: &str) -> Option<SlashCommand> {
         }
         _ => SlashCommand::Unknown(cmd.to_string()),
     })
+}
+
+/// Parse `/deploy [--pod URL] [--token TOKEN] [--dry-run] [--full]
+/// [--include-memory] [--allow-stdio-mcp] [--no-restart]`. All flags
+/// optional — missing URL/token fall back to the configured
+/// remote-agent target (see dev-plan/28). The pod is restarted by
+/// default; `--no-restart` opts out.
+fn parse_deploy_subcommand(args: &str) -> SlashCommand {
+    let mut pod: Option<String> = None;
+    let mut token: Option<String> = None;
+    let mut dry_run = false;
+    let mut full = false;
+    let mut include_memory = false;
+    let mut allow_stdio_mcp = false;
+    let mut restart = true;
+    let mut tokens = args.split_whitespace().peekable();
+    while let Some(tok) = tokens.next() {
+        match tok {
+            "--dry-run" | "--plan" => dry_run = true,
+            "--full" | "--no-diff" => full = true,
+            "--include-memory" => include_memory = true,
+            "--allow-stdio-mcp" => allow_stdio_mcp = true,
+            // Default-on — accepted as a no-op for muscle-memory
+            // compatibility with v0.13.4's --restart opt-in flag.
+            "--restart" => restart = true,
+            "--no-restart" => restart = false,
+            "--pod" => {
+                pod = tokens.next().map(|s| s.to_string());
+                if pod.as_deref().is_none() {
+                    return SlashCommand::Unknown("--pod requires a URL".into());
+                }
+            }
+            "--token" => {
+                token = tokens.next().map(|s| s.to_string());
+                if token.as_deref().is_none() {
+                    return SlashCommand::Unknown("--token requires a value".into());
+                }
+            }
+            other if other.starts_with("--pod=") => {
+                pod = Some(other.trim_start_matches("--pod=").to_string());
+            }
+            other if other.starts_with("--token=") => {
+                token = Some(other.trim_start_matches("--token=").to_string());
+            }
+            other => {
+                return SlashCommand::Unknown(format!(
+                    "unknown arg '{other}' — usage: /deploy [--pod URL] [--token T] [--dry-run] [--full] [--include-memory] [--allow-stdio-mcp] [--no-restart]"
+                ));
+            }
+        }
+    }
+    SlashCommand::Deploy {
+        pod,
+        token,
+        dry_run,
+        full,
+        include_memory,
+        allow_stdio_mcp,
+        restart,
+    }
 }
 
 /// Parse `/agent <name> <prompt>` and `/agent cancel <id>`. Bare
@@ -2779,6 +2898,7 @@ pub fn built_in_commands() -> &'static [BuiltInCommand] {
         BuiltInCommand { name: "clear",    description: "Clear conversation history",                 category: "Session", usage: "" },
         BuiltInCommand { name: "compact",  description: "Compact history (drop oldest, keep recent)", category: "Session", usage: "" },
         BuiltInCommand { name: "fork",     description: "Save + start a new session seeded with a summary", category: "Session", usage: "" },
+        BuiltInCommand { name: "reload",   description: "Re-exec thclaws (re-init MCP / system prompt; sessions survive)", category: "Session", usage: "" },
         BuiltInCommand { name: "save",     description: "Force-save the current session",             category: "Session", usage: "" },
         BuiltInCommand { name: "load",     description: "Load a saved session by id or name",         category: "Session", usage: "ID|NAME" },
         BuiltInCommand { name: "sessions", description: "List saved sessions",                        category: "Session", usage: "" },
@@ -2805,7 +2925,7 @@ pub fn built_in_commands() -> &'static [BuiltInCommand] {
         BuiltInCommand { name: "skill",    description: "Skill subcommands (install / marketplace / search / info / show)", category: "Extensions", usage: "<sub> [args]" },
         BuiltInCommand { name: "plugins",  description: "List installed plugins",                     category: "Extensions", usage: "" },
         BuiltInCommand { name: "plugin",   description: "Plugin subcommands (install / marketplace / search / info / show / enable / disable)", category: "Extensions", usage: "<sub> [args]" },
-        BuiltInCommand { name: "mcp",      description: "MCP subcommands (add / remove / install / marketplace / search / info)", category: "Extensions", usage: "[sub] [args]" },
+        BuiltInCommand { name: "mcp",      description: "MCP subcommands (add / remove / install / reauth / marketplace / search / info)", category: "Extensions", usage: "[sub] [args]" },
 
         // Team
         BuiltInCommand { name: "team",     description: "Show team agent status",                     category: "Team", usage: "" },
@@ -2814,11 +2934,15 @@ pub fn built_in_commands() -> &'static [BuiltInCommand] {
         // Research
         BuiltInCommand { name: "research", description: "Background research → KMS",                  category: "Research", usage: "<query> | list | status <id> | show <id> | cancel <id> | wait <id>" },
 
+        // Deploy
+        BuiltInCommand { name: "deploy",   description: "Ship .thclaws/ to a remote pod (dev-plan/28)", category: "Deploy", usage: "[--pod URL] [--token T] [--dry-run] [--full] [--no-restart]" },
+
         // System
         BuiltInCommand { name: "help",     description: "Show this help",                             category: "System", usage: "" },
         BuiltInCommand { name: "version",  description: "Show version",                               category: "System", usage: "" },
         BuiltInCommand { name: "cwd",      description: "Show current working directory",             category: "System", usage: "" },
         BuiltInCommand { name: "usage",    description: "Show token usage by provider and model",     category: "System", usage: "" },
+        BuiltInCommand { name: "cost",     description: "Show or reset accumulated session cost",     category: "System", usage: "[reset]" },
         BuiltInCommand { name: "doctor",   description: "Run diagnostics",                            category: "System", usage: "" },
         BuiltInCommand { name: "config",   description: "Set a config value (session-only)",          category: "System", usage: "key=value" },
         BuiltInCommand { name: "quit",     description: "Exit",                                       category: "System", usage: "" },
@@ -3000,6 +3124,8 @@ pub fn render_help() -> &'static str {
      /version          Show version\n  \
      /team             Attach to team tmux session (or show status)\n  \
      /usage            Show token usage by provider and model\n  \
+     /cost             Show accumulated session cost in USD\n  \
+     /cost reset       Zero the session cost counter\n  \
      /skill show NAME  Show full description + path for a skill\n  \
      /skill install [--user] <url> [name]\n  \
      \x20                 Install a skill (or bundle) from a git repo or\n  \
@@ -3466,23 +3592,15 @@ pub async fn build_provider_with_fallback(
     }
     let original = config.model.clone();
 
-    // 2. Walk a preference list. Cloud providers only succeed when a
-    //    matching key exists (shell export > keychain > .env). Ollama
-    //    variants always *build* successfully, so we probe the endpoint
-    //    before offering them as a fallback — otherwise a user with no
-    //    keys AND no local Ollama gets a noisy "model not found" loop
-    //    on the first prompt.
+    // 2. Walk a free-fallback list ONLY. Paid providers are
+    //    deliberately excluded: silently swapping a user's
+    //    openrouter (or other) configuration to Anthropic when a
+    //    transient build failure happens has caused real bill
+    //    surprises. Ollama variants always *build* successfully so
+    //    we probe the daemon before offering them — otherwise a
+    //    user with no key AND no local Ollama gets a noisy
+    //    "model not found" loop on the first prompt.
     let fallback_order: &[ProviderKind] = &[
-        ProviderKind::Anthropic,
-        ProviderKind::OpenAI,
-        ProviderKind::AgenticPress,
-        ProviderKind::OpenRouter,
-        ProviderKind::Gemini,
-        ProviderKind::DashScope,
-        ProviderKind::QwenCloud,
-        ProviderKind::ZAi,
-        ProviderKind::ThaiLLM,
-        ProviderKind::OpenCodeGo,
         ProviderKind::Ollama,
         ProviderKind::OllamaAnthropic,
         ProviderKind::OllamaCloud,
@@ -3496,7 +3614,7 @@ pub async fn build_provider_with_fallback(
         config.model = kind.default_model().to_string();
         if let Ok(p) = build_provider(config) {
             let warning = format!(
-                "no API key for {} — falling back to {} (model: {})",
+                "{} couldn't be built — falling back to local {} (model: {}). Fix the credential or run `/model <provider>/<model>` to switch.",
                 ProviderKind::detect(&original)
                     .map(|k| k.name())
                     .unwrap_or("<unknown>"),
@@ -3507,12 +3625,15 @@ pub async fn build_provider_with_fallback(
         }
     }
 
-    // 3. Nothing works — restore the original model so the rest of the
-    //    REPL still shows what the user had configured, and let the
-    //    caller degrade gracefully.
+    // 3. Nothing free works — restore the original model so the
+    //    user's settings.json is untouched and let the caller
+    //    degrade gracefully. No silent swap to a paid provider.
     config.model = original;
     (None, Some(
-        "no usable LLM provider — set an API key via Settings → Provider API keys, or start Ollama (see Chapter 2)".into(),
+        format!(
+            "no usable LLM provider for `{}` and no local fallback (Ollama / LMStudio) reachable. Set an API key via Settings → Provider API keys, run `/model <provider>/<model>` to switch, or start a local runtime (see Chapter 2).",
+            config.model
+        ),
     ))
 }
 
@@ -4538,6 +4659,20 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
     // jobs stay in the manager until pruned, but each is announced once.
     let mut notified_research: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // Accumulated USD cost for this REPL session. Computed via the
+    // model catalogue after every AgentEvent::Done and shown alongside
+    // the per-turn token counts. `/cost reset` zeroes it.
+    let mut session_cost_usd: f64 = 0.0;
+
+    // Cardputer cost-display bridge — best-effort BLE central that
+    // streams `session_cost_usd` to a `thClaws-Cost-*` peripheral and
+    // takes reset notifications back when the user hits Backspace on
+    // the device. Feature-gated so headless CI / GUI-only builds don't
+    // pull in btleplug. The handle stays alive for the REPL's lifetime;
+    // dropping it on Ctrl-C / quit terminates the background task.
+    #[cfg(feature = "cost_bridge")]
+    let mut cost_bridge = crate::cost_bridge::spawn();
+
     // Helper: process team inbox messages and run agent turn.
     macro_rules! process_team_messages {
         ($msgs:expr) => {{
@@ -4695,6 +4830,16 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
     // Uses select! to race user input against team inbox messages so the
     // lead can respond to teammates without the user needing to press Enter.
     loop {
+        // Drain Cardputer reset notifications quietly — when the user
+        // hits Backspace on the device we zero the session counter so
+        // both displays stay in sync. Silent on purpose; the device
+        // already shows the $0.0000 result and a CLI println here would
+        // garble whatever the user is mid-typing into readline.
+        #[cfg(feature = "cost_bridge")]
+        while cost_bridge.rx_reset.try_recv().is_ok() {
+            session_cost_usd = 0.0;
+        }
+
         // M6.39.2: announce any research jobs that finished since the
         // last prompt (Done / Cancelled / Failed). Each id announced
         // once; subsequent prompts skip already-notified jobs.
@@ -6242,13 +6387,26 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                 }
                 SlashCommand::McpRemove { name, user } => {
                     match crate::config::remove_mcp_server(&name, user) {
-                        Ok((true, path)) => {
+                        Ok((true, path, removed_url)) => {
+                            let token_msg = if let Some(url) = removed_url {
+                                let mut store = crate::oauth::TokenStore::load();
+                                let had_token = store.get(&url).is_some();
+                                store.remove(&url);
+                                store.save();
+                                if had_token {
+                                    " + cached OAuth token cleared"
+                                } else {
+                                    ""
+                                }
+                            } else {
+                                ""
+                            };
                             println!(
-                                "{COLOR_DIM}mcp '{name}' removed from {} (restart to drop active tools){COLOR_RESET}",
+                                "{COLOR_DIM}mcp '{name}' removed from {}{token_msg} (restart to drop active tools){COLOR_RESET}",
                                 path.display()
                             );
                         }
-                        Ok((false, path)) => {
+                        Ok((false, path, _)) => {
                             println!(
                                 "{COLOR_YELLOW}no server named '{name}' in {}{COLOR_RESET}",
                                 path.display()
@@ -6256,6 +6414,24 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         }
                         Err(e) => {
                             println!("{COLOR_YELLOW}remove failed: {e}{COLOR_RESET}");
+                        }
+                    }
+                }
+                SlashCommand::McpReauth { name } => {
+                    match crate::mcp::reauth_server(&name, None).await {
+                        Ok(crate::mcp::ReauthOutcome::Completed(msg)) => {
+                            println!("{COLOR_DIM}{msg}{COLOR_RESET}");
+                        }
+                        Ok(crate::mcp::ReauthOutcome::Pending { auth_url, server_name }) => {
+                            println!(
+                                "{COLOR_DIM}[mcp] click to authorize '{server_name}':{COLOR_RESET}\n{auth_url}"
+                            );
+                            println!(
+                                "{COLOR_DIM}[mcp] complete the flow in your browser; the pod's /v1/oauth/callback handles the redirect.{COLOR_RESET}"
+                            );
+                        }
+                        Err(e) => {
+                            println!("{COLOR_YELLOW}[mcp] reauth failed: {e}{COLOR_RESET}");
                         }
                     }
                 }
@@ -6280,6 +6456,23 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         }
                     }
                 }
+                SlashCommand::Cost { reset } => {
+                    if reset {
+                        session_cost_usd = 0.0;
+                        #[cfg(feature = "cost_bridge")]
+                        let _ = cost_bridge.tx_cost.send(0.0);
+                        println!("{COLOR_DIM}session cost reset{COLOR_RESET}");
+                    } else if session_cost_usd > 0.0 {
+                        println!(
+                            "{COLOR_DIM}session cost: ${:.4}{COLOR_RESET}",
+                            session_cost_usd
+                        );
+                    } else {
+                        println!(
+                            "{COLOR_DIM}session cost: $0.0000 (no priced turns yet){COLOR_RESET}"
+                        );
+                    }
+                }
                 SlashCommand::Compact => {
                     let history = agent.history_snapshot();
                     let compacted = crate::compaction::compact(&history, agent.budget_tokens / 2);
@@ -6299,6 +6492,17 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         history.len(),
                         compacted.len()
                     );
+                }
+                SlashCommand::Reload => {
+                    println!(
+                        "{COLOR_DIM}[reload] re-executing thclaws — in-memory state will be reset, on-disk sessions survive…{COLOR_RESET}"
+                    );
+                    // Best-effort flush of stdout before exec() vanishes the
+                    // process. On Unix exec() only returns on failure.
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                    let err = crate::util::reexec_self();
+                    println!("{COLOR_YELLOW}[reload] re-exec failed: {err}{COLOR_RESET}");
                 }
                 SlashCommand::Fork => {
                     // Save → build LLM summary → seed a fresh session
@@ -8365,6 +8569,44 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         );
                     }
                 }
+                SlashCommand::Deploy {
+                    pod,
+                    token,
+                    dry_run,
+                    full,
+                    include_memory,
+                    allow_stdio_mcp,
+                    restart,
+                } => {
+                    let resolved_pod = pod.or_else(crate::remote_agent::url);
+                    let resolved_token = token.or_else(crate::remote_agent::token);
+                    let Some(pod_url) = resolved_pod else {
+                        println!(
+                            "{COLOR_YELLOW}[deploy] REMOTE_AGENT_URL not set — \
+                             open Settings → Provider API keys → Deploy target, \
+                             or pass --pod <URL>{COLOR_RESET}"
+                        );
+                        continue;
+                    };
+                    let Some(token_val) = resolved_token else {
+                        println!(
+                            "{COLOR_YELLOW}[deploy] REMOTE_AGENT_TOKEN not set — \
+                             open Settings → Provider API keys → Deploy target, \
+                             or pass --token <T>{COLOR_RESET}"
+                        );
+                        continue;
+                    };
+                    let args = crate::deploy_client::DeployArgs {
+                        pod: pod_url,
+                        token: Some(token_val),
+                        include_memory,
+                        allow_stdio_mcp,
+                        dry_run,
+                        full,
+                        restart,
+                    };
+                    let _ = crate::deploy_client::run(args).await;
+                }
                 SlashCommand::Unknown(what) => {
                     println!("{COLOR_YELLOW}unknown command: {what}{COLOR_RESET}");
                 }
@@ -8421,6 +8663,13 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
             let Some(ev) = ev else { break };
             match ev {
                 Ok(AgentEvent::IterationStart { .. }) => {}
+                Ok(AgentEvent::UserMessageInjected { text }) => {
+                    // Mid-turn user message landed at the tool_result
+                    // boundary (issue #106). Surface inline so the
+                    // CLI user sees their steering was applied.
+                    println!("\n{COLOR_DIM}[injected mid-turn]{COLOR_RESET} {text}");
+                    let _ = std::io::stdout().flush();
+                }
                 Ok(AgentEvent::Text(s)) => {
                     if last_was_thinking {
                         println!();
@@ -8543,16 +8792,42 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         _ => String::new(),
                     };
                     let elapsed = format_duration(turn_start.elapsed());
+                    // Cost: convert provider Usage → catalogue TokenUsage
+                    // (different field names, same numbers), then look up
+                    // the active model's pricing. Unknown / tier-billed
+                    // models return None — we just skip the cost suffix.
+                    let token_usage = crate::model_catalogue::TokenUsage {
+                        prompt_tokens: usage.input_tokens,
+                        completion_tokens: usage.output_tokens,
+                        cached_input_tokens: usage.cache_read_input_tokens.unwrap_or(0),
+                        cache_creation_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
+                        reasoning_tokens: usage.reasoning_output_tokens.unwrap_or(0),
+                    };
+                    let catalogue = crate::model_catalogue::EffectiveCatalogue::load();
+                    if let Some(c) = catalogue.compute_cost_usd(&config.model, &token_usage) {
+                        session_cost_usd += c;
+                    }
+                    // Push the running total to the Cardputer display.
+                    // Send fails silently when no device is paired —
+                    // we don't want a missing buddy to disrupt the REPL.
+                    #[cfg(feature = "cost_bridge")]
+                    let _ = cost_bridge.tx_cost.send(session_cost_usd);
+                    let cost_str = if session_cost_usd > 0.0 {
+                        format!(" · ${:.4} session", session_cost_usd)
+                    } else {
+                        String::new()
+                    };
                     println!(
-                        "\n{COLOR_DIM}[tokens: {}in/{}out{} · {}]{COLOR_RESET}",
-                        usage.input_tokens, usage.output_tokens, cache_info, elapsed
+                        "\n{COLOR_DIM}[tokens: {}in/{}out{} · {}{}]{COLOR_RESET}",
+                        usage.input_tokens, usage.output_tokens, cache_info, elapsed, cost_str
                     );
                     lead_log!(
-                        "\n{COLOR_DIM}[tokens: {}in/{}out{} · {}]{COLOR_RESET}\n",
+                        "\n{COLOR_DIM}[tokens: {}in/{}out{} · {}{}]{COLOR_RESET}\n",
                         usage.input_tokens,
                         usage.output_tokens,
                         cache_info,
-                        elapsed
+                        elapsed,
+                        cost_str
                     );
                     let _ = std::io::stdout().flush();
 
@@ -8687,6 +8962,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_slash_cost() {
+        assert_eq!(
+            parse_slash("/cost"),
+            Some(SlashCommand::Cost { reset: false })
+        );
+        assert_eq!(
+            parse_slash("/cost reset"),
+            Some(SlashCommand::Cost { reset: true })
+        );
+        assert_eq!(
+            parse_slash("/cost clear"),
+            Some(SlashCommand::Cost { reset: true })
+        );
+        assert!(matches!(
+            parse_slash("/cost bogus"),
+            Some(SlashCommand::Unknown(_))
+        ));
+    }
+
+    #[test]
     fn parse_slash_unknown_command() {
         assert_eq!(
             parse_slash("/bogus"),
@@ -8800,6 +9095,22 @@ mod tests {
         // Missing url → Unknown with usage hint.
         assert!(matches!(
             parse_slash("/mcp add weather"),
+            Some(SlashCommand::Unknown(_))
+        ));
+        assert_eq!(
+            parse_slash("/mcp reauth weather"),
+            Some(SlashCommand::McpReauth {
+                name: "weather".into(),
+            })
+        );
+        assert_eq!(
+            parse_slash("/mcp login weather"),
+            Some(SlashCommand::McpReauth {
+                name: "weather".into(),
+            })
+        );
+        assert!(matches!(
+            parse_slash("/mcp reauth"),
             Some(SlashCommand::Unknown(_))
         ));
     }

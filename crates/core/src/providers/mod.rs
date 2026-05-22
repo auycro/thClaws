@@ -1033,30 +1033,29 @@ pub async fn build_all_models_payload() -> String {
 }
 
 /// If `cfg.model`'s provider has no credentials, pick the first
-/// provider that does and return its default model. Returns `None`
-/// when the current model is already fine or nothing else is usable.
+/// **local / free** provider that's usable and return its default
+/// model. Returns `None` when the current model is already fine or
+/// no free fallback is available.
 ///
-/// Called by the GUI at startup and after `api_key_set` so the
-/// sidebar's active-provider indicator + persisted settings.json land
-/// on whatever the user actually has configured. Same logic now
-/// callable from the WS transport's settings handlers.
+/// Paid providers are deliberately excluded from the fallback list:
+/// silently swapping a user's openrouter (or other) configuration to
+/// Anthropic / OpenAI when their key check momentarily fails has
+/// caused real bill surprises. Better UX: surface the error, let the
+/// user fix the credential or pick a provider explicitly via
+/// `/model …`. Free fallbacks (Ollama variants) stay on so a user
+/// running entirely local still gets a sane default at first launch.
 pub fn auto_fallback_model(cfg: &crate::config::AppConfig) -> Option<String> {
     if provider_has_credentials(cfg) {
         return None;
     }
+    // Only no-cost providers are eligible. Each kind's
+    // `kind_has_credentials` enforces its own reachability check
+    // (Ollama variants return true unconditionally; the GUI layer
+    // probes the daemon before persisting the swap).
     const ORDER: &[ProviderKind] = &[
-        ProviderKind::Anthropic,
-        ProviderKind::OpenAI,
-        ProviderKind::AgenticPress,
-        ProviderKind::OpenRouter,
-        ProviderKind::Gemini,
-        ProviderKind::DashScope,
-        ProviderKind::QwenCloud,
-        ProviderKind::ZAi,
-        ProviderKind::DeepSeek,
-        ProviderKind::ThaiLLM,
-        ProviderKind::Minimax,
-        ProviderKind::OpenCodeGo,
+        ProviderKind::Ollama,
+        ProviderKind::OllamaAnthropic,
+        ProviderKind::LMStudio,
     ];
     for kind in ORDER {
         if kind_has_credentials(Some(*kind)) {

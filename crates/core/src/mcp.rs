@@ -1386,6 +1386,113 @@ async fn resolve_oauth_token(
 }
 
 // ---------------------------------------------------------------------------
+// /mcp reauth — slash-command-driven re-authorization
+// ---------------------------------------------------------------------------
+
+/// Outcome of [`reauth_server`] for a slash-command UI surface.
+pub enum ReauthOutcome {
+    /// Laptop loopback flow completed — the user's browser was opened
+    /// and a fresh token has already been written to the store. The
+    /// embedded string is the line to display to the user.
+    Completed(String),
+    /// Pod public-callback flow initiated — `auth_url` is the link the
+    /// owner must click in their laptop browser. After they consent
+    /// the provider's redirect lands on `/v1/oauth/callback` and the
+    /// token writes itself; no further user action in thClaws.
+    Pending {
+        auth_url: String,
+        server_name: String,
+    },
+}
+
+/// Re-authorize the MCP server named `name`. Looks up the URL from
+/// the merged mcp.json (project ∪ user), clears any cached token,
+/// then runs either the laptop loopback flow (when
+/// `THCLAWS_PUBLIC_BASE_URL` is unset) or the pod public-callback
+/// flow.
+///
+/// `base_url_override` lets a caller force the pod path even on a
+/// laptop — useful for testing the headless flow. `None` consults
+/// `THCLAWS_PUBLIC_BASE_URL` from the environment.
+pub async fn reauth_server(
+    name: &str,
+    base_url_override: Option<&str>,
+) -> crate::error::Result<ReauthOutcome> {
+    let config = crate::config::AppConfig::load()?;
+    let server = config
+        .mcp_servers
+        .iter()
+        .find(|s| s.name == name)
+        .ok_or_else(|| {
+            crate::error::Error::Config(format!(
+                "no MCP server named '{name}' in mcp.json (try /mcp to list)"
+            ))
+        })?;
+    if !server.transport.eq_ignore_ascii_case("http") {
+        return Err(crate::error::Error::Config(format!(
+            "server '{name}' has transport '{}' — /mcp reauth only applies to HTTP servers (OAuth)",
+            server.transport
+        )));
+    }
+    if server.url.trim().is_empty() {
+        return Err(crate::error::Error::Config(format!(
+            "server '{name}' has no `url` set in mcp.json"
+        )));
+    }
+    let mcp_url = server.url.clone();
+
+    // Drop any cached token so subsequent MCP calls re-discover the
+    // newly-issued one (instead of racing the still-cached entry).
+    {
+        let mut store = crate::oauth::TokenStore::load();
+        store.remove(&mcp_url);
+        store.save();
+    }
+
+    let client = reqwest::Client::new();
+    let meta = crate::oauth::discover(&client, &mcp_url).await?;
+
+    let public_base = base_url_override
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("THCLAWS_PUBLIC_BASE_URL").ok())
+        .map(|s| s.trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty());
+
+    if let Some(base) = public_base {
+        // Pod / headless flow.
+        let redirect_uri = format!("{base}/v1/oauth/callback");
+        let begin = crate::oauth::begin_authorize(&client, &meta, &redirect_uri).await?;
+        crate::api_v1::oauth_callback::insert_pending(
+            begin.state.clone(),
+            crate::api_v1::oauth_callback::PendingAuth {
+                code_verifier: begin.code_verifier.clone(),
+                redirect_uri: begin.redirect_uri.clone(),
+                client_id: begin.client_id.clone(),
+                client_secret: begin.client_secret.clone(),
+                scope: begin.scope.clone(),
+                token_endpoint: meta.token_endpoint.clone(),
+                authorization_server_origin: meta.authorization_server_origin.clone(),
+                server_url: mcp_url.clone(),
+                expires_at: 0, // overwritten on insert
+            },
+        );
+        return Ok(ReauthOutcome::Pending {
+            auth_url: begin.auth_url,
+            server_name: name.to_string(),
+        });
+    }
+
+    // Laptop loopback flow.
+    let entry = crate::oauth::authorize(&client, &meta, &mcp_url).await?;
+    let mut store = crate::oauth::TokenStore::load();
+    store.set(&mcp_url, entry);
+    store.save();
+    Ok(ReauthOutcome::Completed(format!(
+        "[mcp] reauth complete for '{name}' — token cached for {mcp_url}"
+    )))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

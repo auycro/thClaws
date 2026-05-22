@@ -24,6 +24,7 @@ pub mod deploy;
 pub mod errors;
 pub mod info;
 pub mod models;
+pub mod oauth_callback;
 
 /// Build the `/v1/*` sub-router. Mounted into the main server router
 /// by [`crate::server::run_with_engine`].
@@ -54,6 +55,11 @@ pub fn router() -> Router {
         .route("/v1/chat/completions", post(chat::chat_completions))
         .route("/agent/run", post(agent::agent_run))
         .route("/v1/agent/info", get(info::get_info))
+        .route("/v1/restart", post(deploy::restart))
+        // OAuth callback is intentionally public — the provider's
+        // redirect won't carry the Bearer token. State-nonce match
+        // is the auth, not a header. See oauth_callback.rs.
+        .route("/v1/oauth/callback", get(oauth_callback::oauth_callback))
         .merge(deploy_routes)
 }
 

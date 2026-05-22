@@ -207,6 +207,13 @@ pub struct AppConfig {
     /// their own rather than a generic map.
     #[serde(default)]
     pub translator_subagent_model: Option<String>,
+
+    /// Default target URL for the `/deploy` slash command (dev-plan/28).
+    /// Paired with the `remote-agent-token` keychain entry. Both can be
+    /// overridden per-invocation with `--pod` / `--token`. Not
+    /// sensitive (URL only) — token sits in the keychain.
+    #[serde(default, alias = "remoteAgentUrl")]
+    pub remote_agent_url: Option<String>,
 }
 
 /// Default stream-chunk idle timeout. Used by `serde(default = ...)`
@@ -263,6 +270,7 @@ impl Default for AppConfig {
             gateway_use_for: Vec::new(),
             extract_save_skill_models: None,
             translator_subagent_model: None,
+            remote_agent_url: None,
         }
     }
 }
@@ -457,6 +465,10 @@ pub struct ProjectConfig {
     /// per-provider opt-in lives in user-visible config.
     #[serde(rename = "gatewayUseFor")]
     pub gateway_use_for: Option<Vec<String>>,
+    /// Default target for `/deploy`. See
+    /// [`AppConfig::remote_agent_url`].
+    #[serde(rename = "remoteAgentUrl")]
+    pub remote_agent_url: Option<String>,
 }
 
 fn null_team_enabled_is_false<'de, D>(d: D) -> std::result::Result<Option<bool>, D::Error>
@@ -492,6 +504,7 @@ impl Default for ProjectConfig {
             auto_learn_reconcile_hours: None,
             openrouter_free_only: None,
             gateway_use_for: None,
+            remote_agent_url: None,
         }
     }
 }
@@ -708,10 +721,23 @@ impl ProjectConfig {
                 .filter(|s| !s.is_empty())
                 .collect();
         }
+        if let Some(ref url) = self.remote_agent_url {
+            let trimmed = url.trim();
+            if !trimmed.is_empty() {
+                config.remote_agent_url = Some(trimmed.to_string());
+            }
+        }
     }
 
     pub fn set_model(&mut self, model: &str) {
         self.model = Some(model.to_string());
+    }
+
+    /// Persist the `/deploy` default target URL. Pair with the
+    /// `remote-agent-token` keychain entry (managed by
+    /// [`crate::secrets`]) for the bearer token.
+    pub fn set_remote_agent_url(&mut self, url: Option<&str>) {
+        self.remote_agent_url = url.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     }
 
     /// Persist the GUI zoom factor. Clamped to a sane range so a
@@ -914,27 +940,36 @@ pub fn save_mcp_server(server: &crate::mcp::McpServerConfig, user: bool) -> Resu
     Ok(path)
 }
 
-/// Remove a server from the on-disk `mcp.json`. Returns whether anything
-/// was actually removed (false when the file or the key didn't exist).
-pub fn remove_mcp_server(name: &str, user: bool) -> Result<(bool, PathBuf)> {
+/// Remove a server from the on-disk `mcp.json`. Returns
+/// `(removed, path, removed_url)`: `removed` is false when the file
+/// or the key didn't exist; `removed_url` is `Some(url)` when the
+/// removed entry had an HTTP `url` (the caller uses this to drop any
+/// cached OAuth token for that server — see [`crate::oauth::TokenStore`]).
+pub fn remove_mcp_server(name: &str, user: bool) -> Result<(bool, PathBuf, Option<String>)> {
     let path = mcp_config_path(user)?;
     if !path.exists() {
-        return Ok((false, path));
+        return Ok((false, path, None));
     }
     let contents = std::fs::read_to_string(&path)?;
     let mut root: serde_json::Value = serde_json::from_str(&contents)
         .map_err(|e| Error::Config(format!("parse mcp.json: {e}")))?;
-    let removed = root
+    let removed_entry = root
         .get_mut("mcpServers")
         .and_then(|v| v.as_object_mut())
-        .and_then(|m| m.remove(name))
-        .is_some();
+        .and_then(|m| m.remove(name));
+    let removed_url = removed_entry
+        .as_ref()
+        .and_then(|v| v.get("url"))
+        .and_then(|u| u.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let removed = removed_entry.is_some();
     if removed {
         let pretty = serde_json::to_string_pretty(&root)
             .map_err(|e| Error::Config(format!("serialize mcp.json: {e}")))?;
         std::fs::write(&path, pretty)?;
     }
-    Ok((removed, path))
+    Ok((removed, path, removed_url))
 }
 
 fn mcp_config_path(user: bool) -> Result<PathBuf> {
