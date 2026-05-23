@@ -7,29 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-05-23
+
+Four user-facing fixes — three issue-driven, plus a Files-tab polish item
+caught while drafting a deck.
+
 ### Fixed
 
-- **Windows `--cli` readline whitespace and cursor offset.** Interactive
-  REPL input on Windows mishandled spaces and put the cursor in the wrong
-  column inside PowerShell / `cmd.exe`. Two root causes: the binary was
-  built with `#![windows_subsystem = "windows"]` and called
-  `AttachConsole(ATTACH_PARENT_PROCESS)` at startup, which detached stdio
-  from the parent terminal before rustyline could read keys; and the cyan
-  ANSI escapes embedded directly in the prompt string confused rustyline's
-  column accounting on Windows.
-  - Removed the `windows_subsystem = "windows"` attribute on
-    `crates/core/src/bin/app.rs` so the binary defaults to the console
-    subsystem and `--cli` keeps a working stdio.
-  - Replaced startup-wide `AttachConsole` with a GUI-only
-    `detach_console_for_gui()` that calls `FreeConsole()` immediately
-    before `gui::run_gui()`. Double-clicking still hides the console; the
-    REPL keeps it.
-  - Added `readline_config()` that sets `rustyline::Behavior::PreferTerm`
-    on Windows.
-  - Moved prompt coloring out of the prompt string into a
-    `highlight_prompt` impl on `SlashCompleter`, and routed the prompt
-    through a single `REPL_PROMPT` constant used by `readline()`, the
-    team-inbox reprint, and the turn-start log line.
+- **Windows: GUI launch no longer blocks the cmd.exe / PowerShell prompt**
+  ([#109](https://github.com/thClaws/thClaws/issues/109),
+  [@jubbyy](https://github.com/jubbyy);
+  [#111](https://github.com/thClaws/thClaws/pull/111)).
+  Typing `thclaws.exe` from a shell on Windows 11 used to leave the
+  prompt waiting until the GUI window closed. Root cause: PR #60 (May
+  2026) deliberately built the binary as the **console subsystem** so
+  `--cli`'s rustyline gets working stdio — the side effect was that
+  cmd.exe / PowerShell `WaitForSingleObject` on every console-subsystem
+  child, and `FreeConsole()` in the child can't undo that. Fix: at GUI
+  dispatch entry on Windows, respawn `current_exe()` with
+  `THCLAWS_GUI_DETACHED=1` and the `DETACHED_PROCESS` creation flag,
+  then `exit(0)` the parent. The detached child runs the GUI in-process
+  and survives parent / terminal closure; the parent exits in
+  microseconds so cmd's wait returns. Placed before the in-process
+  scheduler and `/v1` loopback bind so neither runs in the doomed
+  parent (no port-bind race on 18443). Spawn failure (antivirus
+  quarantine, ENOMEM, etc.) falls through to the in-process GUI run.
+  No-op on macOS / Linux.
+
+- **Agent: `max_tokens` escalation retry no longer rejected by claude-opus-4-7+**
+  ([#112](https://github.com/thClaws/thClaws/pull/112),
+  [@siharat-th](https://github.com/siharat-th)).
+  When the model hit `stop_reason=max_tokens` with no tool uses, the
+  loop escalated `max_tokens` to 64000 and retried. The partial
+  assistant message was already pushed to history, so the next
+  `provider.stream` call's messages ended with `role=assistant` —
+  which claude-opus-4-7+ rejects ("This model does not support
+  assistant message prefill. The conversation must end with a user
+  message."), failing the entire retry. Fix: pop the trailing
+  assistant (guarded on `role == Assistant` so an empty assistant
+  push is a no-op) before `continue`. The retry now sees a clean
+  conversation ending in `role=user` and the model produces a
+  complete response under the larger budget.
+
+- **CLI: `--model` flag now reaches GUI and `--serve` modes**
+  ([#110](https://github.com/thClaws/thClaws/pull/110),
+  [@dome](https://github.com/dome) — original diagnosis;
+  [#113](https://github.com/thClaws/thClaws/pull/113)).
+  `thclaws --model X` was applied only by the CLI/REPL branch in
+  `app.rs::main`, so the GUI and `--serve` paths silently ignored
+  it. Fix: route `--model` through a process-global override that
+  `AppConfig::load` applies last, after the project overlay — every
+  dispatch surface (CLI, GUI, `--serve`, `--serve --gui`) now honors
+  the flag without per-mode override plumbing. The GUI's
+  auto-fallback path clears the override after switching to a
+  working provider so a broken `--model` choice doesn't re-pin on
+  every reload. Closes #110.
+
+- **Files preview: relative `![alt](img/foo.png)` in markdown now renders.**
+  Comrak emits `<img src="img/foo.png">` verbatim, and the iframe's
+  `srcDoc` base URL is opaque, so relative paths had no directory to
+  resolve against and failed silently. Fix: inject a
+  `<base href="${origin}/file-asset/<dir>/">` into the rendered HTML
+  before `srcDoc` so relative refs resolve via the same
+  `/file-asset/` handler the `.html` branch already uses — same
+  sandbox check, no backend changes.
+
+### Added
+
+- **`--set-model VALUE` flag**
+  ([#113](https://github.com/thClaws/thClaws/pull/113)).
+  Persists a model to `.thclaws/settings.json` as the project
+  default *and* uses it for the current run. Kept separate from
+  `--model` (one-shot, in-memory) on purpose: a scripted
+  `thclaws --print --model gpt-4-mini "quick"` shouldn't silently
+  rewrite the default the user keeps for interactive work.
+  Distinguishes "file missing" (safe to create — falls back to
+  `ProjectConfig::load` so `.claude/settings.json` migrations
+  preserve existing settings) from "file exists but unreadable"
+  (bail with a clear error rather than silently nuking siblings
+  like `maxTokens` / `allowedTools` / `kms.active` with a
+  defaults-everywhere `ProjectConfig`). Save errors surface on
+  stderr; success prints a green confirmation with the resolved
+  path.
+
+### Default model — no change
+
+Default stays `claude-sonnet-4-6`.
 
 ## [0.6.2] — 2026-04-27
 

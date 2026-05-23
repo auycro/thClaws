@@ -129,6 +129,22 @@ function assetUrl(absPath: string): string {
   return `${window.location.origin}/file-asset${leadingSlash}${segments}`;
 }
 
+// Inject a <base href> pointing at the markdown file's parent directory
+// via the file-asset handler so relative refs in srcDoc'd HTML (e.g.
+// `<img src="img/foo.png">` from `![alt](img/foo.png)`) resolve to the
+// .md file's sibling assets. Without this the srcDoc iframe has an
+// opaque base URL and relative paths fail silently. The asset handler
+// already enforces the sandbox check, so security is unchanged.
+function injectBaseHref(html: string, filePath: string): string {
+  const normalized = filePath.replace(/\\/g, "/");
+  const lastSlash = normalized.lastIndexOf("/");
+  const dir = lastSlash >= 0 ? normalized.slice(0, lastSlash) : "";
+  const segments = dir.split("/").map(encodeURIComponent).join("/");
+  const leadingSlash = segments.startsWith("/") ? "" : "/";
+  const baseHref = `${window.location.origin}/file-asset${leadingSlash}${segments}/`;
+  return html.replace(/<head>/i, `<head><base href="${baseHref}">`);
+}
+
 export function FilesView({ active }: Props) {
   const [currentPath, setCurrentPath] = useState(".");
   const [entries, setEntries] = useState<FileEntry[]>([]);
@@ -665,10 +681,13 @@ export function FilesView({ active }: Props) {
                 // returns it in `content`. Use `srcDoc` so the iframe
                 // shows that HTML directly; `src={assetUrl}` would
                 // fetch the raw .md via the custom protocol and the
-                // iframe would end up blank.
+                // iframe would end up blank. `injectBaseHref` rewrites
+                // the document so relative `![alt](img/foo.png)` refs
+                // resolve via /file-asset/ instead of failing against
+                // srcDoc's opaque base URL.
                 <iframe
                   key={`md-${preview.path}-${previewVersion}`}
-                  srcDoc={preview.content}
+                  srcDoc={injectBaseHref(preview.content, preview.path)}
                   className="w-full flex-1 min-h-0 rounded border"
                   style={{ borderColor: "var(--border)", background: "var(--bg-primary)" }}
                   sandbox="allow-scripts"

@@ -38,9 +38,18 @@ struct Cli {
     #[arg(short, long)]
     print: bool,
 
-    /// Override model (e.g. claude-sonnet-4-5, gpt-4o, ollama/llama3.2)
+    /// Override model for this run only — applies to CLI, GUI, and --serve.
+    /// One-shot, in-memory. Pair with --set-model to persist instead.
     #[arg(short, long)]
     model: Option<String>,
+
+    /// Persist a model to `.thclaws/settings.json` as the project
+    /// default, then use it for this run. Unlike --model (one-shot),
+    /// subsequent invocations without --model will pick up this value.
+    /// Refuses to overwrite an unreadable settings file to avoid
+    /// clobbering sibling fields (maxTokens, allowedTools, etc.).
+    #[arg(long, value_name = "MODEL")]
+    set_model: Option<String>,
 
     /// Never ask for tool-call approval (alias: --dangerously-skip-permissions)
     #[arg(long, alias = "dangerously-skip-permissions")]
@@ -253,6 +262,67 @@ fn detach_console_for_gui() {
 #[cfg(not(windows))]
 fn detach_console_for_gui() {}
 
+/// Windows-only: when about to launch the GUI from a console (cmd.exe /
+/// PowerShell), respawn ourselves as a detached child and exit the parent
+/// so the shell prompt returns immediately. Issue #109.
+///
+/// Background: `thclaws.exe` is built as a **console-subsystem** binary
+/// (PR #60 / issue #48) so that `--cli`'s rustyline gets working stdio.
+/// The side effect is that cmd.exe / PowerShell `WaitForSingleObject` on
+/// every console-subsystem child until exit — `notepad.exe` returns the
+/// prompt instantly only because it's a windows-subsystem binary, and
+/// `FreeConsole()` in the child doesn't change cmd's wait. Result: typing
+/// `thclaws.exe` from a shell blocks the prompt until the GUI window closes.
+///
+/// Workaround: at the GUI dispatch entry, respawn `current_exe()` with
+/// `THCLAWS_GUI_DETACHED=1` and `DETACHED_PROCESS`, then `exit(0)`. The
+/// child sees the env var, skips the respawn, runs the GUI in-process,
+/// and survives parent / terminal closure because `DETACHED_PROCESS`
+/// breaks the parent process group. The parent exits in microseconds,
+/// so cmd's wait returns and the next prompt appears.
+///
+/// Called before the in-process scheduler and `/v1` loopback bind so
+/// neither runs in the doomed parent (avoiding a port-bind race on
+/// 18443). No-op on macOS / Linux — terminals there don't block on
+/// GUI children.
+#[cfg(all(windows, feature = "gui"))]
+fn respawn_detached_for_gui_if_needed(cli: &Cli) {
+    // Skip in the detached child itself.
+    if std::env::var_os("THCLAWS_GUI_DETACHED").is_some() {
+        return;
+    }
+    // Only respawn when the dispatch is actually GUI: not --cli/--print,
+    // and either plain GUI (no --serve) or the --serve --gui combo.
+    let use_cli = cli.cli || cli.print;
+    let is_gui_dispatch = !use_cli && (!cli.serve || cli.gui);
+    if !is_gui_dispatch {
+        return;
+    }
+
+    use std::os::windows::process::CommandExt;
+    // DETACHED_PROCESS (0x00000008) — child has no console, no process-
+    // group ties to the parent shell.
+    const DETACHED_PROCESS: u32 = 0x00000008;
+
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let spawn = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env("THCLAWS_GUI_DETACHED", "1")
+        .creation_flags(DETACHED_PROCESS)
+        .spawn();
+    if spawn.is_ok() {
+        std::process::exit(0);
+    }
+    // Spawn failed (antivirus quarantine, ENOMEM, etc.): fall through
+    // and run the GUI in-process. User loses the prompt-return but
+    // keeps a working app.
+}
+
+#[cfg(not(all(windows, feature = "gui")))]
+fn respawn_detached_for_gui_if_needed(_cli: &Cli) {}
+
 #[tokio::main]
 async fn main() {
     secrets::load_into_env();
@@ -331,11 +401,42 @@ async fn main() {
 
     let use_cli = cli.cli || cli.print;
 
+    // Issue #109: on Windows, respawn detached so cmd.exe / PowerShell
+    // return the prompt instead of waiting on the GUI window. Runs
+    // before the scheduler + /v1 loopback so they don't bind ports in
+    // the doomed parent. See `respawn_detached_for_gui_if_needed`.
+    respawn_detached_for_gui_if_needed(&cli);
+
     // First-run bootstrap: drop a `.thclaws/settings.json` with model +
     // permissions defaults into the project so users get a working
     // config the first time they `cd` in. Skipped if a config already
     // exists or if a Claude Code `.claude/settings.json` is present.
     thclaws_core::config::ProjectConfig::ensure_default_exists();
+
+    // Wire up `--set-model` / `--model` before any AppConfig::load runs.
+    // `--set-model` persists to `.thclaws/settings.json` (refusing to
+    // overwrite an unreadable file so we don't clobber sibling settings)
+    // and also takes effect this run; `--model` is in-memory only. Both
+    // route through `set_cli_model_override`, which `AppConfig::load`
+    // applies last — so every surface (CLI, GUI, --serve) sees the same
+    // model without each path re-implementing the override step.
+    if let Some(ref m) = cli.set_model {
+        let resolved = thclaws_core::providers::ProviderKind::resolve_alias(m);
+        match thclaws_core::config::persist_model_to_project_settings(&resolved) {
+            Ok(path) => eprintln!(
+                "\x1b[32m--set-model: persisted model={resolved} to {}\x1b[0m",
+                path.display()
+            ),
+            Err(e) => {
+                eprintln!("\x1b[31m--set-model: {e}\x1b[0m");
+                std::process::exit(1);
+            }
+        }
+        thclaws_core::config::set_cli_model_override(resolved);
+    } else if let Some(ref m) = cli.model {
+        let resolved = thclaws_core::providers::ProviderKind::resolve_alias(m);
+        thclaws_core::config::set_cli_model_override(resolved);
+    }
 
     // In-process scheduler (Step 2): spawn a background tokio task
     // that polls `~/.config/thclaws/schedules.json` every 30s and
@@ -444,10 +545,10 @@ async fn main() {
         }
     };
 
-    // CLI overrides.
-    if let Some(m) = cli.model {
-        config.model = thclaws_core::providers::ProviderKind::resolve_alias(&m);
-    }
+    // CLI overrides. `--model` / `--set-model` already routed through
+    // `set_cli_model_override` above, so `AppConfig::load` has applied
+    // them. The rest of these flags are CLI/REPL-only knobs that the
+    // GUI and --serve don't honor today.
     if cli.accept_all {
         config.permissions = "auto".to_string();
     }
