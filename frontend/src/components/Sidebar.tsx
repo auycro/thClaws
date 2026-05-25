@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { Plus } from "lucide-react";
 import { send, subscribe } from "../hooks/useIPC";
 import { ModelPickerDropdown } from "./ModelPickerDropdown";
+import { KmsCreateModal, type KmsCreateMode } from "./KmsCreateModal";
 
 type SessionInfo = { id: string; model: string; messages: number; title?: string | null };
 type KmsInfo = { name: string; scope: "user" | "project"; active: boolean };
@@ -15,6 +16,15 @@ type LineStatus = {
   /// fetch failure).
   display_name?: string;
   picture_url?: string;
+};
+
+/// dev-plan/29 Tier 1: Telegram bridge status pill state.
+type TelegramStatus = {
+  state: "connected" | "disconnected";
+  bot_username: string | null;
+  pending_approvals: number;
+  pending_pairings: number;
+  active_chats: number;
 };
 
 // Confirmation dialog with two backends. Mirrors `platformConfirm`
@@ -76,6 +86,9 @@ export function Sidebar({ onBrowseKms }: SidebarProps = {}) {
     { name: string; tools: number }[]
   >([]);
   const [kmss, setKmss] = useState<KmsInfo[]>([]);
+  // KMS create modal (new KMS base). null = closed. Replaces the old
+  // window.prompt() flow that silently failed inside the webview.
+  const [kmsModal, setKmsModal] = useState<KmsCreateMode | null>(null);
   // Right-click context menu anchored to the session row the user
   // right-clicked; null when closed. Click anywhere else dismisses.
   const [sessionMenu, setSessionMenu] = useState<
@@ -100,6 +113,13 @@ export function Sidebar({ onBrowseKms }: SidebarProps = {}) {
     state: "disconnected",
     server_url: "",
     pending_approvals: 0,
+  });
+  const [telegramStatus, setTelegramStatus] = useState<TelegramStatus>({
+    state: "disconnected",
+    bot_username: null,
+    pending_approvals: 0,
+    pending_pairings: 0,
+    active_chats: 0,
   });
 
   useEffect(() => {
@@ -143,12 +163,21 @@ export function Sidebar({ onBrowseKms }: SidebarProps = {}) {
           display_name: (msg.display_name as string | undefined) ?? undefined,
           picture_url: (msg.picture_url as string | undefined) ?? undefined,
         });
+      } else if (msg.type === "telegram_status") {
+        setTelegramStatus({
+          state: (msg.state as TelegramStatus["state"]) ?? "disconnected",
+          bot_username: (msg.bot_username as string | null) ?? null,
+          pending_approvals: (msg.pending_approvals as number) ?? 0,
+          pending_pairings: (msg.pending_pairings as number) ?? 0,
+          active_chats: (msg.active_chats as number) ?? 0,
+        });
       }
     });
     // Ask for current LINE state once at mount. The backend replies
     // with a `line_status` envelope the subscriber above renders.
     // (SSO state is fetched by the navbar LoginButton.)
     send({ type: "line_status" });
+    send({ type: "telegram_status" });
     return unsub;
   }, []);
 
@@ -315,6 +344,57 @@ export function Sidebar({ onBrowseKms }: SidebarProps = {}) {
         </Section>
       )}
 
+      {/* Telegram bridge pill — visible only while connected. Mirrors
+          the LINE pill; a warning dot flags pending approvals or
+          pairing requests waiting on the owner. dev-plan/29 Tier 1. */}
+      {telegramStatus.state === "connected" && (
+        <Section title="Telegram">
+          <div
+            className="px-2 py-1 flex items-center gap-1.5"
+            title={`${telegramStatus.bot_username ?? "bot"} · ${telegramStatus.active_chats} chat(s)${
+              telegramStatus.pending_approvals > 0
+                ? ` · ${telegramStatus.pending_approvals} approval(s) pending`
+                : ""
+            }${
+              telegramStatus.pending_pairings > 0
+                ? ` · ${telegramStatus.pending_pairings} pairing(s) waiting`
+                : ""
+            }`}
+          >
+            <span
+              className="w-1.5 h-1.5 rounded-full"
+              style={{
+                background:
+                  telegramStatus.pending_approvals > 0 ||
+                  telegramStatus.pending_pairings > 0
+                    ? "var(--warning, #d19a66)"
+                    : "var(--accent)",
+              }}
+              aria-hidden
+            />
+            <span className="truncate" style={{ color: "var(--text-primary)" }}>
+              {telegramStatus.bot_username ?? "bridge live"}
+            </span>
+            {telegramStatus.pending_pairings > 0 && (
+              <span
+                className="ml-auto"
+                style={{ color: "var(--warning, #d19a66)", fontSize: "10px" }}
+              >
+                {telegramStatus.pending_pairings} pair
+              </span>
+            )}
+            {telegramStatus.pending_approvals > 0 && (
+              <span
+                className={telegramStatus.pending_pairings > 0 ? "" : "ml-auto"}
+                style={{ color: "var(--warning, #d19a66)", fontSize: "10px" }}
+              >
+                {telegramStatus.pending_approvals}
+              </span>
+            )}
+          </div>
+        </Section>
+      )}
+
       {/* Sessions */}
       <Section
         title="Sessions"
@@ -441,21 +521,7 @@ export function Sidebar({ onBrowseKms }: SidebarProps = {}) {
           <button
             className="p-0.5 rounded hover:bg-white/10"
             title="New KMS"
-            onClick={() => {
-              const name = window.prompt(
-                "New KMS name (letters, digits, -, _):",
-                "",
-              );
-              if (!name) return;
-              const trimmed = name.trim();
-              if (!trimmed) return;
-              const scope = window.confirm(
-                `Scope?\n\nOK = user (~/.config/thclaws/kms/${trimmed})\nCancel = project (./.thclaws/kms/${trimmed})`,
-              )
-                ? "user"
-                : "project";
-              send({ type: "kms_new", name: trimmed, scope });
-            }}
+            onClick={() => setKmsModal({ kind: "kms" })}
           >
             <Plus size={12} />
           </button>
@@ -662,6 +728,9 @@ export function Sidebar({ onBrowseKms }: SidebarProps = {}) {
             </form>
           </div>
         </div>
+      )}
+      {kmsModal && (
+        <KmsCreateModal mode={kmsModal} onClose={() => setKmsModal(null)} />
       )}
     </div>
   );

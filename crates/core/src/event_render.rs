@@ -108,6 +108,7 @@ pub fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
         ViewEvent::KmsUpdate(json) => vec![json.clone()],
         ViewEvent::McpUpdate(json) => vec![json.clone()],
         ViewEvent::LineStatus(json) => vec![json.clone()],
+        ViewEvent::TelegramStatus(json) => vec![json.clone()],
         ViewEvent::ResearchUpdate(json) => vec![json.clone()],
         ViewEvent::ModelPickerOpen(json) => vec![json.clone()],
         ViewEvent::ScheduleAddOpen(json) => vec![json.clone()],
@@ -193,6 +194,7 @@ pub fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
                 crate::permissions::PermissionMode::Ask => "ask",
                 crate::permissions::PermissionMode::Plan => "plan",
                 crate::permissions::PermissionMode::LineGated => "linegated",
+                crate::permissions::PermissionMode::TelegramGated => "telegramgated",
             };
             let payload = serde_json::json!({
                 "type": "chat_permission_mode",
@@ -456,6 +458,7 @@ pub fn render_terminal_ansi(state: &mut TerminalRenderState, ev: &ViewEvent) -> 
         ViewEvent::KmsUpdate(_) => None,
         ViewEvent::McpUpdate(_) => None,
         ViewEvent::LineStatus(_) => None,
+        ViewEvent::TelegramStatus(_) => None,
         ViewEvent::ResearchUpdate(_) => None,
         ViewEvent::ModelPickerOpen(_) => None,
         ViewEvent::ScheduleAddOpen(_) => None,

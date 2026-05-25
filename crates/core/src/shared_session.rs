@@ -185,6 +185,34 @@ pub enum ShellInput {
         text: String,
         respond: tokio::sync::oneshot::Sender<String>,
     },
+    /// dev-plan/29 Tier 1: connect the Telegram bridge from a saved
+    /// `TelegramConfig` (GUI Connect modal, or boot auto-reconnect). The
+    /// worker validates the token via `getMe`, spawns the polling
+    /// session, stashes the `TelegramSessionHandle`, swaps the approver
+    /// to `TelegramApprover`, and broadcasts `ViewEvent::TelegramStatus`.
+    TelegramConnect(crate::telegram::TelegramConfig),
+    /// dev-plan/29: IPC `telegram_disconnect`. Worker cancels the
+    /// session, restores the pre-connect mode/approver, deletes the
+    /// on-disk config, and broadcasts the disconnected status.
+    TelegramDisconnect,
+    /// dev-plan/29: a Telegram user sent text; the polling sink pushes it
+    /// here so the worker drives the real `Agent::run_turn`. `respond`
+    /// is filled with the captured final assistant text — the session
+    /// then chunks + sends it back via `sendMessage`.
+    TelegramMessage {
+        text: String,
+        respond: tokio::sync::oneshot::Sender<String>,
+    },
+    /// dev-plan/29: owner approved a pairing code in the GUI. Worker
+    /// appends the user id to `allow_from`, persists, and DMs the user.
+    TelegramPairingApprove { code: String },
+    /// dev-plan/29: owner rejected a pairing code in the GUI.
+    TelegramPairingReject { code: String },
+    /// dev-plan/29: GUI requested a live status snapshot (pending
+    /// pairings + approvals + chat counts live in the worker's in-memory
+    /// handle, not on disk). The worker answers by broadcasting a
+    /// `ViewEvent::TelegramStatus`. Polled by the connect modal.
+    TelegramStatusRequest,
 }
 
 /// What both tabs render. Each variant maps to a UI affordance:
@@ -244,6 +272,12 @@ pub enum ViewEvent {
     /// server_url: "...", pending_approvals: N}`. Emitted on pair /
     /// disconnect and whenever the bridge crosses a state boundary.
     LineStatus(String),
+    /// Telegram bridge status (dev-plan/29). Pre-built JSON shaped like
+    /// `{type: "telegram_status", state, bot_username, pending_approvals,
+    /// pending_pairings, active_chats, pairings: [{code, display, …}]}`.
+    /// Emitted on connect / disconnect / pairing change and in response
+    /// to `TelegramStatusRequest`.
+    TelegramStatus(String),
     /// Goal-state sidebar refresh (Phase A). Carries the latest snapshot
     /// of the active /goal — `None` means the goal was cleared. Frontend
     /// renders a compact indicator (objective, iterations, tokens
@@ -593,6 +627,16 @@ pub struct WorkerState {
     /// session is active.
     pub line_pre_mode: Option<crate::permissions::PermissionMode>,
     pub line_pre_approver: Option<std::sync::Arc<dyn crate::permissions::ApprovalSink>>,
+    /// dev-plan/29 Tier 1: active Telegram-bridge session. `Some` only
+    /// while the polling task is running; `telegram_disconnect` cancels
+    /// + clears it. Mirrors `line_session`. Running LINE and Telegram
+    /// simultaneously isn't a Tier 1 goal — last-connect wins the
+    /// approver routing.
+    pub telegram_session: Option<crate::telegram::TelegramSessionHandle>,
+    /// Pre-Telegram-connect snapshot of the agent's permission mode +
+    /// approver, restored on disconnect. Mirrors `line_pre_*`.
+    pub telegram_pre_mode: Option<crate::permissions::PermissionMode>,
+    pub telegram_pre_approver: Option<std::sync::Arc<dyn crate::permissions::ApprovalSink>>,
     /// Externally-held mid-turn injection queue (issue #106). Kept on
     /// the state so `rebuild_agent` can re-wire it onto the new agent
     /// — without this, a `/model` swap or other rebuild would orphan
@@ -1021,6 +1065,33 @@ pub fn spawn_with_approver(
         ready_gate,
         injection_queue,
     }
+}
+
+/// Build the live `telegram_status` JSON for the GUI from an active
+/// bridge handle. Counts are read from the in-memory approver / pairing
+/// manager / chat registry (dev-plan/29).
+fn telegram_status_payload(handle: &crate::telegram::TelegramSessionHandle) -> serde_json::Value {
+    serde_json::json!({
+        "type": "telegram_status",
+        "state": handle.status.state,
+        "bot_username": handle.status.bot_username,
+        "pending_approvals": handle.approver.pending_count(),
+        "pending_pairings": handle.pairing.pending_list().len(),
+        "active_chats": handle.registry.active_count(),
+        "pairings": handle.pairing.pending_list(),
+    })
+}
+
+fn telegram_disconnected_payload() -> serde_json::Value {
+    serde_json::json!({
+        "type": "telegram_status",
+        "state": "disconnected",
+        "bot_username": serde_json::Value::Null,
+        "pending_approvals": 0,
+        "pending_pairings": 0,
+        "active_chats": 0,
+        "pairings": [],
+    })
 }
 
 async fn run_worker(
@@ -1565,6 +1636,9 @@ async fn run_worker(
         line_session: None,
         line_pre_mode: None,
         line_pre_approver: None,
+        telegram_session: None,
+        telegram_pre_mode: None,
+        telegram_pre_approver: None,
         session_cost_usd: 0.0,
         #[cfg(feature = "cost_bridge")]
         cost_bridge: Some(crate::cost_bridge::spawn()),
@@ -1591,6 +1665,17 @@ async fn run_worker(
         }
         Ok(None) => {}
         Err(e) => eprintln!("[line] failed to load on-disk config: {e}"),
+    }
+
+    // dev-plan/29 Tier 1: auto-reconnect the Telegram bridge on boot
+    // when a runtime config is on disk, enabled, and a token resolves
+    // (file or `TELEGRAM_BOT_TOKEN`). Mirrors the LINE block above.
+    match crate::telegram::TelegramConfig::load() {
+        Ok(Some(cfg)) if cfg.enabled && cfg.resolved_token().is_some() => {
+            let _ = input_tx_self.send(ShellInput::TelegramConnect(cfg));
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("[telegram] failed to load on-disk config: {e}"),
     }
 
     // Lead inbox poller — parity with repl.rs:1524. Without this, teammates
@@ -2109,6 +2194,191 @@ async fn run_worker(
                 crate::tools::ask::set_line_driven_turn(false);
                 let final_text = collector.await.unwrap_or_default();
                 let _ = respond.send(final_text);
+            }
+            ShellInput::TelegramConnect(tg_cfg) => {
+                // Validate the token via getMe before committing — a bad
+                // token gets clear feedback instead of a silent dead
+                // poller. Resolves env-first (TELEGRAM_BOT_TOKEN).
+                let Some(token) = tg_cfg.resolved_token() else {
+                    let payload = serde_json::json!({
+                        "type": "telegram_status",
+                        "state": "disconnected",
+                        "error": "no bot token (set TELEGRAM_BOT_TOKEN or paste one in the modal)",
+                    });
+                    let _ = events_tx.send(ViewEvent::TelegramStatus(payload.to_string()));
+                    continue;
+                };
+                let probe = crate::telegram::TelegramClient::new(token);
+                let bot_username = match probe.get_me().await {
+                    Ok(me) => me.username.map(|u| format!("@{u}")),
+                    Err(e) => {
+                        let payload = serde_json::json!({
+                            "type": "telegram_status",
+                            "state": "disconnected",
+                            "error": format!("token rejected by Telegram: {e}"),
+                        });
+                        let _ = events_tx.send(ViewEvent::TelegramStatus(payload.to_string()));
+                        let _ = events_tx.send(ViewEvent::ErrorText(format!(
+                            "[telegram] connect failed: {e}"
+                        )));
+                        continue;
+                    }
+                };
+
+                // New connect always wins — cancel any prior session.
+                if let Some(prev) = state.telegram_session.take() {
+                    prev.cancel.cancel();
+                }
+                let handle =
+                    crate::telegram::bootstrap::spawn(tg_cfg, bot_username, input_tx_self.clone());
+
+                // Swap permission posture so approvals route through
+                // Telegram while connected. Stash the AGENT's mode +
+                // approver (not just the global) so disconnect restores
+                // exactly — same C3 fix the LINE path documents.
+                if state.telegram_pre_mode.is_none() {
+                    state.telegram_pre_mode = Some(state.agent.permission_mode);
+                    state.telegram_pre_approver = Some(state.approver.clone());
+                }
+                crate::permissions::set_current_mode_and_broadcast(
+                    crate::permissions::PermissionMode::TelegramGated,
+                );
+                state.approver =
+                    handle.approver.clone() as std::sync::Arc<dyn crate::permissions::ApprovalSink>;
+                if let Err(e) = state.rebuild_agent(true) {
+                    eprintln!("[telegram] rebuild_agent after mode swap failed: {e}");
+                }
+                state.agent.permission_mode = crate::permissions::PermissionMode::TelegramGated;
+
+                let payload = telegram_status_payload(&handle);
+                state.telegram_session = Some(handle);
+                let _ = events_tx.send(ViewEvent::TelegramStatus(payload.to_string()));
+                let _ = events_tx.send(ViewEvent::SlashOutput(
+                    "[telegram] bridge connected · permissions routed to Telegram".into(),
+                ));
+            }
+            ShellInput::TelegramDisconnect => {
+                if let Some(handle) = state.telegram_session.take() {
+                    handle.cancel.cancel();
+                }
+                // Restore pre-connect mode + approver (same C3 fix as
+                // LINE — restore on the agent's mode, not just global).
+                if let Some(prev_mode) = state.telegram_pre_mode.take() {
+                    crate::permissions::set_current_mode_and_broadcast(prev_mode);
+                    state.agent.permission_mode = prev_mode;
+                }
+                if let Some(prev_approver) = state.telegram_pre_approver.take() {
+                    state.approver = prev_approver;
+                    if let Err(e) = state.rebuild_agent(true) {
+                        eprintln!("[telegram] rebuild_agent after restore failed: {e}");
+                    }
+                }
+                // Delete on-disk config so the next boot doesn't
+                // auto-reconnect.
+                if let Err(e) = crate::telegram::TelegramConfig::delete() {
+                    eprintln!("[telegram] delete on-disk config: {e}");
+                }
+                let _ = events_tx.send(ViewEvent::TelegramStatus(
+                    telegram_disconnected_payload().to_string(),
+                ));
+                let _ = events_tx.send(ViewEvent::SlashOutput(
+                    "[telegram] bridge disconnected".into(),
+                ));
+            }
+            ShellInput::TelegramMessage { text, respond } => {
+                // Drive the live agent for an inbound Telegram message.
+                // Subscribe before the turn, accumulate the FINAL
+                // assistant text (cleared on each ToolCallStart so only
+                // post-last-tool narration survives), answer via the
+                // oneshot. The session sink chunks + sends it back.
+                let mut event_rx = events_tx.subscribe();
+                let collector = tokio::spawn(async move {
+                    let mut buf = String::new();
+                    while let Ok(ev) = event_rx.recv().await {
+                        match ev {
+                            ViewEvent::AssistantTextDelta(s) => buf.push_str(&s),
+                            ViewEvent::ToolCallStart { .. } => buf.clear(),
+                            ViewEvent::TurnDone => break,
+                            ViewEvent::ErrorText(s) => {
+                                if buf.is_empty() {
+                                    buf.push_str(&s);
+                                } else {
+                                    buf.push_str("\n\n");
+                                    buf.push_str(&s);
+                                }
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    buf
+                });
+                // Remote-driven turn: AskUserQuestion short-circuits to a
+                // "please ask in your reply" text instead of a GUI modal
+                // the Telegram user can't see (reuses the LINE flag).
+                crate::tools::ask::set_line_driven_turn(true);
+                handle_line(text, &mut state, &events_tx, &cancel, &input_tx_self).await;
+                crate::tools::ask::set_line_driven_turn(false);
+                let final_text = collector.await.unwrap_or_default();
+                let _ = respond.send(final_text);
+            }
+            ShellInput::TelegramPairingApprove { code } => {
+                if let Some(handle) = state.telegram_session.as_ref() {
+                    if let Some(pair) = handle.pairing.approve(&code) {
+                        // Append to allow_from on the shared config and
+                        // persist so the approval survives restart.
+                        let persisted = {
+                            let mut cfg = handle.config.lock().ok();
+                            cfg.as_mut().map(|c| {
+                                c.add_allowed_user(pair.user_id);
+                                (*c).clone()
+                            })
+                        };
+                        if let Some(cfg) = persisted {
+                            if let Err(e) = cfg.save() {
+                                eprintln!("[telegram] save after pairing approve failed: {e}");
+                            }
+                        }
+                        let client = handle.client.clone();
+                        let chat_id = pair.chat_id;
+                        tokio::spawn(async move {
+                            let _ = client
+                                .send_text(
+                                    chat_id,
+                                    "✅ You're approved! Send a message to start chatting with thClaws.",
+                                )
+                                .await;
+                        });
+                        let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+                            "[telegram] paired {}",
+                            pair.display
+                        )));
+                    }
+                    let payload = telegram_status_payload(handle);
+                    let _ = events_tx.send(ViewEvent::TelegramStatus(payload.to_string()));
+                }
+            }
+            ShellInput::TelegramPairingReject { code } => {
+                if let Some(handle) = state.telegram_session.as_ref() {
+                    if let Some(pair) = handle.pairing.reject(&code) {
+                        let client = handle.client.clone();
+                        let chat_id = pair.chat_id;
+                        tokio::spawn(async move {
+                            let _ = client
+                                .send_text(chat_id, "🚫 Your pairing request was declined.")
+                                .await;
+                        });
+                    }
+                    let payload = telegram_status_payload(handle);
+                    let _ = events_tx.send(ViewEvent::TelegramStatus(payload.to_string()));
+                }
+            }
+            ShellInput::TelegramStatusRequest => {
+                let payload = match state.telegram_session.as_ref() {
+                    Some(handle) => telegram_status_payload(handle),
+                    None => telegram_disconnected_payload(),
+                };
+                let _ = events_tx.send(ViewEvent::TelegramStatus(payload.to_string()));
             }
             ShellInput::McpAppCallTool {
                 request_id,
@@ -4023,18 +4293,11 @@ impl Provider for NoopProvider {
 /// True if this provider is usable without further setup — either
 /// because the env var holding its API key is set, or because it
 /// doesn't need one (Ollama variants, Agent SDK using Claude Code's
-/// own auth). Mirrors `gui::kind_has_credentials` without the
-/// `#[cfg(feature = "gui")]` gate so the shared worker can call it.
+/// own auth). Delegates to the canonical `providers::kind_has_credentials`
+/// so the shared worker, GUI, and CLI all agree (incl. file-based
+/// ChatGptCodex auth).
 fn kind_has_credentials(kind: crate::providers::ProviderKind) -> bool {
-    use crate::providers::ProviderKind;
-    match kind {
-        ProviderKind::AgentSdk => true,
-        ProviderKind::Ollama | ProviderKind::OllamaAnthropic => true,
-        other => other
-            .api_key_env()
-            .map(|v| std::env::var(v).is_ok())
-            .unwrap_or(false),
-    }
+    crate::providers::kind_has_credentials(Some(kind))
 }
 
 /// Auto-compact at 80% of `agent.budget_tokens`. Cheap drop-oldest

@@ -137,11 +137,32 @@ impl Provider for AgentSdkProvider {
             .arg("--permission-mode")
             .arg("bypassPermissions");
 
-        // Always set --system-prompt explicitly. Passing an empty string
-        // suppresses Claude Code's bundled system prompt so the model sees
-        // only thClaws's. Non-empty values replace the bundled prompt.
+        // Write system prompt to a temp file to avoid OS ARG_MAX limits.
+        // With MCP tools + CLAUDE.md + skills, the prompt can exceed 128KB
+        // which hits MAX_ARG_STRLEN when passed as a CLI argument.
+        // Uses tempfile for: unique name (no race), mode 0600 (no leak),
+        // O_EXCL (no symlink attack). Kept alive until after spawn.
         let system = req.system.clone().unwrap_or_default();
-        cmd.arg("--system-prompt").arg(&system);
+        let _prompt_guard: Option<tempfile::TempPath> = if system.is_empty() {
+            cmd.arg("--system-prompt").arg("");
+            None
+        } else {
+            use std::io::Write as _;
+            let mut tmp = tempfile::Builder::new()
+                .prefix("thclaws-sdk-prompt-")
+                .suffix(".txt")
+                .tempfile()
+                .map_err(|e| Error::Provider(format!("failed to create prompt temp file: {e}")))?;
+            tmp.write_all(system.as_bytes()).map_err(|e| {
+                Error::Provider(format!(
+                    "failed to write system prompt file {}: {e}",
+                    tmp.path().display()
+                ))
+            })?;
+            let prompt_path = tmp.into_temp_path();
+            cmd.arg("--system-prompt-file").arg(prompt_path.as_os_str());
+            Some(prompt_path)
+        };
 
         // Strip the `agent/` prefix for the actual model name.
         let model = req.model.strip_prefix("agent/").unwrap_or(&req.model);

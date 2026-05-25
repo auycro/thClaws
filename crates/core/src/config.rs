@@ -503,6 +503,14 @@ pub struct ProjectConfig {
     /// [`AppConfig::remote_agent_url`].
     #[serde(rename = "remoteAgentUrl")]
     pub remote_agent_url: Option<String>,
+    /// Telegram adapter binding (dev-plan/29). When present, a repo can
+    /// ship a bot config alongside its agents. The bot **token** still
+    /// resolves env-first (`TELEGRAM_BOT_TOKEN`) per
+    /// [`crate::telegram::TelegramConfig::resolved_token`], so a token
+    /// need never be committed here. The user-runtime
+    /// `~/.config/thclaws/telegram.json` is the GUI's source of truth;
+    /// this project layer is read at load for headless / shipped setups.
+    pub telegram: Option<crate::telegram::TelegramConfig>,
 }
 
 fn null_team_enabled_is_false<'de, D>(d: D) -> std::result::Result<Option<bool>, D::Error>
@@ -539,6 +547,7 @@ impl Default for ProjectConfig {
             openrouter_free_only: None,
             gateway_use_for: None,
             remote_agent_url: None,
+            telegram: None,
         }
     }
 }

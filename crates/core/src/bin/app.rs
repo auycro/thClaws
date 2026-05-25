@@ -133,6 +133,13 @@ struct Cli {
     #[arg(long)]
     no_scheduler: bool,
 
+    /// Run the Telegram bot headless (no GUI window). Reads the bot token
+    /// from TELEGRAM_BOT_TOKEN or ~/.config/thclaws/telegram.json; set
+    /// TELEGRAM_OWNER_ID=<your id> for instant DM access. The agent runs
+    /// locally; Telegram is just the chat surface. dev-plan/29.
+    #[arg(long)]
+    telegram: bool,
+
     /// Prompt (positional args joined with spaces)
     prompt: Vec<String>,
 }
@@ -184,6 +191,24 @@ enum Command {
         #[arg(long = "no-restart")]
         no_restart: bool,
     },
+    /// Manage the Telegram adapter (dev-plan/29). `status` prints the
+    /// resolved config; `pair` prints setup instructions. Connecting a
+    /// bot is done from the GUI Telegram Connect modal (or auto-loads on
+    /// launch when `~/.config/thclaws/telegram.json` is present + enabled).
+    Telegram {
+        #[command(subcommand)]
+        cmd: TelegramCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum TelegramCmd {
+    /// Print the resolved Telegram config: whether a token is present
+    /// (redacted), DM/group policy, allowlist size, output ceiling.
+    Status,
+    /// Print step-by-step instructions for creating a bot with
+    /// @BotFather and connecting it.
+    Pair,
 }
 
 #[derive(Subcommand)]
@@ -192,9 +217,20 @@ enum ScheduleCmd {
     Add {
         /// Stable id for the schedule (used as the lookup key and log dir name).
         id: String,
-        /// Standard 5-field POSIX cron expression (e.g. "30 8 * * MON-FRI").
+        /// Standard 5-field POSIX cron expression for a recurring job
+        /// (e.g. "30 8 * * MON-FRI"). Mutually exclusive with --at/--in.
         #[arg(long)]
-        cron: String,
+        cron: Option<String>,
+        /// One-shot: fire once at this absolute RFC 3339 time
+        /// (e.g. "2026-05-24T15:30:00Z"), then auto-disable. Mutually
+        /// exclusive with --cron and --in.
+        #[arg(long, conflicts_with_all = ["cron", "in_delay"])]
+        at: Option<String>,
+        /// One-shot: fire once after this relative delay (e.g. 15m, 2h,
+        /// 90s, 1d), then auto-disable. Mutually exclusive with --cron
+        /// and --at.
+        #[arg(long = "in", conflicts_with_all = ["cron", "at"])]
+        in_delay: Option<String>,
         /// Prompt text to feed `thclaws --print` when this schedule fires.
         #[arg(long)]
         prompt: String,
@@ -291,9 +327,10 @@ fn respawn_detached_for_gui_if_needed(cli: &Cli) {
     if std::env::var_os("THCLAWS_GUI_DETACHED").is_some() {
         return;
     }
-    // Only respawn when the dispatch is actually GUI: not --cli/--print,
-    // and either plain GUI (no --serve) or the --serve --gui combo.
-    let use_cli = cli.cli || cli.print;
+    // Only respawn when the dispatch is actually GUI: not --cli/--print/
+    // --telegram, and either plain GUI (no --serve) or the --serve --gui
+    // combo.
+    let use_cli = cli.cli || cli.print || cli.telegram;
     let is_gui_dispatch = !use_cli && (!cli.serve || cli.gui);
     if !is_gui_dispatch {
         return;
@@ -396,10 +433,14 @@ async fn main() {
             .await;
             std::process::exit(code);
         }
+        Some(Command::Telegram { cmd }) => {
+            let code = run_telegram_subcommand(cmd);
+            std::process::exit(code);
+        }
         None => {}
     }
 
-    let use_cli = cli.cli || cli.print;
+    let use_cli = cli.cli || cli.print || cli.telegram;
 
     // Issue #109: on Windows, respawn detached so cmd.exe / PowerShell
     // return the prompt instead of waiting on the GUI window. Runs
@@ -576,7 +617,14 @@ async fn main() {
         std::env::set_var("THCLAWS_TEAM_DIR", team_dir);
     }
 
-    if cli.print {
+    if cli.telegram {
+        // Headless Telegram bot — its own agent loop (the GUI worker is
+        // gui-gated). Runs until Ctrl-C. dev-plan/29 Tier 1.
+        if let Err(e) = thclaws_core::telegram::headless::run(config).await {
+            eprintln!("\n\x1b[31m[telegram] error: {e}\x1b[0m");
+            std::process::exit(1);
+        }
+    } else if cli.print {
         let prompt = cli.prompt.join(" ");
         if prompt.is_empty() {
             eprintln!("\x1b[31m--print requires a prompt argument\x1b[0m");
@@ -598,11 +646,62 @@ async fn main() {
 /// process should report. `run` returns the child's exit code (or 124
 /// on timeout, mirroring GNU `timeout(1)`); the management subcommands
 /// return 0 on success and 1 on user error.
+fn run_telegram_subcommand(cmd: TelegramCmd) -> i32 {
+    use thclaws_core::telegram::{config::redact_token, TelegramConfig};
+    match cmd {
+        TelegramCmd::Status => {
+            let cfg = match TelegramConfig::load() {
+                Ok(Some(c)) => c,
+                Ok(None) => TelegramConfig::default(),
+                Err(e) => {
+                    eprintln!("\x1b[31m[telegram] failed to read config: {e}\x1b[0m");
+                    return 1;
+                }
+            };
+            let token = cfg.resolved_token();
+            println!("Telegram adapter status");
+            println!("  enabled:        {}", cfg.enabled);
+            match token {
+                Some(t) => println!("  bot token:      {} (present)", redact_token(&t)),
+                None => println!(
+                    "  bot token:      <none> (set TELEGRAM_BOT_TOKEN or connect via the GUI)"
+                ),
+            }
+            println!("  dm policy:      {:?}", cfg.dm_policy);
+            println!("  group policy:   {:?}", cfg.group_policy);
+            println!("  allow_from:     {} user(s)", cfg.allow_from.len());
+            println!("  groups:         {} allowlisted", cfg.groups.len());
+            println!("  output ceiling: {} chars", cfg.output_ceiling);
+            0
+        }
+        TelegramCmd::Pair => {
+            println!(
+                "Connect a Telegram bot to thClaws\n\
+                 \n\
+                 1. In Telegram, message @BotFather and send /newbot. Follow the\n\
+                    prompts to pick a name and username; it replies with a bot token\n\
+                    that looks like 123456789:AA…\n\
+                 2. Either:\n\
+                    • paste the token into the GUI \u{2192} Settings \u{2192} Telegram Connect, or\n\
+                    • export TELEGRAM_BOT_TOKEN=<token> and relaunch thClaws.\n\
+                 3. DM your bot. The first message mints a 6-digit pairing code;\n\
+                    approve it in the Telegram Connect modal. You're then chatting\n\
+                    with thClaws over Telegram.\n\
+                 \n\
+                 Run `thclaws telegram status` to confirm the token is detected."
+            );
+            0
+        }
+    }
+}
+
 fn run_schedule_subcommand(cmd: ScheduleCmd) -> i32 {
     match cmd {
         ScheduleCmd::Add {
             id,
             cron,
+            at,
+            in_delay,
             prompt,
             cwd,
             model,
@@ -611,6 +710,34 @@ fn run_schedule_subcommand(cmd: ScheduleCmd) -> i32 {
             disabled,
             watch,
         } => {
+            // Resolve the trigger: one-shot (--at absolute / --in
+            // relative) vs recurring (--cron). clap already enforces
+            // mutual exclusion; here we require exactly one and turn
+            // --in into an absolute run_at.
+            let run_at = match (at, in_delay) {
+                (Some(ts), _) => match schedule::parse_run_at(&ts) {
+                    Ok(dt) => Some(dt.to_rfc3339()),
+                    Err(e) => {
+                        eprintln!("\x1b[31merror: {e}\x1b[0m");
+                        return 1;
+                    }
+                },
+                (_, Some(dur)) => match schedule::parse_relative_duration(&dur) {
+                    Ok(d) => Some((chrono::Utc::now() + d).to_rfc3339()),
+                    Err(e) => {
+                        eprintln!("\x1b[31merror: {e}\x1b[0m");
+                        return 1;
+                    }
+                },
+                (None, None) => None,
+            };
+            if run_at.is_none() && cron.is_none() {
+                eprintln!(
+                    "\x1b[31merror: a schedule needs a trigger — pass --cron \
+                     for recurring, or --at/--in for a one-shot\x1b[0m"
+                );
+                return 1;
+            }
             let cwd_path = match cwd {
                 Some(p) => std::path::PathBuf::from(p),
                 None => match std::env::current_dir() {
@@ -637,7 +764,8 @@ fn run_schedule_subcommand(cmd: ScheduleCmd) -> i32 {
             };
             let entry = schedule::Schedule {
                 id: id.clone(),
-                cron,
+                cron: cron.unwrap_or_default(),
+                run_at,
                 cwd: cwd_path,
                 prompt,
                 model,
@@ -689,10 +817,23 @@ fn run_schedule_subcommand(cmd: ScheduleCmd) -> i32 {
                     Some(_) => " err",
                     None => "    ",
                 };
+                // Trigger column: cron expression for recurring jobs,
+                // or "once@<run_at> (pending|fired)" for one-shots.
+                let trigger = match &s.run_at {
+                    Some(run_at) => {
+                        let state = if s.last_run.is_some() {
+                            "fired"
+                        } else {
+                            "pending"
+                        };
+                        format!("once@{run_at} ({state})")
+                    }
+                    None => s.cron.clone(),
+                };
                 println!(
-                    "{status} {exit} {watch}  {:24}  {:20}  {}  {}",
+                    "{status} {exit} {watch}  {:24}  {:30}  {}  {}",
                     s.id,
-                    s.cron,
+                    trigger,
                     last,
                     s.cwd.display()
                 );

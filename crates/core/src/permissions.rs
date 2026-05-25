@@ -43,6 +43,14 @@ pub enum PermissionMode {
     /// approve agent-initiated mutations from their phone when the
     /// LINE bridge is active.
     LineGated,
+    /// Telegram-gated (dev-plan/29 Tier 1) — the Telegram analogue of
+    /// [`Self::LineGated`]. Same gating semantics (every tool whose
+    /// `requires_approval` returns true), but the prompt is routed to
+    /// the user's Telegram chat as an inline keyboard via the
+    /// `TelegramApprover` sink. The plan generalises both into a single
+    /// `BotGated` mode in Tier 2; kept parallel for Tier 1 to avoid
+    /// churning the LINE path.
+    TelegramGated,
 }
 
 impl PermissionMode {
@@ -50,7 +58,7 @@ impl PermissionMode {
     /// calls. Centralised so a future "Slack-gated" / "Discord-
     /// gated" variant just opts into the same arm.
     pub fn asks_for_approval(&self) -> bool {
-        matches!(self, Self::Ask | Self::LineGated)
+        matches!(self, Self::Ask | Self::LineGated | Self::TelegramGated)
     }
 
     /// True when this mode blocks mutating calls outright (Plan

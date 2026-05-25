@@ -7,6 +7,228 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] — 2026-05-25
+
+Telegram bot adapter — chat with your local thClaws agent from Telegram.
+
+### Added
+
+- **Telegram bot adapter (Tier 1).** Create a bot with `@BotFather`,
+  connect it from the desktop (Settings → **Telegram Connect**) or run it
+  headless with `thclaws --telegram`, and DM your local agent from
+  anywhere. The agent and all its tools stay on your machine; Telegram is
+  only the chat surface, and there is **no relay** — thClaws talks to the
+  Bot API directly via long-polling (works behind NAT).
+
+  - DM + basic group support; pairing-code onboarding (the owner approves
+    new users from the GUI); HTML-formatted replies chunked to Telegram's
+    4096-character message limit.
+  - Tool calls that need approval surface as **inline-keyboard buttons**
+    (Allow / Always / Deny) via a new `telegramgated` permission mode —
+    approve `Bash`/`Edit`/`Write` from your phone.
+  - `thclaws telegram status | pair` CLI; env-first token
+    (`TELEGRAM_BOT_TOKEN`), `TELEGRAM_OWNER_ID` for instant headless
+    allowlisting.
+  - Docs: new Chapter 23 in the EN + TH user manuals and
+    `telegram-bridge.md` in the technical manual.
+
+### Fixed
+
+- **Agent SDK: avoid `ARG_MAX` on large system prompts**
+  ([#124](https://github.com/thClaws/thClaws/pull/124),
+  [@gobikom](https://github.com/gobikom)). The Agent SDK provider passed
+  the assembled system prompt as a single `--system-prompt` CLI argument;
+  with MCP tools + CLAUDE.md + skills + memory + KMS it can exceed Linux's
+  128 KB `MAX_ARG_STRLEN` → `spawn claude: Argument list too long`,
+  blocking `agent/claude-*` models in `--cli` when MCP servers are
+  registered. The prompt is now written to a temp file and passed via
+  `--system-prompt-file`.
+
+### Default model — no change
+
+Default stays `claude-sonnet-4-6`.
+
+## [0.18.0] — 2026-05-24
+
+One-shot schedules ("run once in 15 minutes / tomorrow at 9am"), plus
+two community fixes.
+
+### Added
+
+- **One-shot / relative-delay schedules**
+  ([#122](https://github.com/thClaws/thClaws/issues/122),
+  design by [@ultramcu](https://github.com/ultramcu)). Schedules can now
+  run **once** at a future time or after a relative delay, alongside the
+  existing recurring cron jobs:
+
+  ```sh
+  thclaws schedule add report --at "2026-05-24T15:30:00Z" --prompt "…"
+  thclaws schedule add check  --in 15m                    --prompt "…"
+  ```
+
+  `--in` accepts `s`/`m`/`h`/`d` (and a bare integer as seconds);
+  `--at` takes an RFC 3339 timestamp. Both are mutually exclusive with
+  `--cron`. A one-shot fires once, then auto-disables. **Catch-up by
+  design:** a fire time already in the past when the scheduler ticks
+  (e.g. the daemon was down over the slot) runs immediately rather than
+  being lost — the footgun of hand-writing a cron for a single minute,
+  where a missed slot silently waits a year. `schedule list` shows
+  `once@<time> (pending|fired)`; the new on-disk `runAt` field is
+  optional, so existing `schedules.json` files stay compatible.
+
+### Fixed
+
+- **Edit: reject an empty `old_string`**
+  ([#121](https://github.com/thClaws/thClaws/pull/121),
+  [@ultramcu](https://github.com/ultramcu)). An empty `old_string`
+  matches between every character, so with `replace_all` it would inject
+  the replacement throughout the file and corrupt it. The Edit tool now
+  rejects it up front.
+
+- **ChatGptCodex credentials detected from the auth file**
+  ([#123](https://github.com/thClaws/thClaws/pull/123),
+  [@gobikom](https://github.com/gobikom)). `kind_has_credentials()` only
+  probed env vars, but ChatGptCodex (ChatGPT subscription) authenticates
+  via a file-based OAuth token — so it was wrongly reported as having no
+  credentials, and interactive `--cli` / GUI / `--serve` triggered the
+  model-fallback path and overwrote `settings.json`. It now resolves the
+  Codex auth store (honoring token expiry), and the shared-session
+  worker delegates to the same canonical check so all surfaces agree.
+
+### Default model — no change
+
+Default stays `claude-sonnet-4-6`.
+
+## [0.17.1] — 2026-05-24
+
+KMS + Files management in the GUI, a LINE reconnect fix, and a clearer
+sandbox boundary message.
+
+### Added
+
+- **KMS sidebar create / rename / delete / edit.** The `+` buttons now
+  open proper modals (the old `window.prompt`/`confirm` silently failed
+  inside the wry webview): create a new KMS base (name + project/user
+  scope), and create a new blank page (title / topic / category / tags)
+  from the per-KMS browser panel. Right-click a page row to **Rename…**
+  (moves the file and rewrites inbound links + the index) or
+  **Delete…**. Edit the page you're viewing — a pencil opens the body
+  in the TipTap editor plus a modal for the raw YAML frontmatter; Save
+  writes it back.
+- **Files tab create file / folder.** Right-click the explorer (or the
+  new FilePlus / FolderPlus header buttons) for **New file…** /
+  **New folder…**, created in the current directory via a name modal.
+  Sandbox-checked; refuses to clobber an existing path. The explorer
+  header now shows a compact `../<last>` path (full path on hover)
+  since the viewer navbar already carries the full path.
+
+### Fixed
+
+- **LINE: reconnect storm after a clean websocket close**
+  ([#120](https://github.com/thClaws/thClaws/pull/120),
+  [@ultramcu](https://github.com/ultramcu)). `LineClient::run` reset
+  backoff and reconnected immediately on a clean close; a relay that
+  closes cleanly on every connect spun an unthrottled connect/close
+  loop. Adds a cancel-aware 1s pause mirroring the error path (shutdown
+  still returns `Cancelled` promptly).
+
+- **Clearer "outside the workspace" sandbox message**
+  ([#119](https://github.com/thClaws/thClaws/issues/119),
+  [@ruzerix](https://github.com/ruzerix)). When a path resolves outside
+  the workspace root, `Sandbox` now states plainly that this is a
+  workspace-path boundary, **not** a permission/approval issue
+  (approving a tool doesn't widen it). #119 turned out not to be a bug:
+  a small model fabricated an out-of-workspace absolute interpreter
+  path, the command failed as an ordinary shell error, and the model
+  paraphrased it as "rejected by the security policy." The Bash tool
+  description now steers models to invoke interpreters via PATH
+  (e.g. `python script.py`) rather than guessing absolute paths.
+
+### Default model — no change
+
+Default stays `claude-sonnet-4-6`.
+
+## [0.17.0] — 2026-05-24
+
+Two contributor-driven fixes: accurate Anthropic token/cost accounting,
+and a remote-MCP `/mcp add` that no longer hangs (with API-key header
+support).
+
+### Added
+
+- **`--header` on `/mcp add`** (part of
+  [#118](https://github.com/thClaws/thClaws/pull/118)).
+  `/mcp add <name> <url> --header "Key: Value"` — repeatable, `-H`
+  alias. Values support `${VAR}` interpolation resolved from the
+  environment at connect time, so an API key lives in your shell /
+  `.env` rather than plaintext in `mcp.json`:
+  ```
+  /mcp add financial-datasets https://mcp.financialdatasets.ai/api --header "X-API-KEY: ${FD_KEY}"
+  ```
+
+### Fixed
+
+- **Anthropic token usage + prompt-cache accounting**
+  ([#115](https://github.com/thClaws/thClaws/pull/115),
+  [@ultramcu](https://github.com/ultramcu)). The streaming parser read
+  usage only from `message_delta` (which carries just `output_tokens`)
+  and dropped `message_start.message.usage`, so every Anthropic turn
+  reported `input_tokens = 0` and no cache stats — making `/cost` and
+  the Cardputer cost display undercount the flagship provider. Now
+  merges `message_start` usage into the terminal result (terminal
+  `output_tokens` wins; cache fields preserved).
+
+- **Remote MCP `/mcp add` no longer hangs; supports API-key auth**
+  ([#114](https://github.com/thClaws/thClaws/issues/114),
+  [@ultramcu](https://github.com/ultramcu);
+  [#118](https://github.com/thClaws/thClaws/pull/118)). Adding an
+  OAuth-gated remote server (e.g. financial-datasets' root URL) froze
+  `/mcp add` for up to 5 minutes: the command ran the full connect
+  inline, hit a 401, and blocked on the OAuth browser callback. Four
+  fixes:
+  - `--header` lets you use the API-key endpoint (`/api` + `X-API-KEY`)
+    and skip OAuth entirely (see Added).
+  - The auth probe and `oauth::discover` now have hard timeouts (15s
+    request / 10s connect) so a stalled server can't hang the command
+    or a startup spawn indefinitely.
+  - `/mcp add` connects **non-interactively**: a server that needs
+    OAuth returns "run `/mcp reauth <name>`" instead of blocking on a
+    browser callback. The guard covers both the upfront probe and the
+    bridge's `initialize`-time 401. Startup / `/mcp reauth` stay
+    interactive (browser flow runs in the background as before).
+
+### Default model — no change
+
+Default stays `claude-sonnet-4-6`.
+
+## [0.16.1] — 2026-05-24
+
+Hotfix. macOS startup crash for every GUI / `--serve` user.
+
+### Fixed
+
+- **macOS: GUI / `--serve` build crashed on startup (TCC / Bluetooth SIGABRT)**
+  ([#116](https://github.com/thClaws/thClaws/issues/116),
+  [@ultramcu](https://github.com/ultramcu);
+  [#117](https://github.com/thClaws/thClaws/pull/117)).
+  The `cost_bridge` feature (Cardputer cost display, added in v0.15.0)
+  was enabled by default and started a Bluetooth LE scan on every
+  launch via `cost_bridge::spawn()` → `adapter.start_scan()`. On
+  macOS, any binary without an `NSBluetoothAlwaysUsageDescription`
+  `Info.plist` — every `cargo build` and every GitHub release archive
+  (none are `.app` bundles) — is killed by **TCC** with a hard
+  **SIGABRT** ~1–3s after startup, before serving any request. It also
+  popped a Bluetooth permission prompt for the ~99% of users who don't
+  own a thClaws-Cost Cardputer.
+  - Fix: `cost_bridge` is now **opt-in** (`default = []`). A stock
+    build never links `btleplug` or starts the BLE scan. Cardputer
+    users build with `--features cost_bridge`.
+  - No code changes — the call sites were already
+    `#[cfg(feature = "cost_bridge")]`-gated.
+  - **Affected releases v0.15.0 and v0.16.0**: macOS users on those
+    versions should upgrade to v0.16.1, or run with
+    `cargo run --no-default-features --features gui` as a workaround.
+
 ## [0.16.0] — 2026-05-23
 
 Four user-facing fixes — three issue-driven, plus a Files-tab polish item

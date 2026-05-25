@@ -9,6 +9,7 @@ import {
   Check,
   Users,
   MessageCircle,
+  Send,
 } from "lucide-react";
 import { useTheme, type ThemeMode } from "../hooks/useTheme";
 import { send, subscribe } from "../hooks/useIPC";
@@ -17,7 +18,8 @@ type Choice =
   | "global-instructions"
   | "folder-instructions"
   | "api-keys"
-  | "line-connect";
+  | "line-connect"
+  | "telegram-connect";
 
 export function SettingsMenu({
   anchorRef,
@@ -110,6 +112,12 @@ export function SettingsMenu({
       icon: <MessageCircle size={12} />,
       label: "Line Connect…",
       hint: "Pair this thClaws install with your LINE OA",
+    },
+    {
+      id: "telegram-connect",
+      icon: <Send size={12} />,
+      label: "Telegram Connect…",
+      hint: "Pair this thClaws install with a Telegram bot",
     },
   ];
 
