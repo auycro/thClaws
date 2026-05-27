@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] — 2026-05-26
+
+Telegram channels + forum topics + streaming preview, plus two
+community-driven hardening fixes.
+
+### Added
+
+- **Telegram channels + forum-topic routing (Tier 2).** The bot can post
+  to a broadcast **channel**, and comments on those posts (which land in
+  the channel's linked **discussion group**) reach the agent. Supergroup
+  **forum topics** route to different agents: `channels[].topicRouting`
+  maps a topic id to an `agentId` (an AgentDef under `.thclaws/agents/`),
+  falling back to the channel's default agent. Replies go back into the
+  originating topic, with the "General" topic's `message_thread_id=1`
+  send quirk handled. A `getChatMember` admin-rights probe returns a
+  clear error when the bot isn't an admin that can post. Per-topic
+  multi-agent routing is honoured by headless `thclaws --telegram`; the
+  GUI runs its single shared session.
+- **Telegram streaming preview edits (Tier 3.1).** Opt-in via
+  `streamPreview` in the Telegram config: instead of one reply at the end
+  of a turn, post a placeholder and **edit it in place** as the agent
+  generates (rate-limited to avoid Telegram's same-message edit
+  throttling), then swap in the final formatted reply. Headless-only for
+  now.
+
+### Fixed
+
+- **Grapheme-aware Backspace in the CLI REPL**
+  ([#126](https://github.com/thClaws/thClaws/pull/126),
+  [@modtanoii](https://github.com/modtanoii)). Backspace deleted one
+  codepoint per press, orphaning Thai/Lao/Hindi/Arabic combining marks
+  and splitting emoji ZWJ sequences. It now deletes a whole grapheme
+  cluster, via a rustyline `ConditionalEventHandler` + `unicode-segmentation`
+  (rather than vendoring rustyline).
+
+- **Shell-aware team bash seatbelts**
+  ([#125](https://github.com/thClaws/thClaws/issues/125),
+  [@ultramcu](https://github.com/ultramcu)). The team-lead / teammate
+  destructive-command guards matched by substring and were defeated by
+  shell quoting (`r''m -rf`, `$(printf rm)`, `${x:-rm}`, backticks,
+  `{rm,-rf,..}`, `IFS`-splicing, `eval $'\x72\x6d'`, arg-order swap,
+  quoted verb, line-continuation, wrapper prefixes) — letting an LLM
+  lead/teammate in `--accept-all` mode slip a destructive command past
+  the seatbelt. They now tokenize via `shell_words` (resolving quotes /
+  order / wrappers, recursing into `eval` / `sh -c` / `bash -c`) and
+  refuse obfuscated forms carrying a destructive signal; the substring
+  guard remains as a fallback.
+
+### Default model — no change
+
+Default stays `claude-sonnet-4-6`.
+
 ## [0.19.0] — 2026-05-25
 
 Telegram bot adapter — chat with your local thClaws agent from Telegram.

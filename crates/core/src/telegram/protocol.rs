@@ -76,9 +76,108 @@ pub struct Message {
     #[serde(default)]
     pub text: Option<String>,
     /// Present on forum-topic messages (supergroups with topics on).
-    /// Tier 1 ignores it; Tier 2 routes per-topic.
+    /// Tier 2 routes per-topic on this.
     #[serde(default)]
     pub message_thread_id: Option<i64>,
+    /// Set on supergroup messages that belong to a forum topic (Tier 2).
+    /// A message in the "General" topic has no `message_thread_id` but is
+    /// still a topic message — this disambiguates.
+    #[serde(default)]
+    pub is_topic_message: Option<bool>,
+    /// The chat on whose behalf the message was sent. For a comment on a
+    /// channel post (auto-forwarded into the linked discussion group),
+    /// `sender_chat` is the channel — lets us recognise the channel's
+    /// own forwarded posts vs. real user replies (Tier 2).
+    #[serde(default)]
+    pub sender_chat: Option<Chat>,
+    // ── forum-topic service messages (Tier 2) ──
+    #[serde(default)]
+    pub forum_topic_created: Option<ForumTopicCreated>,
+    #[serde(default)]
+    pub forum_topic_edited: Option<ForumTopicEdited>,
+    #[serde(default)]
+    pub forum_topic_closed: Option<ForumTopicClosed>,
+    #[serde(default)]
+    pub forum_topic_reopened: Option<ForumTopicReopened>,
+}
+
+/// Which forum-topic lifecycle service message a [`Message`] carries, if
+/// any. Tier 2 uses this to keep an internal topic registry in sync
+/// without the polling loop having to match each variant inline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForumTopicEvent {
+    Created,
+    Edited,
+    Closed,
+    Reopened,
+}
+
+impl Message {
+    /// True for any non-text service message (forum-topic lifecycle,
+    /// etc.) that Tier 2 should account for but never feed to the agent.
+    pub fn forum_topic_event(&self) -> Option<ForumTopicEvent> {
+        if self.forum_topic_created.is_some() {
+            Some(ForumTopicEvent::Created)
+        } else if self.forum_topic_edited.is_some() {
+            Some(ForumTopicEvent::Edited)
+        } else if self.forum_topic_closed.is_some() {
+            Some(ForumTopicEvent::Closed)
+        } else if self.forum_topic_reopened.is_some() {
+            Some(ForumTopicEvent::Reopened)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ForumTopicCreated {
+    pub name: String,
+    #[serde(default)]
+    pub icon_color: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_custom_emoji_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ForumTopicEdited {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub icon_custom_emoji_id: Option<String>,
+}
+
+/// Both `forum_topic_closed` and `_reopened` are empty objects on the
+/// wire — we only need their presence, captured by the `Option` field.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ForumTopicClosed {}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ForumTopicReopened {}
+
+/// Subset of `getChatMember`'s result — enough to answer "is the bot an
+/// admin that can post here?" for the Tier 2 channel admin-rights probe.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatMember {
+    /// `creator` | `administrator` | `member` | `restricted` | `left` |
+    /// `kicked`.
+    pub status: String,
+    #[serde(default)]
+    pub can_post_messages: Option<bool>,
+    #[serde(default)]
+    pub can_delete_messages: Option<bool>,
+}
+
+impl ChatMember {
+    /// True when this member may post to a channel: the creator (all
+    /// rights implied) or an administrator with `can_post_messages`.
+    pub fn can_post_to_channel(&self) -> bool {
+        match self.status.as_str() {
+            "creator" => true,
+            "administrator" => self.can_post_messages.unwrap_or(false),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -29,11 +29,12 @@ use async_trait::async_trait;
 use super::approver::{ApprovalReply, TelegramApprover};
 use super::client::{TelegramClient, TelegramClientError, TelegramUpdateSink};
 use super::config::{DmPolicy, TelegramConfig};
-use super::filter::format_for_telegram;
 use super::pairing::PairingManager;
 use super::protocol::{
     AnswerCallbackQuery, CallbackQuery, Chat, ChatKind, EditMessageText, Message, Update,
 };
+use super::stream::{PreviewSink, TelegramPreview};
+use super::{channel, topic};
 
 /// Idle window after which a chat's registry entry is GC'd (decision #7).
 pub const IDLE_GC: Duration = Duration::from_secs(24 * 60 * 60);
@@ -43,8 +44,19 @@ pub const IDLE_GC: Duration = Duration::from_secs(24 * 60 * 60);
 #[async_trait]
 pub trait TelegramMessageHandler: Send + Sync + 'static {
     /// Run one inbound text as an agent turn; return the final assistant
-    /// text. `None` skips the Telegram reply.
-    async fn handle_message(&self, text: String) -> Option<String>;
+    /// text. `None` skips the Telegram reply. `agent_id` (Tier 2) is the
+    /// forum-topic-routed AgentDef name to run as, or `None` for the
+    /// default agent — implementers that can't route per-agent (e.g. the
+    /// single-session GUI worker) ignore it. `preview` (Tier 3.1), when
+    /// `Some`, receives the full assistant text on each delta so the
+    /// implementer can stream a live in-place edit; implementers that
+    /// can't stream ignore it and the sink sends the returned final text.
+    async fn handle_message(
+        &self,
+        text: String,
+        agent_id: Option<String>,
+        preview: Option<Arc<dyn PreviewSink>>,
+    ) -> Option<String>;
 }
 
 #[derive(Debug, Clone)]
@@ -199,23 +211,62 @@ impl SessionSink {
             .unwrap_or(false)
     }
 
-    /// Forward an authorized text to the agent and ship the reply back,
-    /// chunked. Spawned so the polling loop never blocks on a turn.
-    fn spawn_turn(&self, chat_id: i64, text: String) {
+    /// Resolve the forum-topic-routed agent for `(chat_id, topic)` from
+    /// the shared config. `None` ⇒ the handler's default agent.
+    fn route_for(&self, chat_id: i64, topic: Option<i64>) -> Option<String> {
+        self.config
+            .lock()
+            .ok()
+            .and_then(|c| topic::resolve_agent(&c, chat_id, topic))
+    }
+
+    fn stream_preview_enabled(&self) -> bool {
+        self.config
+            .lock()
+            .map(|c| c.stream_preview)
+            .unwrap_or(false)
+    }
+
+    /// Forward an authorized text to the agent and ship the reply back
+    /// into the same forum topic. Spawned so the polling loop never
+    /// blocks on a turn. `agent_id` (Tier 2) routes the turn to a
+    /// per-topic agent; when `stream_preview` is on (Tier 3.1) the reply
+    /// is streamed as an in-place edit, otherwise sent once at the end.
+    fn spawn_turn(&self, chat_id: i64, topic: Option<i64>, agent_id: Option<String>, text: String) {
         if let Some(approver) = &self.approver {
             approver.set_active_chat(chat_id);
         }
         let handler = self.handler.clone();
         let client = self.client.clone();
         let ceiling = self.output_ceiling;
+        let streaming = self.stream_preview_enabled();
         tokio::spawn(async move {
-            let Some(reply) = handler.handle_message(text).await else {
+            let preview = streaming.then(|| {
+                Arc::new(TelegramPreview::new(
+                    client.clone(),
+                    chat_id,
+                    topic,
+                    ceiling,
+                ))
+            });
+            let preview_sink: Option<Arc<dyn PreviewSink>> =
+                preview.clone().map(|p| p as Arc<dyn PreviewSink>);
+
+            let Some(reply) = handler.handle_message(text, agent_id, preview_sink).await else {
                 return;
             };
-            for chunk in format_for_telegram(&reply, ceiling) {
-                if let Err(e) = client.send_text(chat_id, chunk).await {
-                    eprintln!("[telegram] reply send failed (chat {chat_id}): {e}");
-                    break;
+
+            match preview {
+                // Streaming: swap the live preview for the final reply.
+                Some(p) => p.finish(&reply).await,
+                // Non-streaming: one send into the originating topic
+                // (General-topic quirk applied by `send_to_topic`).
+                None => {
+                    if let Err(e) =
+                        channel::send_to_topic(&client, chat_id, topic, &reply, ceiling).await
+                    {
+                        eprintln!("[telegram] reply send failed (chat {chat_id}): {e}");
+                    }
                 }
             }
         });
@@ -283,17 +334,28 @@ impl SessionSink {
         let chat: Chat = msg.chat.clone();
         self.registry.touch(chat.id, chat.kind);
 
+        // Tier 2: forum-topic lifecycle service messages (created/edited/
+        // closed/reopened) carry no text and must NOT reach the agent —
+        // just acknowledge them so the polling loop never trips.
+        if let Some(ev) = msg.forum_topic_event() {
+            eprintln!("[telegram] forum topic event {ev:?} in chat {}", chat.id);
+            return;
+        }
+
         let Some(text) = msg.text.clone() else {
-            // Tier 1 is text-only; non-text messages (photos, stickers,
-            // voice) are ignored until Tier 3 media support.
+            // Text-only until Tier 3 media support (photos, voice, …).
             return;
         };
+
+        // Effective forum topic + per-topic agent routing (Tier 2).
+        let topic =
+            topic::effective_topic_id(msg.message_thread_id, msg.is_topic_message.unwrap_or(false));
 
         match chat.kind {
             ChatKind::Private => {
                 let user_id = msg.from.as_ref().map(|u| u.id).unwrap_or(chat.id);
                 if self.dm_authorized(user_id) {
-                    self.route_authorized_text(chat.id, text);
+                    self.route_authorized_text(chat.id, None, None, text);
                     return;
                 }
                 match self.dm_policy() {
@@ -314,8 +376,17 @@ impl SessionSink {
                 }
             }
             ChatKind::Group | ChatKind::Supergroup => {
-                if self.group_authorized(chat.id) {
-                    self.route_authorized_text(chat.id, text);
+                // Serve if the group is allowlisted OR it's the linked
+                // discussion group of a configured channel (Tier 2 —
+                // comments on channel posts land here).
+                let is_channel_surface = self
+                    .config
+                    .lock()
+                    .map(|c| c.is_channel_surface(chat.id))
+                    .unwrap_or(false);
+                if self.group_authorized(chat.id) || is_channel_surface {
+                    let agent_id = self.route_for(chat.id, topic);
+                    self.route_authorized_text(chat.id, topic, agent_id, text);
                 } else {
                     eprintln!(
                         "[telegram] ignoring message from unallowlisted group {}",
@@ -324,7 +395,9 @@ impl SessionSink {
                 }
             }
             ChatKind::Channel => {
-                // Broadcast channel posts are Tier 2 (channel.rs).
+                // Posts authored in the channel itself arrive as
+                // `channel_post` (handled in `on_update`); a `message`
+                // with channel kind is unusual — ignore.
             }
         }
     }
@@ -332,8 +405,14 @@ impl SessionSink {
     /// Authorized text: either resolve a pending approval (free-text
     /// fallback) or run a turn. Mirrors the LINE sink's short-circuit so
     /// a typed "approve"/"deny" answers the gate instead of starting a
-    /// new turn.
-    fn route_authorized_text(&self, chat_id: i64, text: String) {
+    /// new turn. `topic` / `agent_id` carry Tier 2 forum-topic routing.
+    fn route_authorized_text(
+        &self,
+        chat_id: i64,
+        topic: Option<i64>,
+        agent_id: Option<String>,
+        text: String,
+    ) {
         if let Some(approver) = &self.approver {
             if approver.has_pending() {
                 if let Some(reply) = approver.record_decision_from_text(&text) {
@@ -347,14 +426,16 @@ impl SessionSink {
                     };
                     let client = self.client.clone();
                     let msg = msg.to_string();
+                    let ceiling = self.output_ceiling;
                     tokio::spawn(async move {
-                        let _ = client.send_text(chat_id, msg).await;
+                        let _ =
+                            channel::send_to_topic(&client, chat_id, topic, &msg, ceiling).await;
                     });
                     return;
                 }
             }
         }
-        self.spawn_turn(chat_id, text);
+        self.spawn_turn(chat_id, topic, agent_id, text);
     }
 }
 
@@ -367,6 +448,14 @@ impl TelegramUpdateSink for SessionSink {
         }
         if let Some(msg) = update.incoming_message() {
             self.handle_message(msg.clone());
+            return;
+        }
+        // Tier 2: a `channel_post` is the bot's (or an admin's) broadcast
+        // in a channel. The agent drives turns from the linked discussion
+        // group, not from channel posts themselves — acknowledge so the
+        // poll loop advances, but don't run a turn.
+        if let Some(post) = &update.channel_post {
+            self.registry.touch(post.chat.id, post.chat.kind);
         }
     }
 }
@@ -394,5 +483,131 @@ mod tests {
         // With ZERO idle, the entry is considered expired on the next
         // observation.
         assert_eq!(reg.active_count(), 0);
+    }
+
+    // ── Tier 2: discussion-group ingest + per-topic routing ──
+
+    use crate::telegram::config::{TelegramChannelConfig, TelegramConfig, TopicRoute};
+    use std::collections::HashMap;
+
+    /// Records each `(text, agent_id)` the sink routes; returns `None` so
+    /// `spawn_turn` never attempts a (network) reply.
+    struct RecordingHandler {
+        tx: tokio::sync::mpsc::UnboundedSender<(String, Option<String>)>,
+    }
+
+    #[async_trait]
+    impl TelegramMessageHandler for RecordingHandler {
+        async fn handle_message(
+            &self,
+            text: String,
+            agent_id: Option<String>,
+            _preview: Option<Arc<dyn PreviewSink>>,
+        ) -> Option<String> {
+            let _ = self.tx.send((text, agent_id));
+            None
+        }
+    }
+
+    fn channel_cfg() -> TelegramConfig {
+        // Channel -100123 ↔ discussion group -100987; topic 42 → coder,
+        // General (1) → research; channel default → research.
+        let mut topic_routing = HashMap::new();
+        topic_routing.insert(
+            "42".to_string(),
+            TopicRoute {
+                agent_id: Some("coder".into()),
+            },
+        );
+        let mut channels = HashMap::new();
+        channels.insert(
+            "-100123".to_string(),
+            TelegramChannelConfig {
+                linked_discussion_group: Some("-100987".into()),
+                agent_id: Some("research".into()),
+                topic_routing,
+            },
+        );
+        TelegramConfig {
+            channels,
+            ..Default::default()
+        }
+    }
+
+    fn sink_with(
+        cfg: TelegramConfig,
+    ) -> (
+        SessionSink,
+        tokio::sync::mpsc::UnboundedReceiver<(String, Option<String>)>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = SessionSink {
+            client: Arc::new(TelegramClient::new("1:aaaaaaaaaaaaaaaaaaaaaa")),
+            handler: Arc::new(RecordingHandler { tx }),
+            approver: None,
+            pairing: Arc::new(PairingManager::new()),
+            config: Arc::new(Mutex::new(cfg)),
+            registry: Arc::new(ChatRegistry::default()),
+            output_ceiling: 4000,
+        };
+        (sink, rx)
+    }
+
+    fn supergroup_msg(chat_id: i64, thread: Option<i64>, is_topic: bool, text: &str) -> Message {
+        let thread_json = match thread {
+            Some(t) => format!(r#","message_thread_id":{t}"#),
+            None => String::new(),
+        };
+        let json = format!(
+            r#"{{"message_id":1,"chat":{{"id":{chat_id},"type":"supergroup"}},"text":"{text}","is_topic_message":{is_topic}{thread_json}}}"#
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[tokio::test]
+    async fn discussion_group_reply_routes_to_topic_agent() {
+        // Acceptance #2 + #3: a reply in the linked discussion group
+        // reaches the agent, routed by forum topic.
+        let (sink, mut rx) = sink_with(channel_cfg());
+
+        // Topic 42 → coder.
+        sink.handle_message(supergroup_msg(-100987, Some(42), true, "build it"));
+        let (text, agent) = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("handler called")
+            .unwrap();
+        assert_eq!(text, "build it");
+        assert_eq!(agent.as_deref(), Some("coder"));
+
+        // General topic (no thread id, flagged) → research.
+        sink.handle_message(supergroup_msg(-100987, None, true, "status?"));
+        let (_t, agent) = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("handler called")
+            .unwrap();
+        assert_eq!(agent.as_deref(), Some("research"));
+    }
+
+    #[tokio::test]
+    async fn forum_topic_service_message_is_ignored() {
+        // Acceptance #5: a forum_topic_created service message must not
+        // reach the agent (and must not crash).
+        let (sink, mut rx) = sink_with(channel_cfg());
+        let json = r#"{"message_id":2,"chat":{"id":-100987,"type":"supergroup"},"message_thread_id":42,"forum_topic_created":{"name":"Coder","icon_color":7322096}}"#;
+        let msg: Message = serde_json::from_str(json).unwrap();
+        sink.handle_message(msg);
+        // Nothing should be routed within a short window.
+        let got = tokio::time::timeout(std::time::Duration::from_millis(150), rx.recv()).await;
+        assert!(got.is_err(), "service message should not reach the agent");
+    }
+
+    #[tokio::test]
+    async fn unconfigured_group_is_ignored() {
+        // A supergroup that's neither allowlisted nor a channel surface
+        // gets dropped.
+        let (sink, mut rx) = sink_with(channel_cfg());
+        sink.handle_message(supergroup_msg(-555555, Some(7), true, "hello"));
+        let got = tokio::time::timeout(std::time::Duration::from_millis(150), rx.recv()).await;
+        assert!(got.is_err(), "unconfigured group should be ignored");
     }
 }

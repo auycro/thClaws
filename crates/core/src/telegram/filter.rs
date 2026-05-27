@@ -54,6 +54,34 @@ pub fn format_for_telegram(body: &str, ceiling: u32) -> Vec<String> {
         .collect()
 }
 
+/// Render a **single-message** live preview (dev-plan/29 Tier 3.1
+/// streaming preview edits). Unlike [`format_for_telegram`] this never
+/// chunks — a preview edits one message in place — so it head-truncates
+/// the cleaned text to `ceiling` chars (UTF-8 safe) with a trailing `…`
+/// when clipped, then HTML-escapes the (truncated) plain text as a whole
+/// so no entity is ever split. Returns an empty string for empty input.
+pub fn format_preview(body: &str, ceiling: u32) -> String {
+    let cleaned = crate::line::filter::clean_for_stream(body);
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        return String::new();
+    }
+    let ceiling = (ceiling as usize).clamp(1, TELEGRAM_MAX_CHARS);
+    let char_count = cleaned.chars().count();
+    let plain = if char_count > ceiling {
+        // Reserve one char for the ellipsis cursor.
+        let head: String = cleaned.chars().take(ceiling.saturating_sub(1)).collect();
+        format!("{head}…")
+    } else {
+        cleaned.to_string()
+    };
+    // Escape the whole truncated plain string at once (no entity split).
+    // Code-fence `<pre>` handling is skipped for the live preview — a
+    // half-streamed fence would be unbalanced anyway; the final reply
+    // goes through `format_for_telegram` with full fence handling.
+    escape_html(&plain)
+}
+
 /// Split plain text into pieces of at most `ceiling` chars, preferring
 /// to break on line boundaries. A single line longer than `ceiling` is
 /// hard-split on a char boundary (UTF-8 safe — we collect `char`s).
@@ -258,5 +286,27 @@ mod tests {
         assert!(out.len() > 1);
         let rejoined: String = out.join("");
         assert!(rejoined.contains("สวัสดีครับ"));
+    }
+
+    #[test]
+    fn preview_is_single_message_escaped() {
+        assert_eq!(format_preview("a < b & c", 4000), "a &lt; b &amp; c");
+        // ANSI / tool narration stripped, like the chunked path.
+        assert_eq!(
+            format_preview("⏺ Read(/x)\nDone & dusted.", 4000),
+            "Done &amp; dusted."
+        );
+        assert_eq!(format_preview("", 4000), "");
+    }
+
+    #[test]
+    fn preview_head_truncates_with_ellipsis() {
+        let out = format_preview(&"x".repeat(1000), 100);
+        assert_eq!(out.chars().count(), 100); // 99 x's + '…'
+        assert!(out.ends_with('…'));
+        // Truncation is on a char boundary for multibyte text.
+        let thai = format_preview(&"ก".repeat(1000), 50);
+        assert!(thai.ends_with('…'));
+        assert_eq!(thai.chars().count(), 50);
     }
 }

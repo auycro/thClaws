@@ -34,7 +34,23 @@ struct WorkerForwardHandler {
 
 #[async_trait]
 impl TelegramMessageHandler for WorkerForwardHandler {
-    async fn handle_message(&self, text: String) -> Option<String> {
+    async fn handle_message(
+        &self,
+        text: String,
+        agent_id: Option<String>,
+        _preview: Option<Arc<dyn super::stream::PreviewSink>>,
+    ) -> Option<String> {
+        // Tier 2: the GUI worker runs a single shared session, so a
+        // per-topic `agent_id` can't yet route to a different agent here
+        // (that needs worker-side multi-agent spawning — a follow-up).
+        // The headless path (`telegram::headless`) honours it fully.
+        // Tier 3.1: streaming preview is headless-only too; the GUI worker
+        // ignores `_preview` and the sink sends the final reply once.
+        if let Some(a) = &agent_id {
+            eprintln!(
+                "[telegram] topic routed to agent '{a}' (GUI worker runs the shared session)"
+            );
+        }
         let (tx, rx) = oneshot::channel();
         if self
             .input_tx

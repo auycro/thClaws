@@ -19,18 +19,21 @@
 //! persistence (history is in-memory for the process lifetime), single
 //! shared session across chats (pairing gates who reaches it).
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures::StreamExt;
 
 use crate::agent::{Agent, AgentEvent};
+use crate::agent_defs::AgentDefsConfig;
 use crate::cancel::CancelToken;
 use crate::config::AppConfig;
 use crate::context::ProjectContext;
 use crate::error::Result;
 use crate::memory::MemoryStore;
 use crate::permissions::{ApprovalSink, PermissionMode};
+use crate::subagent::{AgentFactory, ProductionAgentFactory};
 use crate::tools::ToolRegistry;
 
 use super::approver::TelegramApprover;
@@ -43,25 +46,77 @@ use super::session::{TelegramMessageHandler, TelegramSession};
 /// so the owner can DM the bot without the GUI pairing-approval step.
 pub const OWNER_ID_ENV: &str = "TELEGRAM_OWNER_ID";
 
-/// Drives a single in-process [`Agent`] for each inbound message,
-/// capturing the final assistant text. Turns are serialised on
-/// `turn_lock` because the agent's history is shared mutable state.
+/// Drives in-process [`Agent`]s for inbound messages, capturing the
+/// final assistant text. Tier 2: a forum-topic-routed `agent_id` selects
+/// (and lazily builds, then caches) a per-AgentDef agent via the shared
+/// [`ProductionAgentFactory`]; `None` uses the default agent. Turns are
+/// serialised on `turn_lock` because each agent's history is shared
+/// mutable state and they share one Telegram client + approver.
 struct HeadlessAgentHandler {
-    agent: Arc<Agent>,
-    turn_lock: Arc<tokio::sync::Mutex<()>>,
+    default_agent: Arc<Agent>,
+    factory: Arc<ProductionAgentFactory>,
+    agent_defs: AgentDefsConfig,
+    /// agent_id → built agent, reused across turns so each topic-agent
+    /// keeps its own conversation history.
+    cache: tokio::sync::Mutex<HashMap<String, Arc<Agent>>>,
+    turn_lock: tokio::sync::Mutex<()>,
+}
+
+impl HeadlessAgentHandler {
+    /// Resolve the agent for a routed `agent_id`, building it from its
+    /// AgentDef on first use. Falls back to the default agent when the
+    /// id is absent, unknown, or fails to build.
+    async fn agent_for(&self, agent_id: Option<String>) -> Arc<Agent> {
+        let Some(id) = agent_id else {
+            return self.default_agent.clone();
+        };
+        if let Some(cached) = self.cache.lock().await.get(&id).cloned() {
+            return cached;
+        }
+        let Some(def) = self.agent_defs.get(&id).cloned() else {
+            eprintln!(
+                "[telegram] routed agent '{id}' not found in .thclaws/agents/; using default"
+            );
+            return self.default_agent.clone();
+        };
+        match self.factory.build("", Some(&def), 0).await {
+            Ok(agent) => {
+                let arc = Arc::new(agent);
+                self.cache.lock().await.insert(id, arc.clone());
+                arc
+            }
+            Err(e) => {
+                eprintln!("[telegram] failed to build agent '{id}': {e}; using default");
+                self.default_agent.clone()
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl TelegramMessageHandler for HeadlessAgentHandler {
-    async fn handle_message(&self, text: String) -> Option<String> {
+    async fn handle_message(
+        &self,
+        text: String,
+        agent_id: Option<String>,
+        preview: Option<Arc<dyn super::stream::PreviewSink>>,
+    ) -> Option<String> {
+        let agent = self.agent_for(agent_id).await;
         let _turn = self.turn_lock.lock().await;
-        let mut stream = Box::pin(self.agent.run_turn(text));
+        let mut stream = Box::pin(agent.run_turn(text));
         // Capture the FINAL assistant text — cleared on each tool call so
         // only post-last-tool narration survives (matches the GUI worker).
+        // Tier 3.1: when a `preview` sink is present, feed it the running
+        // text so it can stream a rate-limited in-place edit.
         let mut buf = String::new();
         while let Some(ev) = stream.next().await {
             match ev {
-                Ok(AgentEvent::Text(s)) => buf.push_str(&s),
+                Ok(AgentEvent::Text(s)) => {
+                    buf.push_str(&s);
+                    if let Some(p) = &preview {
+                        p.update(&buf).await;
+                    }
+                }
                 Ok(AgentEvent::ToolCallStart { .. }) => buf.clear(),
                 Ok(AgentEvent::Done { .. }) => break,
                 Err(e) => return Some(format!("⚠️ thClaws hit an error: {e}")),
@@ -163,16 +218,40 @@ pub async fn run(config: AppConfig) -> Result<()> {
     // 4. Agent with the Telegram approver + gated permission mode. Set
     //    the process-global mode too — the agent loop consults
     //    `current_mode()` at each tool gate.
-    let agent = Agent::new(provider, tools, config.model.clone(), system)
+    crate::permissions::set_current_mode(PermissionMode::TelegramGated);
+
+    // Tier 2: a ProductionAgentFactory + AgentDefs registry so a
+    // forum-topic-routed `agentId` can spin up (and reuse) a per-AgentDef
+    // agent. Clone the inputs the factory needs before they move into the
+    // default agent below.
+    let agent_defs = AgentDefsConfig::load();
+    let factory = Arc::new(ProductionAgentFactory {
+        provider: provider.clone(),
+        base_tools: tools.clone(),
+        model: config.model.clone(),
+        system: system.clone(),
+        max_iterations: config.max_iterations,
+        max_depth: crate::subagent::DEFAULT_MAX_DEPTH,
+        max_tokens: config.max_tokens,
+        agent_defs: agent_defs.clone(),
+        approver: approver.clone() as Arc<dyn ApprovalSink>,
+        permission_mode: PermissionMode::TelegramGated,
+        cancel: Some(cancel.clone()),
+        hooks: None,
+    });
+
+    let default_agent = Agent::new(provider, tools, config.model.clone(), system)
         .with_max_iterations(config.max_iterations)
         .with_max_tokens(config.max_tokens)
         .with_permission_mode(PermissionMode::TelegramGated)
         .with_approver(approver.clone() as Arc<dyn ApprovalSink>);
-    crate::permissions::set_current_mode(PermissionMode::TelegramGated);
 
     let handler: Arc<dyn TelegramMessageHandler> = Arc::new(HeadlessAgentHandler {
-        agent: Arc::new(agent),
-        turn_lock: Arc::new(tokio::sync::Mutex::new(())),
+        default_agent: Arc::new(default_agent),
+        factory,
+        agent_defs,
+        cache: tokio::sync::Mutex::new(HashMap::new()),
+        turn_lock: tokio::sync::Mutex::new(()),
     });
 
     // 5. Ctrl-C → cancel the poll loop for a clean shutdown.

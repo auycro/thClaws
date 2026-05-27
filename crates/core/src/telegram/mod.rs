@@ -26,6 +26,8 @@
 pub mod approver;
 #[cfg(feature = "gui")]
 pub mod bootstrap;
+/// Broadcast-channel + linked-discussion-group plumbing (Tier 2).
+pub mod channel;
 pub mod client;
 pub mod config;
 pub mod filter;
@@ -35,13 +37,22 @@ pub mod headless;
 pub mod pairing;
 pub mod protocol;
 pub mod session;
+/// Streaming preview edits — edit a message in place as the agent
+/// generates, rate-limited (Tier 3.1).
+pub mod stream;
+/// Forum-topic routing: effective topic id, per-topic agent resolution,
+/// the General-topic send quirk, per-topic session keys (Tier 2).
+pub mod topic;
 
 pub use approver::{ApprovalReply, TelegramApprover};
 #[cfg(feature = "gui")]
 pub use bootstrap::{TelegramSessionHandle, TelegramStatus};
+pub use channel::ChannelError;
 pub use client::{TelegramClient, TelegramClientError, TelegramUpdateSink};
 pub use config::{DmPolicy, GroupPolicy, TelegramConfig, TelegramConfigError};
+pub use config::{TelegramChannelConfig, TopicRoute};
 pub use filter::{escape_html, format_for_telegram};
 pub use pairing::{PairingManager, PendingPair};
-pub use protocol::{CallbackQuery, Chat, ChatKind, Message, Update, User};
+pub use protocol::{CallbackQuery, Chat, ChatKind, ChatMember, Message, Update, User};
 pub use session::{ChatRegistry, TelegramMessageHandler, TelegramSession};
+pub use stream::{PreviewCoalescer, PreviewSink, TelegramPreview};

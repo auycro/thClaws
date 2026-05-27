@@ -39,6 +39,49 @@ fn readline_config() -> rustyline::Config {
     let builder = builder.behavior(rustyline::Behavior::PreferTerm);
     builder.build()
 }
+
+/// Number of codepoints in the last `n` grapheme clusters of `before`
+/// (the text left of the cursor). Drives grapheme-aware Backspace so a
+/// single press deletes a whole user-perceived character — Thai/Lao
+/// consonant + vowel/tone marks, Hindi/Arabic combining marks, emoji ZWJ
+/// sequences — instead of orphaning one codepoint at a time. `0` when
+/// `before` is empty (caller falls back to rustyline's default).
+fn grapheme_backspace_chars(before: &str, n: usize) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+    before
+        .graphemes(true)
+        .rev()
+        .take(n.max(1))
+        .map(|g| g.chars().count())
+        .sum()
+}
+
+/// rustyline keybinding: make Backspace delete a grapheme cluster rather
+/// than a single codepoint. The default Backspace is
+/// `Cmd::Kill(Movement::BackwardChar(1))`; we generalise the count to the
+/// cluster size at the cursor. Avoids vendoring/forking rustyline (cf.
+/// thClaws#126) — it's the public `ConditionalEventHandler` API.
+struct GraphemeBackspace;
+
+impl rustyline::ConditionalEventHandler for GraphemeBackspace {
+    fn handle(
+        &self,
+        _evt: &rustyline::Event,
+        n: rustyline::RepeatCount,
+        _positive: bool,
+        ctx: &rustyline::EventContext,
+    ) -> Option<rustyline::Cmd> {
+        let before = &ctx.line()[..ctx.pos()];
+        let chars = grapheme_backspace_chars(before, n);
+        // At beginning-of-line (nothing to delete) defer to the default.
+        if chars == 0 {
+            return None;
+        }
+        Some(rustyline::Cmd::Kill(rustyline::Movement::BackwardChar(
+            chars,
+        )))
+    }
+}
 /// Render the current plan as a coloured ANSI block for the CLI
 /// terminal — analogue of the right-side `PlanSidebar` component the
 /// GUI chat tab gets. M5 CLI parity. Called from the agent loop after
@@ -4700,6 +4743,13 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
     > = rustyline::Editor::with_config(readline_config())
         .map_err(|e| Error::Agent(format!("readline init: {e}")))?;
     rl.set_helper(Some(crate::cli_completer::SlashCompleter));
+    // Grapheme-aware Backspace: one press deletes a whole cluster, so
+    // Thai/Lao/Hindi/Arabic combining marks (and emoji ZWJ runs) aren't
+    // orphaned a codepoint at a time. thClaws#126.
+    rl.bind_sequence(
+        rustyline::KeyEvent(rustyline::KeyCode::Backspace, rustyline::Modifiers::NONE),
+        rustyline::EventHandler::Conditional(Box::new(GraphemeBackspace)),
+    );
     let rl_mutex = std::sync::Arc::new(std::sync::Mutex::new(rl));
 
     // M6.39.2: track which research jobs we've already announced as
@@ -8966,6 +9016,22 @@ mod tests {
         );
         #[cfg(not(windows))]
         assert_eq!(readline_config().behavior(), rustyline::Behavior::Stdio);
+    }
+
+    #[test]
+    fn grapheme_backspace_deletes_whole_cluster() {
+        // ASCII: one codepoint per grapheme.
+        assert_eq!(grapheme_backspace_chars("abc", 1), 1);
+        // Combining acute: "e" + U+0301 = one grapheme, two codepoints.
+        assert_eq!(grapheme_backspace_chars("abe\u{301}", 1), 2);
+        // Thai consonant + tone mark (U+0E48) = one cluster, two codepoints.
+        assert_eq!(grapheme_backspace_chars("ก\u{0E48}", 1), 2);
+        // Emoji ZWJ family = one grapheme, five codepoints.
+        assert_eq!(grapheme_backspace_chars("👨\u{200d}👩\u{200d}👧", 1), 5);
+        // Beginning-of-line: nothing to delete (handler defers to default).
+        assert_eq!(grapheme_backspace_chars("", 1), 0);
+        // Repeat count spans multiple clusters: last 2 of [a, b, é] = 1 + 2.
+        assert_eq!(grapheme_backspace_chars("abe\u{301}", 2), 3);
     }
 
     #[test]

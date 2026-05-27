@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use super::config::redact_token;
 use super::protocol::{
-    AnswerCallbackQuery, ApiResponse, EditMessageText, SendMessage, Update, User,
+    AnswerCallbackQuery, ApiResponse, ChatMember, EditMessageText, Message, SendMessage, Update,
+    User,
 };
 
 /// Server-side long-poll hold. Telegram holds the `getUpdates`
@@ -121,6 +122,31 @@ impl TelegramClient {
         self.post_unit("sendMessage", msg).await
     }
 
+    /// `sendMessage`, returning the new message's id — needed by the
+    /// streaming preview (Tier 3.1) so subsequent deltas can edit it in
+    /// place via `editMessageText`.
+    pub async fn send_message_returning_id(
+        &self,
+        msg: &SendMessage,
+    ) -> Result<i64, TelegramClientError> {
+        let url = self.method_url("sendMessage");
+        let resp = self
+            .http
+            .post(&url)
+            .json(msg)
+            .send()
+            .await
+            .map_err(|e| TelegramClientError::Http(e.to_string()))?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(TelegramClientError::Unauthorized);
+        }
+        let parsed: ApiResponse<Message> = resp
+            .json()
+            .await
+            .map_err(|e| TelegramClientError::Http(e.to_string()))?;
+        api_result(parsed).map(|m| m.message_id)
+    }
+
     /// Convenience: plain HTML text to a chat.
     pub async fn send_text(
         &self,
@@ -142,6 +168,35 @@ impl TelegramClient {
         edit: &EditMessageText,
     ) -> Result<(), TelegramClientError> {
         self.post_unit("editMessageText", edit).await
+    }
+
+    /// `getChatMember` — the bot's membership/role in a chat. Tier 2's
+    /// channel admin-rights probe calls this with the bot's own user id
+    /// to confirm it can post (see [`super::channel`]).
+    pub async fn get_chat_member(
+        &self,
+        chat_id: i64,
+        user_id: i64,
+    ) -> Result<ChatMember, TelegramClientError> {
+        let url = self.method_url("getChatMember");
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[
+                ("chat_id", chat_id.to_string()),
+                ("user_id", user_id.to_string()),
+            ])
+            .send()
+            .await
+            .map_err(|e| TelegramClientError::Http(e.to_string()))?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(TelegramClientError::Unauthorized);
+        }
+        let body: ApiResponse<ChatMember> = resp
+            .json()
+            .await
+            .map_err(|e| TelegramClientError::Http(e.to_string()))?;
+        api_result(body)
     }
 
     /// POST a JSON body to `method`, discarding the `result` payload.

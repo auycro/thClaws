@@ -93,8 +93,26 @@ pub struct TelegramGroupConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct TelegramChannelConfig {
+    /// Chat id (string) of the discussion group Telegram auto-links to
+    /// this channel. Comments on channel posts arrive here as regular
+    /// `message` updates.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub linked_discussion_group: Option<String>,
+    /// Default agent for this channel + its discussion group. Falls back
+    /// to the main agent when unset. References an AgentDef name under
+    /// `.thclaws/agents/` (same key the Agent Teams subsystem uses).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Per-forum-topic agent overrides, keyed by `message_thread_id` (as
+    /// a string). A topic not listed here falls back to `agent_id`. The
+    /// "General" topic is thread id `1`.
+    pub topic_routing: HashMap<String, TopicRoute>,
+}
+
+/// Routing for one forum topic.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TopicRoute {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
 }
@@ -117,6 +135,11 @@ pub struct TelegramConfig {
     /// Channel bindings (Tier 2).
     pub channels: HashMap<String, TelegramChannelConfig>,
     pub output_ceiling: u32,
+    /// Tier 3.1: edit a single message in place as the agent streams,
+    /// instead of sending one reply at the end. Opt-in (Telegram throttles
+    /// repeated same-message edits, and only the headless `--telegram`
+    /// path honours it today). `streamPreview` on the wire.
+    pub stream_preview: bool,
 }
 
 impl Default for TelegramConfig {
@@ -130,6 +153,7 @@ impl Default for TelegramConfig {
             groups: HashMap::new(),
             channels: HashMap::new(),
             output_ceiling: DEFAULT_OUTPUT_CEILING,
+            stream_preview: false,
         }
     }
 }
@@ -239,6 +263,31 @@ impl TelegramConfig {
         }
         self.allow_from.push(id);
         true
+    }
+
+    // ── Tier 2: channels + linked discussion groups ──
+
+    /// The channel config for `chat_id`, if `chat_id` is a configured
+    /// broadcast channel.
+    pub fn channel(&self, chat_id: i64) -> Option<&TelegramChannelConfig> {
+        self.channels.get(&chat_id.to_string())
+    }
+
+    /// The channel config whose linked discussion group is `chat_id`.
+    /// Comments on channel posts arrive in this group, so a message here
+    /// is authorized + routed even though the group isn't in `groups`.
+    pub fn channel_for_discussion_group(&self, chat_id: i64) -> Option<&TelegramChannelConfig> {
+        let id = chat_id.to_string();
+        self.channels
+            .values()
+            .find(|c| c.linked_discussion_group.as_deref() == Some(id.as_str()))
+    }
+
+    /// True when `chat_id` is a configured channel or the discussion
+    /// group linked to one — i.e. Tier 2 should serve messages from it
+    /// regardless of `group_policy`.
+    pub fn is_channel_surface(&self, chat_id: i64) -> bool {
+        self.channel(chat_id).is_some() || self.channel_for_discussion_group(chat_id).is_some()
     }
 }
 
