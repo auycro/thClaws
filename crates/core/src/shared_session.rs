@@ -213,6 +213,27 @@ pub enum ShellInput {
     /// handle, not on disk). The worker answers by broadcasting a
     /// `ViewEvent::TelegramStatus`. Polled by the connect modal.
     TelegramStatusRequest,
+    /// dev-plan/31: connect the Facebook Page Messenger bridge from a
+    /// saved `MessengerConfig` (GUI Connect modal after `/pair`, or boot
+    /// auto-reconnect). The worker spawns the relay WS session, stashes
+    /// the `MessengerSessionHandle`, swaps the approver to
+    /// `MessengerApprover`, and broadcasts `ViewEvent::MessengerStatus`.
+    MessengerConnect(crate::messenger::MessengerConfig),
+    /// dev-plan/31: IPC `messenger_disconnect`. Worker cancels the
+    /// session, restores the pre-connect mode/approver, deletes the
+    /// on-disk config, and broadcasts the disconnected status.
+    MessengerDisconnect,
+    /// dev-plan/31: a Messenger user sent text; the relay WS sink pushes
+    /// it here so the worker drives the real `Agent::run_turn`. `respond`
+    /// is filled with the captured final assistant text — the session
+    /// then chunks + sends it back via the relay's Send API.
+    MessengerMessage {
+        text: String,
+        respond: tokio::sync::oneshot::Sender<String>,
+    },
+    /// dev-plan/31: GUI requested a live status snapshot. The worker
+    /// answers by broadcasting a `ViewEvent::MessengerStatus`.
+    MessengerStatusRequest,
 }
 
 /// What both tabs render. Each variant maps to a UI affordance:
@@ -278,6 +299,11 @@ pub enum ViewEvent {
     /// Emitted on connect / disconnect / pairing change and in response
     /// to `TelegramStatusRequest`.
     TelegramStatus(String),
+    /// Messenger bridge status (dev-plan/31). Pre-built JSON shaped like
+    /// `{type: "messenger_status", state, server_url, pending_approvals}`.
+    /// Emitted on connect / disconnect and in response to
+    /// `MessengerStatusRequest`.
+    MessengerStatus(String),
     /// Goal-state sidebar refresh (Phase A). Carries the latest snapshot
     /// of the active /goal — `None` means the goal was cleared. Frontend
     /// renders a compact indicator (objective, iterations, tokens
@@ -637,6 +663,14 @@ pub struct WorkerState {
     /// approver, restored on disconnect. Mirrors `line_pre_*`.
     pub telegram_pre_mode: Option<crate::permissions::PermissionMode>,
     pub telegram_pre_approver: Option<std::sync::Arc<dyn crate::permissions::ApprovalSink>>,
+    /// dev-plan/31: active Facebook Page Messenger bridge session. `Some`
+    /// only while the relay WS task is running; `messenger_disconnect`
+    /// cancels + clears it. Mirrors `line_session`.
+    pub messenger_session: Option<crate::messenger::MessengerSessionHandle>,
+    /// Pre-Messenger-connect snapshot of the agent's permission mode +
+    /// approver, restored on disconnect. Mirrors `line_pre_*`.
+    pub messenger_pre_mode: Option<crate::permissions::PermissionMode>,
+    pub messenger_pre_approver: Option<std::sync::Arc<dyn crate::permissions::ApprovalSink>>,
     /// Externally-held mid-turn injection queue (issue #106). Kept on
     /// the state so `rebuild_agent` can re-wire it onto the new agent
     /// — without this, a `/model` swap or other rebuild would orphan
@@ -1091,6 +1125,26 @@ fn telegram_disconnected_payload() -> serde_json::Value {
         "pending_pairings": 0,
         "active_chats": 0,
         "pairings": [],
+    })
+}
+
+fn messenger_status_payload(
+    handle: &crate::messenger::MessengerSessionHandle,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "messenger_status",
+        "state": handle.status.state,
+        "server_url": handle.status.server_url,
+        "pending_approvals": handle.approver.pending_count(),
+    })
+}
+
+fn messenger_disconnected_payload() -> serde_json::Value {
+    serde_json::json!({
+        "type": "messenger_status",
+        "state": "disconnected",
+        "server_url": "",
+        "pending_approvals": 0,
     })
 }
 
@@ -1639,6 +1693,9 @@ async fn run_worker(
         telegram_session: None,
         telegram_pre_mode: None,
         telegram_pre_approver: None,
+        messenger_session: None,
+        messenger_pre_mode: None,
+        messenger_pre_approver: None,
         session_cost_usd: 0.0,
         #[cfg(feature = "cost_bridge")]
         cost_bridge: Some(crate::cost_bridge::spawn()),
@@ -1676,6 +1733,16 @@ async fn run_worker(
         }
         Ok(_) => {}
         Err(e) => eprintln!("[telegram] failed to load on-disk config: {e}"),
+    }
+
+    // dev-plan/31: auto-reconnect the Messenger bridge on boot when a
+    // binding token is already on disk. Mirrors the LINE block above.
+    match crate::messenger::MessengerConfig::load() {
+        Ok(Some(cfg)) if !cfg.binding_token.trim().is_empty() => {
+            let _ = input_tx_self.send(ShellInput::MessengerConnect(cfg));
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("[messenger] failed to load on-disk config: {e}"),
     }
 
     // Lead inbox poller — parity with repl.rs:1524. Without this, teammates
@@ -2379,6 +2446,117 @@ async fn run_worker(
                     None => telegram_disconnected_payload(),
                 };
                 let _ = events_tx.send(ViewEvent::TelegramStatus(payload.to_string()));
+            }
+            ShellInput::MessengerConnect(msgr_cfg) => {
+                // New connect always wins — cancel any prior session.
+                if let Some(prev) = state.messenger_session.take() {
+                    prev.cancel.cancel();
+                }
+                let handle = crate::messenger::bootstrap::spawn(msgr_cfg, input_tx_self.clone());
+
+                // Swap permission posture so approvals route through
+                // Messenger while connected. Stash the AGENT's mode +
+                // approver (not just the global) so disconnect restores
+                // exactly — same C3 fix the LINE/Telegram paths document.
+                if state.messenger_pre_mode.is_none() {
+                    state.messenger_pre_mode = Some(state.agent.permission_mode);
+                    state.messenger_pre_approver = Some(state.approver.clone());
+                }
+                crate::permissions::set_current_mode_and_broadcast(
+                    crate::permissions::PermissionMode::MessengerGated,
+                );
+                state.approver =
+                    handle.approver.clone() as std::sync::Arc<dyn crate::permissions::ApprovalSink>;
+                if let Err(e) = state.rebuild_agent(true) {
+                    eprintln!("[messenger] rebuild_agent after mode swap failed: {e}");
+                }
+                state.agent.permission_mode = crate::permissions::PermissionMode::MessengerGated;
+
+                let payload = messenger_status_payload(&handle);
+                state.messenger_session = Some(handle);
+                let _ = events_tx.send(ViewEvent::MessengerStatus(payload.to_string()));
+                let _ = events_tx.send(ViewEvent::SlashOutput(
+                    "[messenger] bridge connected · permissions routed to Messenger".into(),
+                ));
+            }
+            ShellInput::MessengerDisconnect => {
+                // Tell the relay to drop our binding before local cleanup
+                // so the next inbound message re-issues a pairing code
+                // instead of routing into a dead WS. Best-effort.
+                if let Ok(Some(cfg)) = crate::messenger::MessengerConfig::load() {
+                    let client = crate::messenger::MessengerClient::new(cfg);
+                    tokio::spawn(async move {
+                        if let Err(e) = client.unpair().await {
+                            eprintln!("[messenger] /unpair failed (continuing): {e}");
+                        }
+                    });
+                }
+                if let Some(handle) = state.messenger_session.take() {
+                    handle.cancel.cancel();
+                }
+                // Restore pre-connect mode + approver (same C3 fix).
+                if let Some(prev_mode) = state.messenger_pre_mode.take() {
+                    crate::permissions::set_current_mode_and_broadcast(prev_mode);
+                    state.agent.permission_mode = prev_mode;
+                }
+                if let Some(prev_approver) = state.messenger_pre_approver.take() {
+                    state.approver = prev_approver;
+                    if let Err(e) = state.rebuild_agent(true) {
+                        eprintln!("[messenger] rebuild_agent after restore failed: {e}");
+                    }
+                }
+                if let Err(e) = crate::messenger::MessengerConfig::delete() {
+                    eprintln!("[messenger] delete on-disk config: {e}");
+                }
+                let _ = events_tx.send(ViewEvent::MessengerStatus(
+                    messenger_disconnected_payload().to_string(),
+                ));
+                let _ = events_tx.send(ViewEvent::SlashOutput(
+                    "[messenger] bridge disconnected".into(),
+                ));
+            }
+            ShellInput::MessengerMessage { text, respond } => {
+                // Drive the live agent for an inbound Messenger message.
+                // Subscribe before the turn, accumulate the FINAL
+                // assistant text (cleared on each ToolCallStart), answer
+                // via the oneshot. The session sink chunks + sends it
+                // back through the relay's Send API.
+                let mut event_rx = events_tx.subscribe();
+                let collector = tokio::spawn(async move {
+                    let mut buf = String::new();
+                    while let Ok(ev) = event_rx.recv().await {
+                        match ev {
+                            ViewEvent::AssistantTextDelta(s) => buf.push_str(&s),
+                            ViewEvent::ToolCallStart { .. } => buf.clear(),
+                            ViewEvent::TurnDone => break,
+                            ViewEvent::ErrorText(s) => {
+                                if buf.is_empty() {
+                                    buf.push_str(&s);
+                                } else {
+                                    buf.push_str("\n\n");
+                                    buf.push_str(&s);
+                                }
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    buf
+                });
+                // Remote-driven turn: AskUserQuestion short-circuits to a
+                // text prompt instead of a GUI modal (reuses the LINE flag).
+                crate::tools::ask::set_line_driven_turn(true);
+                handle_line(text, &mut state, &events_tx, &cancel, &input_tx_self).await;
+                crate::tools::ask::set_line_driven_turn(false);
+                let final_text = collector.await.unwrap_or_default();
+                let _ = respond.send(final_text);
+            }
+            ShellInput::MessengerStatusRequest => {
+                let payload = match state.messenger_session.as_ref() {
+                    Some(handle) => messenger_status_payload(handle),
+                    None => messenger_disconnected_payload(),
+                };
+                let _ = events_tx.send(ViewEvent::MessengerStatus(payload.to_string()));
             }
             ShellInput::McpAppCallTool {
                 request_id,
@@ -3509,10 +3687,10 @@ async fn drive_turn_stream(
             }
             Ok(AgentEvent::ToolCallStart { name, input, .. }) => {
                 state.last_turn_made_tool_calls = true;
-                let label = format_tool_label(&name, &input);
+                let label = crate::tool_display::tool_label(&name, &input);
                 write_lead_log(
                     &state.lead_log,
-                    &format!("\x1b[0m\n\x1b[90m[tool: {name}]\x1b[0m "),
+                    &format!("\x1b[0m\n\x1b[90m[tool: {label}]\x1b[0m "),
                 );
                 let _ = events_tx.send(ViewEvent::ToolCallStart { name, label, input });
             }
@@ -3911,10 +4089,10 @@ async fn handle_team_messages(
                 let _ = events_tx.send(ViewEvent::UserPrompt(text));
             }
             Ok(AgentEvent::ToolCallStart { name, input, .. }) => {
-                let label = format_tool_label(&name, &input);
+                let label = crate::tool_display::tool_label(&name, &input);
                 write_lead_log(
                     &state.lead_log,
-                    &format!("\x1b[0m\n\x1b[90m[tool: {name}]\x1b[0m "),
+                    &format!("\x1b[0m\n\x1b[90m[tool: {label}]\x1b[0m "),
                 );
                 let _ = events_tx.send(ViewEvent::ToolCallStart { name, label, input });
             }
@@ -4141,14 +4319,6 @@ fn format_provider_model(provider: &str, model: &str) -> String {
     }
 }
 
-fn sanitize_label_field(s: &str) -> String {
-    let cleaned: String = s
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 /// Translate the worker's `ViewEvent` into the chat envelope
 /// shape the plan-10 browser SPA expects. Subset of all events —
 /// only the ones that drive the user-visible chat (text deltas,
@@ -4198,72 +4368,6 @@ fn view_event_to_chat_envelope(ev: &ViewEvent) -> Option<serde_json::Value> {
             "text": crate::providers::humanize_provider_error(text),
         })),
         _ => None,
-    }
-}
-
-fn format_tool_label(name: &str, input: &serde_json::Value) -> String {
-    let detail = match name {
-        "Skill" => input
-            .get("name")
-            .and_then(|v| v.as_str())
-            .map(|n| format!("({n})")),
-        "Task" => input
-            .get("agent")
-            .and_then(|v| v.as_str())
-            .map(|a| format!("(agent={a})")),
-        "Bash" => input.get("command").and_then(|v| v.as_str()).map(|c| {
-            // Same control-char strip as AskUserQuestion — bash
-            // commands often contain heredocs (`<<'PY' ... PY`) whose
-            // newlines break the single-line label.
-            let cleaned = sanitize_label_field(c);
-            let first: String = cleaned.chars().take(40).collect();
-            format!(
-                "({first}{})",
-                if cleaned.chars().count() > 40 {
-                    "…"
-                } else {
-                    ""
-                }
-            )
-        }),
-        "Read" | "Write" | "Edit" => input
-            .get("path")
-            .and_then(|v| v.as_str())
-            .map(|p| format!("({p})")),
-        "Grep" | "Glob" => input
-            .get("pattern")
-            .and_then(|v| v.as_str())
-            .map(|p| format!("({p})")),
-        "WebFetch" => input
-            .get("url")
-            .and_then(|v| v.as_str())
-            .map(|u| format!("({})", u.chars().take(60).collect::<String>())),
-        "WebSearch" => input
-            .get("query")
-            .and_then(|v| v.as_str())
-            .map(|q| format!("({q})")),
-        "AskUserQuestion" => input.get("question").and_then(|v| v.as_str()).map(|q| {
-            // Strip newlines / control chars first — agents often pass
-            // multi-line prompts here, and the raw text breaks the
-            // single-line tool label in xterm.
-            let cleaned = sanitize_label_field(q);
-            let first: String = cleaned.chars().take(60).collect();
-            format!(
-                "({first}{})",
-                if cleaned.chars().count() > 60 {
-                    "..."
-                } else {
-                    ""
-                }
-            )
-        }),
-        _ => None,
-    }
-    .unwrap_or_default();
-    if detail.is_empty() {
-        name.to_string()
-    } else {
-        format!("{name} {detail}")
     }
 }
 
