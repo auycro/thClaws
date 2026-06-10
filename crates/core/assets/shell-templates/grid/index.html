@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Asset Grid — thClaws Shell</title>
+  <style>
+    :root { --bg: #0b1220; --surface: #0f172a; --border: #1f2937;
+      --fg: #f8fafc; --muted: #94a3b8; --teal: #0d9488; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--fg);
+      font: 14px/1.5 system-ui, sans-serif; }
+    header { padding: 16px 24px; border-bottom: 1px solid var(--border);
+      display: flex; gap: 12px; align-items: center; }
+    header input { flex: 1; background: var(--surface); color: var(--fg);
+      border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; font: inherit; }
+    header button { background: var(--teal); color: white; border: 0;
+      border-radius: 8px; padding: 8px 18px; font-weight: 600; cursor: pointer; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+      gap: 12px; padding: 16px 24px; }
+    .card { background: var(--surface); border: 1px solid var(--border);
+      border-radius: 10px; overflow: hidden; aspect-ratio: 1; position: relative; }
+    .card img { width: 100%; height: 100%; object-fit: cover; }
+    .card .placeholder { width: 100%; height: 100%; display: flex; align-items: center;
+      justify-content: center; color: var(--muted); font-size: 11px; padding: 12px; text-align: center; }
+    .card .label { position: absolute; bottom: 0; left: 0; right: 0;
+      padding: 8px 10px; background: linear-gradient(transparent, rgba(0,0,0,0.7));
+      font-size: 11px; color: var(--fg); }
+  </style>
+</head>
+<body>
+  <header>
+    <input id="prompt" placeholder="Describe what to generate (e.g. 'a teal robot reading a book')" />
+    <button id="go">Generate</button>
+  </header>
+  <div class="grid" id="grid"></div>
+  <script>
+    const grid = document.getElementById("grid");
+    const promptEl = document.getElementById("prompt");
+    const go = document.getElementById("go");
+    let recent = [];
+
+    // Persisted history of generated cards — uses the shell-scoped KV.
+    async function load() {
+      try { recent = (await window.thclaws.storage.get("generations")) || []; }
+      catch { recent = []; }
+      render();
+    }
+    function render() {
+      grid.innerHTML = "";
+      recent.forEach((g) => {
+        const card = document.createElement("div");
+        card.className = "card";
+        const inner = g.url
+          ? `<img src="${g.url}" alt="${g.prompt}">`
+          : `<div class="placeholder">${g.prompt || "generating…"}</div>`;
+        card.innerHTML = inner + `<div class="label">${g.prompt}</div>`;
+        grid.prepend(card);
+      });
+    }
+
+    let pendingPrompt = null;
+    let pendingBuf = "";
+    async function generate() {
+      const prompt = promptEl.value.trim();
+      if (!prompt) return;
+      pendingPrompt = prompt;
+      pendingBuf = "";
+      recent.push({ prompt, url: null });
+      render();
+      promptEl.value = "";
+      try { await window.thclaws.run(prompt); } catch (e) { console.error(e); }
+    }
+    go.onclick = generate;
+    promptEl.addEventListener("keydown", (e) => { if (e.key === "Enter") generate(); });
+
+    window.thclaws.on("text", ({ delta }) => { pendingBuf += delta; });
+    window.thclaws.on("done", async () => {
+      // Try to pull a URL out of the assistant's reply — author edits
+      // this to match their actual image-gen tool's output shape.
+      const m = pendingBuf.match(/https?:\/\/\S+\.(?:png|jpg|jpeg|webp)/i);
+      const last = recent[recent.length - 1];
+      if (last) last.url = m ? m[0] : null;
+      try { await window.thclaws.storage.set("generations", recent); } catch {}
+      render();
+      pendingPrompt = null;
+      pendingBuf = "";
+    });
+    load();
+  </script>
+</body>
+</html>

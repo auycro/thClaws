@@ -17,7 +17,7 @@
 //! verbatim — only the trigger changes.
 
 use crate::error::{Error, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -540,13 +540,26 @@ pub fn parse_last_run(schedule: &Schedule) -> Option<DateTime<Utc>> {
         .map(|d| d.with_timezone(&Utc))
 }
 
+/// Format a last-run timestamp for display in the local timezone.
+/// Returns `never` when the field is absent and preserves the raw
+/// string if parsing fails.
+pub fn display_last_run(last_run: Option<&str>) -> String {
+    last_run
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Local).to_rfc3339())
+        .unwrap_or_else(|| last_run.unwrap_or("never").to_string())
+}
+
 /// First cron fire strictly after `after`. Returns `None` if the
 /// expression is invalid or has no upcoming fire (rare — e.g. a
 /// `cron` expression pinned to a specific year that's already past).
 pub fn compute_next_fire(cron_expr: &str, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let normalized = normalize_cron(cron_expr);
     let schedule = cron::Schedule::from_str(&normalized).ok()?;
-    schedule.after(&after).next()
+    schedule
+        .after(&after.with_timezone(&Local))
+        .next()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 /// Next time `schedule` is due relative to `cursor`, unifying the
@@ -577,7 +590,11 @@ pub fn compute_next_n_fires(cron_expr: &str, after: DateTime<Utc>, n: usize) -> 
     let Ok(schedule) = cron::Schedule::from_str(&normalized) else {
         return Vec::new();
     };
-    schedule.after(&after).take(n).collect()
+    schedule
+        .after(&after.with_timezone(&Local))
+        .take(n)
+        .map(|dt| dt.with_timezone(&Utc))
+        .collect()
 }
 
 /// In-process scheduler state. Owns the per-schedule cursor map and
@@ -1740,6 +1757,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn spawn_job_captures_exit_and_writes_log() {
+        // `log_dir_for` reads `$HOME` to place the log file. Concurrent
+        // tests in tools/{memory,kms} + research/* + kms.rs flip HOME
+        // to tempdirs they then drop on guard release — racing those
+        // would leave `outcome.log_path` pointing at a deleted dir.
+        let _env = crate::kms::test_env_lock();
         let tmp = tempfile::tempdir().unwrap();
         // Fake binary: ignores --print + the prompt, just echoes its
         // cwd to stdout and exits 0. This proves cwd was honored.
@@ -2078,18 +2100,13 @@ mod tests {
             .with_timezone(&Utc);
         let fires = compute_next_n_fires("0 9 * * *", after, 3);
         assert_eq!(fires.len(), 3);
-        assert_eq!(
-            fires[0].format("%Y-%m-%dT%H:%M").to_string(),
-            "2026-05-06T09:00"
-        );
-        assert_eq!(
-            fires[1].format("%Y-%m-%dT%H:%M").to_string(),
-            "2026-05-07T09:00"
-        );
-        assert_eq!(
-            fires[2].format("%Y-%m-%dT%H:%M").to_string(),
-            "2026-05-08T09:00"
-        );
+        assert!(fires.windows(2).all(|pair| pair[0] < pair[1]));
+        for fire in fires {
+            assert_eq!(
+                fire.with_timezone(&Local).format("%H:%M").to_string(),
+                "09:00"
+            );
+        }
     }
 
     #[test]
@@ -2106,13 +2123,15 @@ mod tests {
 
     #[test]
     fn compute_next_fire_handles_minute_cron() {
-        // 8:30 every day. After 2026-05-06T08:00:00Z next fire is 08:30 same day.
+        // 8:30 every day in local time.
         let after = DateTime::parse_from_rfc3339("2026-05-06T08:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
         let next = compute_next_fire("30 8 * * *", after).unwrap();
-        assert_eq!(next.format("%H:%M").to_string(), "08:30");
-        assert_eq!(next.format("%Y-%m-%d").to_string(), "2026-05-06");
+        assert_eq!(
+            next.with_timezone(&Local).format("%H:%M").to_string(),
+            "08:30"
+        );
     }
 
     #[test]
@@ -2161,6 +2180,22 @@ mod tests {
             parsed.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             "2026-05-06T12:34:56Z"
         );
+    }
+
+    #[test]
+    fn display_last_run_formats_local_time_and_preserves_instant() {
+        let displayed = display_last_run(Some("2026-05-06T12:34:56Z"));
+        let parsed = DateTime::parse_from_rfc3339(&displayed).unwrap();
+        assert_eq!(
+            parsed.with_timezone(&Utc).to_rfc3339(),
+            "2026-05-06T12:34:56+00:00"
+        );
+    }
+
+    #[test]
+    fn display_last_run_handles_absent_and_invalid_values() {
+        assert_eq!(display_last_run(None), "never");
+        assert_eq!(display_last_run(Some("bad-timestamp")), "bad-timestamp");
     }
 
     /// Tick logic end-to-end: covers catch-up skipping (fresh

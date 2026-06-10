@@ -1182,6 +1182,11 @@ mod tests {
     /// and `WebFetch` (fallback).
     #[test]
     fn hal_key_available_reflects_env() {
+        // HAL_API_KEY is read by the prompt builder's services section,
+        // so this test must serialise against the crate-wide env lock —
+        // pre-fix it ran lockless and intermittently flipped HAL_API_KEY
+        // out from under the prompt-builder test in repl::tests.
+        let _g = crate::kms::test_env_lock();
         let prev = std::env::var("HAL_API_KEY").ok();
 
         std::env::remove_var("HAL_API_KEY");

@@ -1,0 +1,9 @@
+{
+  "id": "dashboard",
+  "name": "Dashboard",
+  "version": "0.1.0",
+  "description": "Stats grid + activity log. Agent returns JSON; shell renders.",
+  "entry": "index.html",
+  "min_bridge_version": "1",
+  "permissions": ["agent.run", "session.read"]
+}

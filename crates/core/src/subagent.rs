@@ -18,10 +18,36 @@ use crate::providers::Provider;
 use crate::tools::{req_str, Tool, ToolRegistry};
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 pub const TOOL_NAME: &str = "Task";
 pub const DEFAULT_MAX_DEPTH: usize = 3;
+
+/// Mutable state shared between a `ProductionAgentFactory` and its
+/// owning worker (CLI `run_repl` locals, GUI `WorkerState`).
+///
+/// Pre-fix the factory captured `system: String` + `base_tools:
+/// ToolRegistry` at construction and never refreshed them — mid-
+/// session mutators (`/mcp add`, `/skill install`, `/kms use`,
+/// `/reload-prompt`, AGENTS.md / memory edits via `/reload-prompt`)
+/// reached the parent agent but not the factory. Subagents spawned
+/// after any of those saw the startup-time system prompt with no
+/// new MCP tools.
+///
+/// Now the worker holds an `Arc<RwLock<FactorySnapshot>>` and the
+/// factory holds a clone of that same `Arc`. Worker writes through
+/// `refresh_factory_snapshot` / `update_factory_snapshot`; factory
+/// reads on every `build()`. Child factories inherit the same `Arc`
+/// (via `snapshot.clone()`) so nested subagents also pick up live
+/// state.
+///
+/// Cheap: cloning a `ToolRegistry` is just cloning a `HashMap<String,
+/// Arc<dyn Tool>>` — tool objects themselves are Arc'd, only the
+/// map shape is copied.
+pub struct FactorySnapshot {
+    pub system: String,
+    pub tools: ToolRegistry,
+}
 
 /// How to construct a child agent. Implementations produce a brand-new
 /// `Agent` with the appropriate configuration.
@@ -62,9 +88,10 @@ pub trait AgentFactory: Send + Sync {
 ///   plumbing yet); GUI passes the worker's CancelToken.
 pub struct ProductionAgentFactory {
     pub provider: Arc<dyn Provider>,
-    pub base_tools: ToolRegistry,
+    /// Live view of the parent agent's system prompt + tool registry.
+    /// Shared by Arc with the worker — see [`FactorySnapshot`] docs.
+    pub snapshot: Arc<RwLock<FactorySnapshot>>,
     pub model: String,
-    pub system: String,
     pub max_iterations: usize,
     pub max_depth: usize,
     /// Per-request output token budget propagated from `AppConfig::max_tokens`.
@@ -96,20 +123,28 @@ impl AgentFactory for ProductionAgentFactory {
             .and_then(|d| d.model.as_deref())
             .unwrap_or(&self.model);
 
+        // Snapshot the live parent state ONCE — system + tools are
+        // both needed and we want them to come from the same instant
+        // (so a refresh between the two reads can't tear).
+        let (parent_system, base_tools) = {
+            let snap = self.snapshot.read().expect("factory snapshot read lock");
+            (snap.system.clone(), snap.tools.clone())
+        };
+
         // System prompt: parent's full prompt + (optional) agent
         // instructions + (when nested) the subagent-mode addendum.
         let mut system = agent_def
             .map(|d| {
                 if d.instructions.is_empty() {
-                    self.system.clone()
+                    parent_system.clone()
                 } else {
                     format!(
                         "{}\n\n# Agent instructions\n{}",
-                        self.system, d.instructions
+                        parent_system, d.instructions
                     )
                 }
             })
-            .unwrap_or_else(|| self.system.clone());
+            .unwrap_or_else(|| parent_system.clone());
         if child_depth > 0 {
             system.push_str(&crate::prompts::load(
                 "subagent",
@@ -127,18 +162,18 @@ impl AgentFactory for ProductionAgentFactory {
         // definitions claiming `disallowed_tools: Bash` got Bash anyway.
         let mut tools = if let Some(def) = agent_def {
             if def.tools.is_empty() {
-                self.base_tools.clone()
+                base_tools.clone()
             } else {
                 let mut filtered = ToolRegistry::new();
                 for name in &def.tools {
-                    if let Some(tool) = self.base_tools.get(name) {
+                    if let Some(tool) = base_tools.get(name) {
                         filtered.register(tool);
                     }
                 }
                 filtered
             }
         } else {
-            self.base_tools.clone()
+            base_tools.clone()
         };
         if let Some(def) = agent_def {
             for name in &def.disallowed_tools {
@@ -152,9 +187,11 @@ impl AgentFactory for ProductionAgentFactory {
         if child_depth < self.max_depth {
             let child_factory = Arc::new(ProductionAgentFactory {
                 provider: self.provider.clone(),
-                base_tools: self.base_tools.clone(),
+                // Share the SAME snapshot Arc so nested subagents
+                // also see live state updates. Cloning the Arc is
+                // O(1) — just a refcount bump.
+                snapshot: self.snapshot.clone(),
                 model: self.model.clone(),
-                system: self.system.clone(),
                 max_iterations: self.max_iterations,
                 max_depth: self.max_depth,
                 max_tokens: self.max_tokens,
@@ -321,6 +358,14 @@ impl Tool for SubAgentTool {
         // subagent stream ran to completion regardless of ctrl-C.
         let outcome = collect_agent_turn_with_cancel(stream, self.cancel.clone()).await?;
 
+        // dev-plan/32 Stage I: push this turn's Usage to the workflow
+        // usage sink if one is active on this thread. No-op outside
+        // `/workflow run` — model-driven Task calls and tests stay
+        // unaffected.
+        if let Some(u) = outcome.usage.as_ref() {
+            crate::workflow::push_worker_usage(u.clone());
+        }
+
         if outcome.text.is_empty() {
             Err(Error::Agent("sub-agent returned empty response".into()))
         } else {
@@ -482,9 +527,11 @@ mod tests {
 
         let factory = ProductionAgentFactory {
             provider: Arc::new(StubProvider),
-            base_tools: base,
+            snapshot: Arc::new(RwLock::new(FactorySnapshot {
+                system: String::new(),
+                tools: base,
+            })),
             model: "test".into(),
-            system: String::new(),
             max_iterations: 1,
             max_depth: 3,
             max_tokens: 8192,
@@ -516,9 +563,11 @@ mod tests {
         let cancel = CancelToken::new();
         let factory = ProductionAgentFactory {
             provider: Arc::new(StubProvider),
-            base_tools: ToolRegistry::new(),
+            snapshot: Arc::new(RwLock::new(FactorySnapshot {
+                system: String::new(),
+                tools: ToolRegistry::new(),
+            })),
             model: "test".into(),
-            system: String::new(),
             max_iterations: 1,
             max_depth: 3,
             max_tokens: 8192,
@@ -537,6 +586,87 @@ mod tests {
                 .map(|c| c.is_cancelled())
                 .unwrap_or(false),
             "child agent should observe parent's cancel token"
+        );
+    }
+
+    /// Regression: the factory must see the LIVE system prompt + tool
+    /// registry — not a snapshot frozen at construction time. Pre-fix
+    /// (everything before this commit) ProductionAgentFactory held
+    /// `system: String` + `base_tools: ToolRegistry` as owned fields
+    /// populated once at worker init. Mid-session `/mcp add` /
+    /// `/skill install` / `/kms use` / `/reload-prompt` updated the
+    /// PARENT agent's system + tool_registry but never reached the
+    /// factory — subagents spawned post-mutator saw the startup-time
+    /// snapshot, missing newly-attached MCP tools and stale on the
+    /// `# MCP server instructions` / KMS / Memory sections.
+    #[tokio::test]
+    async fn production_factory_reads_live_snapshot() {
+        let mut initial_tools = ToolRegistry::new();
+        initial_tools.register(Arc::new(EchoTool { name: "OldTool" }));
+        let snapshot = Arc::new(RwLock::new(FactorySnapshot {
+            system: "INITIAL_SYSTEM".into(),
+            tools: initial_tools,
+        }));
+        let factory = ProductionAgentFactory {
+            provider: Arc::new(StubProvider),
+            snapshot: snapshot.clone(),
+            model: "test".into(),
+            max_iterations: 1,
+            max_depth: 3,
+            max_tokens: 8192,
+            agent_defs: AgentDefsConfig::default(),
+            approver: Arc::new(crate::permissions::DenyApprover),
+            permission_mode: PermissionMode::Auto,
+            cancel: None,
+            hooks: None,
+        };
+
+        // Build once with the initial snapshot — child sees OldTool
+        // and the initial system.
+        let child1 = factory.build("go", None, 1).await.unwrap();
+        let names1 = child1.tools.names();
+        assert!(
+            names1.contains(&"OldTool"),
+            "child should see initial tools, got {names1:?}"
+        );
+        assert!(
+            child1.system_text().contains("INITIAL_SYSTEM"),
+            "child should see initial system; got: {:?}",
+            child1.system_text()
+        );
+
+        // Worker-side mutation: a `/mcp add` would do this — update
+        // tool registry, refresh system prompt, then push both into
+        // the shared snapshot.
+        let mut updated_tools = ToolRegistry::new();
+        updated_tools.register(Arc::new(EchoTool { name: "NewTool" }));
+        {
+            let mut snap = snapshot.write().unwrap();
+            snap.system = "REFRESHED_SYSTEM".into();
+            snap.tools = updated_tools;
+        }
+
+        // Build AGAIN with the same factory — the new child must see
+        // the refreshed state, NOT the initial snapshot.
+        let child2 = factory.build("go", None, 1).await.unwrap();
+        let names2 = child2.tools.names();
+        assert!(
+            names2.contains(&"NewTool"),
+            "child built after refresh must see new tool, got {names2:?}"
+        );
+        assert!(
+            !names2.contains(&"OldTool"),
+            "child built after refresh must NOT see old tool, got {names2:?}"
+        );
+        assert!(
+            child2.system_text().contains("REFRESHED_SYSTEM"),
+            "child built after refresh must see fresh system; got: {:?}",
+            child2.system_text()
+        );
+        assert!(
+            !child2.system_text().contains("INITIAL_SYSTEM"),
+            "child built after refresh must NOT see stale system; got: {:?}",
+            child2.system_text()
         );
     }
 

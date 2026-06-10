@@ -61,9 +61,24 @@ let wsSend: ((msg: IPCMessage) => void) | null = null;
 let reconnectDelayMs = 250;
 const RECONNECT_MAX_MS = 5000;
 
+/**
+ * Path prefix the frontend lives under, with a trailing slash.
+ *
+ * Local + thcompany deploys serve at `/` so this returns `/`. Hosted
+ * agents on thclaws.cloud serve under `/u/<handle>/<slug>/` — every
+ * runtime URL (WebSocket, /upload, etc.) needs to include that prefix
+ * so requests reach the right pod after Caddy strips it. Recomputed
+ * lazily at call time so we pick up the actual page location, not a
+ * cached value from another tab.
+ */
+export function basePath(): string {
+  const p = window.location.pathname;
+  return p.endsWith("/") ? p : p + "/";
+}
+
 function wsUrl(): string {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${proto}//${window.location.host}/ws`;
+  return `${proto}//${window.location.host}${basePath()}ws`;
 }
 
 function emitStatus(status: "disconnected" | "connecting" | "connected") {

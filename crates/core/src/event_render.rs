@@ -86,7 +86,43 @@ pub fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
             "text": strip_ansi(text),
         })
         .to_string()],
+        ViewEvent::WorkflowReviewRequest {
+            id,
+            prompt,
+            script,
+            model,
+            revision,
+        } => vec![serde_json::json!({
+            "type": "chat_workflow_review",
+            "id": id,
+            "prompt": prompt,
+            "script": script,
+            "model": model,
+            "revision": revision,
+        })
+        .to_string()],
         ViewEvent::TurnDone => vec![serde_json::json!({"type": "chat_done"}).to_string()],
+        ViewEvent::BusyChanged => {
+            // Snapshot busy state inline so subscribers don't need a
+            // follow-up `gui_busy_query` round-trip. Time is emitted
+            // as milliseconds-since-epoch — the frontend converts to
+            // a relative "Xm Ys" elapsed for the chip label.
+            let meta = crate::agent_activity::busy_meta();
+            let started_at_ms = meta.as_ref().and_then(|m| {
+                m.started_at
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_millis() as u64)
+            });
+            vec![serde_json::json!({
+                "type": "gui_busy_changed",
+                "busy": meta.is_some(),
+                "sessionId": meta.as_ref().map(|m| m.session_id.clone()),
+                "startedAtMs": started_at_ms,
+                "lastProgress": meta.as_ref().and_then(|m| m.last_progress.clone()),
+            })
+            .to_string()]
+        }
         ViewEvent::HistoryReplaced(messages) => {
             let arr: Vec<serde_json::Value> = messages
                 .iter()
@@ -105,6 +141,7 @@ pub fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
         }
         ViewEvent::SessionListRefresh(json) => vec![json.clone()],
         ViewEvent::ProviderUpdate(json) => vec![json.clone()],
+        ViewEvent::SettingsChanged(json) => vec![json.clone()],
         ViewEvent::KmsUpdate(json) => vec![json.clone()],
         ViewEvent::McpUpdate(json) => vec![json.clone()],
         ViewEvent::LineStatus(json) => vec![json.clone()],
@@ -259,6 +296,96 @@ pub fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
             "error": error,
         })
         .to_string()],
+    }
+}
+
+// ── GUI Shell-shaped translator (dev-plan/33) ─────────────────────
+//
+// Emits a single envelope per event that's interesting to a shell UI.
+// The bridge runtime's `thclaws.on(event, cb)` consumes these — Tier 1
+// events are `"text"`, `"done"`, `"error"`. Tier 2 adds `"tool_call"`
+// and `"tool_result"`.
+//
+// Returns `None` for events that have no shell representation
+// (sidebar refreshes, status pills, etc. — those belong to the
+// main GUI's chrome, not to a shell's domain UI).
+
+/// Build a shell-shaped JSON envelope for a single ViewEvent. The
+/// frontend ShellView filters by `sessionId` before forwarding to the
+/// iframe; here we just emit the event without a session id and the
+/// parent will stamp it when re-posting.
+pub fn render_gui_shell_dispatch(ev: &ViewEvent) -> Option<String> {
+    match ev {
+        ViewEvent::AssistantTextDelta(text) => Some(
+            serde_json::json!({
+                "type": "gui_shell_event",
+                "event": "text",
+                "payload": strip_ansi(text),
+            })
+            .to_string(),
+        ),
+        ViewEvent::TurnDone => Some(
+            serde_json::json!({
+                "type": "gui_shell_event",
+                "event": "done",
+                "payload": null,
+            })
+            .to_string(),
+        ),
+        ViewEvent::ErrorText(s) => Some(
+            serde_json::json!({
+                "type": "gui_shell_event",
+                "event": "error",
+                "payload": { "error": strip_ansi(s) },
+            })
+            .to_string(),
+        ),
+        // Tier 2: surface agent tool activity so shells with
+        // domain-specific UIs can show a progress indicator next to
+        // each call ("Generating image…", "Fetching market data…").
+        ViewEvent::ToolCallStart { name, label, input } => Some(
+            serde_json::json!({
+                "type": "gui_shell_event",
+                "event": "tool_call",
+                "payload": {
+                    "name": name,
+                    "label": strip_ansi(label),
+                    "input": input,
+                },
+            })
+            .to_string(),
+        ),
+        ViewEvent::ToolCallResult { name, output, .. } => Some(
+            serde_json::json!({
+                "type": "gui_shell_event",
+                "event": "tool_result",
+                "payload": {
+                    "name": name,
+                    "output": strip_ansi(output),
+                },
+            })
+            .to_string(),
+        ),
+        // Output of a `!bang` or pure-interceptor `/slash` command the
+        // shell ran via `window.thclaws.run(...)`. Without this arm a
+        // domain shell that fetches state with `run("!script ...")`
+        // (e.g. Book Studio's status poll) gets NOTHING back — the bang
+        // path emits `SlashOutput`, not `ToolCallResult`, so its 15s
+        // refresh + reload button were silently no-ops. Deliver it as a
+        // `tool_result` (the channel shells already parse), labelled
+        // "Bash" since bang commands run as bash.
+        ViewEvent::SlashOutput(text) => Some(
+            serde_json::json!({
+                "type": "gui_shell_event",
+                "event": "tool_result",
+                "payload": {
+                    "name": "Bash",
+                    "output": strip_ansi(text),
+                },
+            })
+            .to_string(),
+        ),
+        _ => None,
     }
 }
 
@@ -428,7 +555,31 @@ pub fn render_terminal_ansi(state: &mut TerminalRenderState, ev: &ViewEvent) -> 
             let body = text.replace('\n', "\r\n");
             Some(format!("\x1b[2m{body}\x1b[0m\r\n"))
         }
+        ViewEvent::WorkflowReviewRequest {
+            id,
+            script,
+            revision,
+            ..
+        } => {
+            // Terminal-tab review banner. Accepts typed decisions
+            // (`approve` / `cancel` / `rework: <note>`) via the
+            // shared chat input, mirroring `--cli` REPL behaviour, or
+            // a button click in the Chat tab. Both paths resolve the
+            // same WorkflowApprover oneshot.
+            let body = script.replace('\n', "\r\n");
+            let rev_tag = if *revision > 0 {
+                format!(" (revision {})", *revision + 1)
+            } else {
+                String::new()
+            };
+            Some(format!(
+                "\x1b[2m── workflow review {id}{rev_tag} ──\r\n{body}\r\n── \
+                 type [a]pprove · [c]ancel · [r] <note> (re-author)   \
+                 or click in Chat tab ──\x1b[0m\r\n"
+            ))
+        }
         ViewEvent::TurnDone => None,
+        ViewEvent::BusyChanged => None,
         ViewEvent::HistoryReplaced(messages) => {
             let mut out = String::from("\x1b[3J\x1b[2J\x1b[H");
             for (i, m) in messages.iter().enumerate() {
@@ -466,6 +617,7 @@ pub fn render_terminal_ansi(state: &mut TerminalRenderState, ev: &ViewEvent) -> 
         ViewEvent::ErrorText(text) => Some(format!("\r\n\x1b[31m{text}\x1b[0m\r\n")),
         ViewEvent::SessionListRefresh(_) => None,
         ViewEvent::ProviderUpdate(_) => None,
+        ViewEvent::SettingsChanged(_) => None,
         ViewEvent::KmsUpdate(_) => None,
         ViewEvent::McpUpdate(_) => None,
         ViewEvent::LineStatus(_) => None,
@@ -645,6 +797,25 @@ mod chat_render_tests {
         assert_eq!(parsed["type"], "chat_error");
         // No JSON to extract → original text passes through unchanged.
         assert_eq!(parsed["text"], raw);
+    }
+
+    #[test]
+    fn gui_shell_slash_output_becomes_bash_tool_result() {
+        // Regression: a `!bang` status fetch (SlashOutput) used to map to
+        // None for gui shells, so Book Studio's status poll silently got
+        // nothing. It must arrive as a `tool_result` the shell can parse.
+        let out = render_gui_shell_dispatch(&ViewEvent::SlashOutput(
+            "[!] book.py status\n{\"next_action\": \"run_audit\"}".into(),
+        ))
+        .expect("SlashOutput should produce a gui_shell event");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["type"], "gui_shell_event");
+        assert_eq!(parsed["event"], "tool_result");
+        assert_eq!(parsed["payload"]["name"], "Bash");
+        assert!(parsed["payload"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("next_action"));
     }
 
     /// Restored chat history is rendered into the terminal as one

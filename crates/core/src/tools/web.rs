@@ -198,14 +198,13 @@ fn truncate_for_bytes(text: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
 
-    /// Mutex serialises tests that fiddle with `HAL_API_KEY` so they
-    /// don't race when the suite runs in parallel.
+    /// Crate-wide env lock alias. These tests mutate `HAL_API_KEY`,
+    /// which the prompt builder's `services_prompt_section()` reads —
+    /// a local lock here wouldn't coordinate with the prompt-builder
+    /// test and the HAL bullet would flip between its two refresh
+    /// calls.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        crate::kms::test_env_lock()
     }
 
     #[test]

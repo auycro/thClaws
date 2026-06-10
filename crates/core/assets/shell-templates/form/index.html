@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Form — thClaws Shell</title>
+  <style>
+    :root { --bg: #0b1220; --surface: #0f172a; --border: #1f2937;
+      --fg: #f8fafc; --muted: #94a3b8; --teal: #0d9488; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--fg);
+      font: 14px/1.5 system-ui, sans-serif; padding: 24px; max-width: 760px; }
+    h1 { margin-top: 0; font-size: 20px; }
+    label { display: block; margin: 14px 0; }
+    label > span { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+    input, textarea, select { width: 100%; background: var(--surface); color: var(--fg);
+      border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font: inherit; }
+    textarea { min-height: 80px; resize: vertical; }
+    button { background: var(--teal); color: white; border: 0;
+      border-radius: 8px; padding: 10px 22px; font-weight: 600; cursor: pointer; margin-top: 12px; }
+    .output { margin-top: 24px; background: var(--surface); border: 1px solid var(--border);
+      border-radius: 8px; padding: 14px; white-space: pre-wrap; min-height: 60px; color: var(--muted); }
+    .output.live { color: var(--fg); }
+  </style>
+</head>
+<body>
+  <h1 id="title">Tell me about your task</h1>
+  <!-- Author: edit these fields to match what your agent needs. -->
+  <form id="f">
+    <label><span>Topic</span><input name="topic" placeholder="e.g. weekly competitor digest" /></label>
+    <label><span>Tone</span>
+      <select name="tone">
+        <option>neutral</option><option>formal</option><option>conversational</option><option>technical</option>
+      </select>
+    </label>
+    <label><span>Length</span>
+      <select name="length"><option>short</option><option>medium</option><option>long</option></select>
+    </label>
+    <label><span>Notes (free text)</span><textarea name="notes" placeholder="anything else…"></textarea></label>
+    <button type="submit">Run</button>
+  </form>
+  <div class="output" id="output">Output appears here…</div>
+  <script>
+    const form = document.getElementById("f");
+    const output = document.getElementById("output");
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const data = Object.fromEntries(new FormData(form).entries());
+      const prompt = `Task: ${data.topic}\nTone: ${data.tone}\nLength: ${data.length}\nNotes: ${data.notes || "—"}`;
+      output.textContent = ""; output.classList.add("live");
+      try { await window.thclaws.run(prompt); } catch (e) { output.textContent = String(e); }
+    });
+    window.thclaws.on("text", ({ delta }) => { output.textContent += delta; });
+    window.thclaws.on("error", ({ message }) => { output.textContent = `error: ${message}`; });
+  </script>
+</body>
+</html>

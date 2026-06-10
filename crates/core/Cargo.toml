@@ -1,6 +1,6 @@
 [package]
 name = "thclaws-core"
-version = "0.22.0"
+version = "0.45.0"
 edition = "2021"
 description = "thClaws — native Rust AI agent workspace with CLI and desktop GUI."
 license = "MIT OR Apache-2.0"
@@ -44,6 +44,16 @@ clap = { version = "4", features = ["derive"] }
 base64 = "0.22"
 sha2 = "0.10"
 tar = "0.4"
+# Gzip codec for the thClaws.cloud agent package format (dev-plan/34).
+# `tar` alone produces uncompressed archives; pairing with flate2 gives
+# us `.tar.gz` for catalog upload/download.
+flate2 = "1"
+# Bundles `assets/shell-templates/` into the binary so
+# `thclaws shell new <template>` works offline. dev-plan/39 Tier 2.
+include_dir = "0.7"
+# Adapter for piping tokio broadcast channels into a Stream (for SSE
+# in `thclaws shell preview`). dev-plan/39 Tier 2.
+tokio-stream = { version = "0.1", features = ["sync"] }
 walkdir = "2"
 getrandom = "0.2"
 shell-words = "1"
@@ -96,6 +106,10 @@ calamine = "0.34"
 umya-spreadsheet = "2"
 tao = { version = "0.34", optional = true }
 wry = { version = "0.54", optional = true }
+# PTY-backed `Shell` tab — spawns $SHELL inside a pty so the GUI can
+# host a live terminal alongside the agent-rendered `Terminal` tab.
+# Optional + gui-gated; CLI / headless builds don't ship a webview.
+portable-pty = { version = "0.9", optional = true }
 # Markdown → HTML for the Files-tab preview. GFM tables, strikethrough,
 # task lists, autolinks. `unsafe_ = false` strips raw HTML (incl. scripts)
 # before we hand it to the sandboxed iframe.
@@ -148,6 +162,26 @@ image = "0.24"
 # builds and the GUI-only path can opt out without pulling in BLE stacks.
 btleplug = { version = "0.11", optional = true }
 
+# Embedded JS engine for the `/workflow` slash command (dev-plan/32 —
+# code-driven subagent fan-out). Pure-Rust, no V8 dep; we attach only
+# the `thclaws.*` host bindings and strip `eval` / `Function` so scripts
+# can't escape the sandbox. MSRV bumps to 1.88 because of this.
+boa_engine = "0.21"
+
+# JSON Schema validation for workflow worker outputs (dev-plan/32
+# Stage H). Default features pull in TLS for HTTP $ref resolution
+# which workflow schemas don't need — strip them; we only validate
+# in-process against an inline schema object.
+jsonschema = { version = "0.46", default-features = false }
+
+# dev-plan/36 Tier 1: BM25-ranked KmsSearch + native Thai segmenter.
+# `tantivy` is the full-text index; `fst` is the DAFSA-backed dict
+# for the Thai segmenter (Burntsushi, battle-tested via ripgrep).
+# Both gated behind the `kms_search_index` feature so users who
+# don't want the ~4-5 MB binary cost can build without them.
+tantivy = { version = "0.22", optional = true }
+fst = { version = "0.4", optional = true }
+
 [features]
 # `cost_bridge` is OPT-IN, not default: it starts a BLE scan on launch
 # (cost_bridge::spawn → adapter.start_scan), which on macOS triggers a
@@ -157,11 +191,17 @@ btleplug = { version = "0.11", optional = true }
 # ~99% of users who don't own a thClaws-Cost Cardputer. Cardputer users
 # build with `--features cost_bridge`. Issue #116.
 default = []
-gui = ["dep:tao", "dep:wry", "dep:comrak", "dep:rfd", "dep:native-dialog"]
+gui = ["dep:tao", "dep:wry", "dep:comrak", "dep:rfd", "dep:native-dialog", "dep:portable-pty"]
 # Cardputer cost display bridge — REPL streams session_cost_usd to a
 # thClaws-Cost peripheral over BLE NUS; device sends reset notifications
 # back when the user hits Backspace. Opt-in (see note on `default`).
 cost_bridge = ["dep:btleplug"]
+# dev-plan/36: BM25-ranked KmsSearch + Thai segmenter.
+# Opt-in forever (per D3) — the regex path stays default. The
+# released binaries built via `make release` include this; cargo-
+# install users must opt in explicitly. Adds ~4-5 MB (tantivy ~3 MB
+# + Thai dict + auxiliary).
+kms_search_index = ["dep:tantivy", "dep:fst"]
 
 [[bin]]
 name = "thclaws-cli"
@@ -213,3 +253,11 @@ windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 # pulling it in directly avoids hand-rolling extern "C" declarations.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Cross-platform terminal-size query (TIOCGWINSZ on Unix,
+# GetConsoleScreenBufferInfo on Windows). Used by
+# tool_display::format_tool_spinner to fit labels within the current
+# terminal row so spinner frames overwrite in place instead of
+# wrapping. Issue #138 / PR #139.
+[dependencies.terminal_size]
+version = "0.4"

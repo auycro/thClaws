@@ -17,8 +17,8 @@
 
 use crate::config::AppConfig;
 use crate::event_render::{
-    render_chat_dispatches, render_terminal_ansi, terminal_data_envelope,
-    terminal_history_replaced_envelope, TerminalRenderState,
+    render_chat_dispatches, render_gui_shell_dispatch, render_terminal_ansi,
+    terminal_data_envelope, terminal_history_replaced_envelope, TerminalRenderState,
 };
 use crate::session::SessionStore;
 use crate::shared_session::{SharedSessionHandle, ShellInput, ViewEvent};
@@ -118,6 +118,14 @@ fn spawn_event_translator(handle: &SharedSessionHandle, proxy: EventLoopProxy<Us
                             continue;
                         }
                         for dispatch in render_chat_dispatches(&ev) {
+                            let _ = proxy.send_event(UserEvent::Dispatch(dispatch));
+                        }
+                        // dev-plan/33 Tier 1: also emit a gui_shell_event
+                        // for any active shell iframes. The shell shares
+                        // this session in Tier 1, so this is effectively
+                        // a third rendering of the same stream — Chat and
+                        // Terminal still get their events as before.
+                        if let Some(dispatch) = render_gui_shell_dispatch(&ev) {
                             let _ = proxy.send_event(UserEvent::Dispatch(dispatch));
                         }
                         if let Some(ansi) = render_terminal_ansi(&mut term_state, &ev) {
@@ -406,6 +414,98 @@ fn escape_for_js(s: &str) -> String {
         .replace('\0', "\\0")
         .replace('\u{2028}', "\\u2028")
         .replace('\u{2029}', "\\u2029")
+}
+
+/// Resolve a `/gui-shell/<id>/<rel>` request against the embedded
+/// registry and return the asset bytes (HTML responses get the bridge
+/// `<script>` injected). Used by the custom-protocol handler.
+fn serve_gui_shell_asset(
+    registry: &crate::gui_shell::ShellRegistry,
+    rest: &str,
+) -> Response<Cow<'static, [u8]>> {
+    // rest = "<id>/<path>" or "<id>" (latter → treat as "<id>/index.html"
+    // wouldn't apply here because the loader always specifies index.html
+    // in the iframe src, so a bare id is a 404).
+    let decoded = urlencoding::decode(rest)
+        .map(|c| c.into_owned())
+        .unwrap_or_else(|_| rest.to_string());
+    let mut parts = decoded.splitn(2, '/');
+    let shell_id = parts.next().unwrap_or("");
+    let rel = parts.next().unwrap_or("");
+
+    let Some(shell) = registry.resolve(shell_id) else {
+        return Response::builder()
+            .status(404)
+            .body(Cow::Borrowed(&b"unknown shell"[..]))
+            .expect("build 404");
+    };
+
+    let (bytes, mime) = match shell.read_asset(rel) {
+        Ok(pair) => pair,
+        Err(_) => {
+            return Response::builder()
+                .status(404)
+                .body(Cow::Borrowed(&b"asset not found"[..]))
+                .expect("build 404");
+        }
+    };
+
+    let body: Cow<'static, [u8]> = if mime.starts_with("text/html") {
+        Cow::Owned(inject_bridge_script(&bytes))
+    } else {
+        Cow::Owned(bytes)
+    };
+
+    Response::builder()
+        .header("Content-Type", mime)
+        .header("X-Content-Type-Options", "nosniff")
+        .body(body)
+        .expect("build gui-shell asset response")
+}
+
+/// Inject `<script src="thclaws://localhost/gui-shell-bridge.js"></script>`
+/// at the start of `<head>` so shell authors don't have to include it
+/// manually. If no `<head>` is present (rare — shells are encouraged to
+/// declare one), prepend a minimal head wrapper at the top of the body.
+fn inject_bridge_script(html: &[u8]) -> Vec<u8> {
+    const TAG: &[u8] = b"<script src=\"thclaws://localhost/gui-shell-bridge.js\"></script>";
+    let lower = html.to_ascii_lowercase();
+    if let Some(idx) = find_subslice(&lower, b"<head>") {
+        let insert_at = idx + b"<head>".len();
+        let mut out = Vec::with_capacity(html.len() + TAG.len());
+        out.extend_from_slice(&html[..insert_at]);
+        out.extend_from_slice(TAG);
+        out.extend_from_slice(&html[insert_at..]);
+        out
+    } else if let Some(idx) = find_subslice(&lower, b"<head ") {
+        // Match `<head class="...">` etc. — insert after the closing >.
+        let after_open = html[idx..]
+            .iter()
+            .position(|&b| b == b'>')
+            .map(|p| idx + p + 1)
+            .unwrap_or(idx);
+        let mut out = Vec::with_capacity(html.len() + TAG.len());
+        out.extend_from_slice(&html[..after_open]);
+        out.extend_from_slice(TAG);
+        out.extend_from_slice(&html[after_open..]);
+        out
+    } else {
+        // No head — prepend one. Wraps the bridge in <head> so a strict
+        // parser still treats the rest as body.
+        let mut out = Vec::with_capacity(html.len() + TAG.len() + b"<head></head>".len());
+        out.extend_from_slice(b"<head>");
+        out.extend_from_slice(TAG);
+        out.extend_from_slice(b"</head>");
+        out.extend_from_slice(html);
+        out
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(target_os = "macos")]
@@ -733,19 +833,62 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
 
     let builder = WebViewBuilder::new()
         .with_url(start_url)
-        .with_custom_protocol("thclaws".into(), |_webview_id, request| {
+        .with_custom_protocol("thclaws".into(), move |_webview_id, request| {
             // File-asset route: serves on-disk files so previewed HTML
             // can load its sibling CSS/JS with relative URLs. Example:
             // `thclaws://localhost/file-asset/Users/jimmy/site/index.html`
             // → reads `/Users/jimmy/site/index.html`. Every request is
             // validated through the sandbox before hitting disk.
             let req_path = request.uri().path();
+
+            // GUI Shell bridge runtime — served at a fixed path so every
+            // shell's injected <script src="…/gui-shell-bridge.js"> hits
+            // the same well-known URL regardless of which shell is loaded.
+            if req_path == "/gui-shell-bridge.js" {
+                return Response::builder()
+                    .header("Content-Type", "application/javascript; charset=utf-8")
+                    .body(Cow::Borrowed(crate::gui_shell::BRIDGE_RUNTIME.as_bytes()))
+                    .expect("build bridge-runtime response");
+            }
+
+            // GUI Shell asset route — `/gui-shell/<id>/<rel>`. Rebuild
+            // the registry per request so newly-installed agents and
+            // workspace cwd switches are picked up live (matches the
+            // fresh-scan the `gui_shell_list` IPC does — without this
+            // the picker would list a project shell that the protocol
+            // handler 404s, producing a blank iframe). Each shell load
+            // triggers a handful of asset requests, so the per-request
+            // FS scan stays well under the human-perceptible threshold.
+            if let Some(rest) = req_path.strip_prefix("/gui-shell/") {
+                let registry = crate::gui_shell::ShellRegistry::new();
+                return serve_gui_shell_asset(&registry, rest);
+            }
+
             if let Some(rest) = req_path.strip_prefix("/file-asset/") {
                 let decoded = urlencoding::decode(rest)
                     .map(|c| c.into_owned())
                     .unwrap_or_else(|_| rest.to_string());
-                let abs = format!("/{decoded}");
-                match crate::sandbox::Sandbox::check(&abs) {
+                // Two URL shapes both reach this route — match the
+                // dual-path lookup in server.rs::serve_project_asset:
+                //   - FilesView builds absolute paths (`/Users/.../foo.png`);
+                //     the URL pathname strips the leading slash, so we
+                //     re-add it and try Sandbox::check (cwd-or-absolute).
+                //   - GUI shells (image-batch's Gallery, speech-studio,
+                //     video-studio) build workspace-relative paths
+                //     (`images/<slug>/<file>.png`); the absolute attempt
+                //     resolves to `/images/...` and 404s, so we fall back
+                //     to passing `decoded` directly and let Sandbox::check
+                //     join it with cwd.
+                //
+                // Cloud (`server.rs`) had this fallback since the early
+                // shells shipped; desktop was stuck on the absolute-only
+                // path, which is why image-generator's Gallery worked in
+                // hosted workspaces but rendered broken thumbnails in the
+                // desktop GUI.
+                let abs_first = format!("/{decoded}");
+                let resolved = crate::sandbox::Sandbox::check(&abs_first)
+                    .or_else(|_| crate::sandbox::Sandbox::check(&decoded));
+                match resolved {
                     Ok(resolved) => match std::fs::read(&resolved) {
                         Ok(bytes) => {
                             let ext = resolved.extension()
@@ -767,6 +910,20 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
                                 "woff2" => "font/woff2",
                                 "ttf" => "font/ttf",
                                 "otf" => "font/otf",
+                                // Audio
+                                "mp3" => "audio/mpeg",
+                                "wav" => "audio/wav",
+                                "m4a" | "aac" => "audio/mp4",
+                                "ogg" | "oga" => "audio/ogg",
+                                "opus" => "audio/opus",
+                                "flac" => "audio/flac",
+                                "weba" => "audio/webm",
+                                // Video
+                                "mp4" | "m4v" => "video/mp4",
+                                "webm" => "video/webm",
+                                "mov" => "video/quicktime",
+                                "mkv" => "video/x-matroska",
+                                "ogv" => "video/ogg",
                                 _ => "application/octet-stream",
                             };
                             return Response::builder()
@@ -830,6 +987,7 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
                 // the shared dispatch path today.
                 let on_zoom: crate::ipc::ZoomFn = Arc::new(|_scale: f64| {});
                 let ipc_ctx = crate::ipc::IpcContext {
+                    is_serve_mode: false,
                     shared: shared_for_ipc.clone(),
                     approver: approver_for_ipc.clone(),
                     pending_asks: pending_asks_for_ipc.clone(),
@@ -837,6 +995,7 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
                     on_quit,
                     on_send_initial_state,
                     on_zoom,
+                    workflow_approver: shared_for_ipc.workflow_approver.clone(),
                 };
                 if crate::ipc::handle_ipc(msg.clone(), &ipc_ctx) {
                     return;
@@ -1015,6 +1174,36 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
                             images: attachments,
                         });
                     } else if !trimmed.is_empty() {
+                        // dev-plan/32 Tier 3 Terminal-tab approval
+                        // intercept (mirrors crate::ipc::handle_ipc).
+                        // The worker loop is blocked on the workflow
+                        // approver oneshot, so typed approvals queued
+                        // through input_tx wait forever. Resolve at
+                        // the IPC boundary instead.
+                        let pending = shared_for_ipc.workflow_approver.pending_ids();
+                        if !pending.is_empty() {
+                            match crate::workflow::parse_chat_decision(trimmed) {
+                                Some(decision) => {
+                                    if let Some(id) = pending.into_iter().next_back() {
+                                        shared_for_ipc
+                                            .workflow_approver
+                                            .resolve(&id, decision);
+                                    }
+                                    return;
+                                }
+                                None => {
+                                    let _ = shared_for_ipc.events_tx.send(
+                                        crate::shared_session::ViewEvent::SlashOutput(
+                                            "workflow review pending — type \
+                                             `approve`, `cancel`, or `rework: <note>` \
+                                             (or click in the Chat tab)"
+                                                .to_string(),
+                                        ),
+                                    );
+                                    return;
+                                }
+                            }
+                        }
                         let _ = shared_for_ipc
                             .input_tx
                             .send(ShellInput::Line(trimmed.to_string()));

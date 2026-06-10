@@ -1,0 +1,9 @@
+{
+  "id": "chat-enhanced",
+  "name": "Chat Enhanced",
+  "version": "0.1.0",
+  "description": "Conversational shell with quick-prompt chips and streaming bubbles. Edit QUICK_PROMPTS to seed your own one-tap actions.",
+  "entry": "index.html",
+  "min_bridge_version": "1",
+  "permissions": ["agent.run", "session.read"]
+}

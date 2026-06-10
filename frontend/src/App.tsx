@@ -1,10 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Terminal, MessageSquare, FolderTree, Users, FolderOpen, Folder, Settings } from "lucide-react";
+import { Terminal, MessageSquare, FolderTree, Users, FolderOpen, Folder, Settings, Sparkles, Layout, Maximize2 } from "lucide-react";
 import { TerminalView } from "./components/TerminalView";
 import { ChatView } from "./components/ChatView";
 import { FilesView } from "./components/FilesView";
 import { TeamView } from "./components/TeamView";
+import { UITab } from "./components/UITab";
+import { ShellTab } from "./components/ShellTab";
 import { LoginButton } from "./components/LoginButton";
+import { RunningChip } from "./components/RunningChip";
+import { useBusyState } from "./hooks/useBusyState";
 import { Sidebar } from "./components/Sidebar";
 import { PlanSidebar } from "./components/PlanSidebar";
 import { GoalSidebar } from "./components/GoalSidebar";
@@ -31,7 +35,7 @@ import { ContextWarningBanner } from "./components/ContextWarningBanner";
 import { useEditingShortcuts } from "./hooks/useEditingShortcuts";
 import { send, subscribe } from "./hooks/useIPC";
 
-type Tab = "terminal" | "chat" | "files" | "team";
+type Tab = "terminal" | "chat" | "files" | "team" | "ui" | "shell";
 
 // Fires `frontend_ready` once on mount. Mounted only after both
 // startup modals (working-directory + secrets-backend) dismiss, so
@@ -49,6 +53,13 @@ const ALL_TABS: { id: Tab; label: string; icon: React.ReactNode }[] = [
   { id: "terminal", label: "Terminal", icon: <Terminal size={14} /> },
   { id: "files", label: "Files", icon: <FolderTree size={14} /> },
   { id: "team", label: "Team", icon: <Users size={14} /> },
+  // dev-plan/33 Tier 2: GUI Shell picker (iframe-loaded installable
+  // domain frontends). Renamed from "Shell" → "UI" once the new
+  // PTY-backed Shell tab took the name.
+  { id: "ui", label: "UI", icon: <Sparkles size={14} /> },
+  // PTY-backed live shell. Spawns `$SHELL` (or fallback) and pipes
+  // stdio through xterm.js.
+  { id: "shell", label: "Shell", icon: <Layout size={14} /> },
 ];
 
 // ── Startup modal ────────────────────────────────────────────────────
@@ -56,7 +67,34 @@ const ALL_TABS: { id: Tab; label: string; icon: React.ReactNode }[] = [
 // directory; on "Start" the backend sets cwd + re-inits sandbox, and
 // only then does the PTY spawn and the tabs become active.
 
-function StartupModal({ onStart }: { onStart: (cwd: string) => void }) {
+/**
+ * Subtle top-right chip shown only in full-screen UI mode. Reminds
+ * the user of the toggle hotkey so they're not stuck without chrome,
+ * and offers a click target for when they've forgotten it. Pure CSS
+ * fade so it doesn't pull attention from the shell.
+ */
+function FullscreenExitHint({ onExit }: { onExit: () => void }) {
+  const isMac =
+    typeof navigator !== "undefined" && navigator.platform.startsWith("Mac");
+  const kbd = isMac ? "⌘⇧U" : "Ctrl⇧U";
+  return (
+    <button
+      onClick={onExit}
+      title={`Exit full-screen UI (${kbd})`}
+      className="fixed top-2 right-2 z-50 px-2 py-1 rounded text-[10px] font-mono opacity-25 hover:opacity-100 transition-opacity"
+      style={{
+        background: "var(--bg-secondary)",
+        color: "var(--text-secondary)",
+        border: "1px solid var(--border)",
+        backdropFilter: "blur(4px)",
+      }}
+    >
+      {kbd}
+    </button>
+  );
+}
+
+function StartupModal({ onStart }: { onStart: (cwd: string, initialTab?: Tab) => void }) {
   const [cwd, setCwd] = useState("");
   const [error, setError] = useState("");
   const [showModal, setShowModal] = useState<boolean | null>(null);
@@ -78,8 +116,14 @@ function StartupModal({ onStart }: { onStart: (cwd: string) => void }) {
         if (Array.isArray(msg.recent_dirs)) {
           setRecentDirs(msg.recent_dirs as string[]);
         }
+        // Backend resolves guiShell.tabDefault to "ui" when set so the
+        // workspace lands on the GUI shell instead of always defaulting
+        // to Terminal. Pass through to onStart so App.tsx can seed
+        // useState<Tab> before the main UI mounts.
+        const initialTab =
+          typeof msg.initial_tab === "string" ? (msg.initial_tab as Tab) : undefined;
         if (msg.needs_modal === false) {
-          onStart(msg.path as string);
+          onStart(msg.path as string, initialTab);
         } else {
           setShowModal(true);
         }
@@ -304,6 +348,63 @@ export default function App() {
   // to paste.
   useEditingShortcuts();
 
+  // dev-plan/36 — auto-attach to the right session on tab open. Two
+  // cases, handled by a SINGLE auto-load that fires ONCE per mount:
+  //
+  //   1. Agent is currently busy → load the busy session so the chat
+  //      view streams the live `[i/N]` progress (the original
+  //      dev-plan/36 Tier 1 goal).
+  //   2. Agent is idle but the user previously worked on a session
+  //      (closed tab after a batch finished, came back to review) →
+  //      load the most-recent non-empty session so they land in
+  //      their work instead of a blank new turn.
+  //
+  // Loads go through the `session_load` IPC (same path the sidebar's
+  // click-to-load uses) so the engine swaps `state.session`, fires a
+  // `chat_history_replaced` event, and the chat view repaints.
+  // `shell_input "/load <id>"` would also work but races worker
+  // readiness; `session_load` is the proper typed handler.
+  const busyState = useBusyState();
+  const [knownSessions, setKnownSessions] = useState<
+    Array<{ id: string; messages: number; title?: string | null }>
+  >([]);
+  useEffect(() => {
+    const unsub = subscribe((msg: any) => {
+      if (msg?.type === "initial_state" || msg?.type === "sessions_list") {
+        if (Array.isArray(msg.sessions)) setKnownSessions(msg.sessions);
+      }
+    });
+    // useIPC opens the WS at module-load and fires frontend_ready in
+    // ws.onopen — both events can complete BEFORE this useEffect
+    // runs (App may re-render mid-flow via StartupModal). If the
+    // initial_state was already dispatched, our subscribe missed it
+    // and `knownSessions` stays empty forever. Re-fire frontend_ready
+    // here so the engine sends a fresh snapshot AFTER our subscribe
+    // is in place. The engine's handler is idempotent — just rebuilds
+    // the same snapshot from the current SessionStore.
+    send({ type: "frontend_ready" });
+    return unsub;
+  }, []);
+  const autoLoadedRef = useRef(false);
+  useEffect(() => {
+    if (autoLoadedRef.current) return;
+    // Case 1 — agent busy.
+    if (busyState.busy && busyState.sessionId) {
+      autoLoadedRef.current = true;
+      send({ type: "session_load", id: busyState.sessionId });
+      return;
+    }
+    // Case 2 — pick the most recent non-empty session from the list.
+    // The engine sends sessions sorted most-recent-first (per
+    // SessionStore::list ordering). Skip empty ones so a freshly-
+    // spawned default session doesn't shadow a real prior session.
+    if (!knownSessions.length) return;
+    const target = knownSessions.find((s) => (s.messages ?? 0) > 0);
+    if (!target) return;
+    autoLoadedRef.current = true;
+    send({ type: "session_load", id: target.id });
+  }, [busyState.busy, busyState.sessionId, knownSessions]);
+
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (!navigator.platform.startsWith("Mac")) return;
@@ -342,9 +443,64 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKeyDown, { capture: true });
   }, []);
 
+  // ⌘⇧U / Ctrl⇧U — toggle full-screen UI tab. Mirrors the
+  // `--serve --gui-shell <id>` experience (chrome-free, just the
+  // shell) without restarting the server. Entering also forces the
+  // active tab to "ui" so the toggle is meaningful from any tab; the
+  // iframe stays mounted across the swap so the shell session
+  // doesn't reset.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const isMac = navigator.platform.startsWith("Mac");
+      const modOk = isMac
+        ? e.metaKey && !e.ctrlKey && !e.altKey && e.shiftKey
+        : e.ctrlKey && !e.metaKey && !e.altKey && e.shiftKey;
+      if (!modOk) return;
+      if (e.key.toLowerCase() !== "u") return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      setFullscreen((prev) => {
+        if (!prev) setActiveTab("ui");
+        return !prev;
+      });
+    };
+    // Iframe focus would swallow the hotkey before parent sees it —
+    // the gui-shell bridge re-emits matching ⌘⇧U presses as a
+    // postMessage so this handler runs regardless of where focus lives.
+    const onMessage = (e: MessageEvent) => {
+      const data = e.data;
+      if (
+        !data ||
+        data.ns !== "thclaws-shell" ||
+        data.type !== "hotkey" ||
+        data.key !== "toggle-fullscreen-ui"
+      ) {
+        return;
+      }
+      setFullscreen((prev) => {
+        if (!prev) setActiveTab("ui");
+        return !prev;
+      });
+    };
+    window.addEventListener("keydown", onKeyDown, { capture: true });
+    window.addEventListener("message", onMessage);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown, { capture: true });
+      window.removeEventListener("message", onMessage);
+    };
+  }, []);
+
   const [started, setStarted] = useState(false);
   const [currentCwd, setCurrentCwd] = useState("");
+  // Default tab is terminal; backend overrides via `initial_tab` on
+  // current_cwd when `guiShell.tabDefault` is set in settings.json so
+  // the workspace lands on the GUI shell instead of terminal.
   const [activeTab, setActiveTab] = useState<Tab>("terminal");
+  // Full-screen UI mode — hides tab strip, sidebar, status bar so the
+  // GUI shell fills the viewport (the cloud equivalent of running
+  // `thclaws --serve --gui-shell <id>`). Auto-enters when the backend
+  // signals an initial UI tab; toggle with ⌘⇧U / Ctrl⇧U.
+  const [fullscreen, setFullscreen] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showSettingsMenu, setShowSettingsMenu] = useState(false);
   const [showLineConnect, setShowLineConnect] = useState(false);
@@ -394,7 +550,7 @@ export default function App() {
   // never touches the OS keychain behind the user's back. `null` ==
   // not picked yet → show the chooser before the main UI.
   const [secretsBackend, setSecretsBackend] =
-    useState<"keychain" | "dotenv" | null>(null);
+    useState<"keychain" | "dotenv" | "hosted" | null>(null);
   const [secretsBackendChecked, setSecretsBackendChecked] = useState(false);
   const settingsButtonRef = useRef<HTMLButtonElement | null>(null);
 
@@ -404,7 +560,9 @@ export default function App() {
       if (msg.type === "secrets_backend") {
         const value = (msg.backend as string | null) ?? null;
         setSecretsBackend(
-          value === "keychain" || value === "dotenv" ? value : null,
+          value === "keychain" || value === "dotenv" || value === "hosted"
+            ? value
+            : null,
         );
         setSecretsBackendChecked(true);
       }
@@ -414,6 +572,11 @@ export default function App() {
   }, []);
 
   const [teamEnabled, setTeamEnabled] = useState(false);
+  // Opt-in flag for the PTY-backed Shell tab. Default off — the tab
+  // gives the user an unsandboxed live shell with no agent-side
+  // permission gating, so it stays hidden until the project flips
+  // `shellTabEnabled: true` in .thclaws/settings.json.
+  const [shellTabEnabled, setShellTabEnabled] = useState(false);
 
   useEffect(() => {
     const unsub = subscribe((msg) => {
@@ -422,6 +585,20 @@ export default function App() {
         typeof msg.enabled === "boolean"
       ) {
         setTeamEnabled(msg.enabled as boolean);
+      } else if (
+        (msg.type === "shell_tab_enabled" ||
+          msg.type === "shell_tab_enabled_result") &&
+        typeof msg.enabled === "boolean"
+      ) {
+        setShellTabEnabled(msg.enabled as boolean);
+      } else if (msg.type === "settings_changed") {
+        // Backend re-loaded .thclaws/settings.json (file watcher or
+        // explicit `settings_reload` IPC). Re-fetch every settings-
+        // derived flag so tab visibility + similar UI bits move
+        // without a page refresh. Cheap — the responses come back
+        // through this same subscribe above.
+        send({ type: "team_enabled_get" });
+        send({ type: "shell_tab_enabled_get" });
       } else if (
         msg.type === "initial_state" &&
         typeof msg.team_enabled === "boolean"
@@ -436,18 +613,36 @@ export default function App() {
       }
     });
     send({ type: "team_enabled_get" });
+    send({ type: "shell_tab_enabled_get" });
     return unsub;
   }, []);
 
   const modalOpen = showSettings || instructionsScope !== null || modelPicker !== null;
-  const effectiveTab = (!teamEnabled && activeTab === "team") ? "chat" as Tab : activeTab;
+  const effectiveTab =
+    !teamEnabled && activeTab === "team"
+      ? ("chat" as Tab)
+      : !shellTabEnabled && activeTab === "shell"
+        ? ("chat" as Tab)
+        : activeTab;
 
-  const TABS = teamEnabled ? ALL_TABS : ALL_TABS.filter((t) => t.id !== "team");
+  let TABS = teamEnabled ? ALL_TABS : ALL_TABS.filter((t) => t.id !== "team");
+  if (!shellTabEnabled) TABS = TABS.filter((t) => t.id !== "shell");
 
   if (!started) {
     return (
       <>
-        <StartupModal onStart={(cwd) => { setCurrentCwd(cwd); setStarted(true); }} />
+        <StartupModal onStart={(cwd, initialTab) => {
+          setCurrentCwd(cwd);
+          if (initialTab) {
+            setActiveTab(initialTab);
+            // guiShell.tabDefault is pinned → enter full-screen UI
+            // automatically so the workspace opens like a dedicated
+            // gui-shell server (`thclaws --serve --gui-shell <id>`).
+            // Toggle off any time with ⌘⇧U / Ctrl⇧U.
+            if (initialTab === "ui") setFullscreen(true);
+          }
+          setStarted(true);
+        }} />
         <ApprovalModal />
       </>
     );
@@ -468,10 +663,19 @@ export default function App() {
     );
   }
 
+  // Full-screen UI mode forces the UI tab regardless of which tab
+  // the user last had active — the whole point is to hide chrome and
+  // surface only the shell.
+  const renderTab = fullscreen ? "ui" : effectiveTab;
+
   return (
     <div className="flex flex-col h-screen">
       <FrontendReadyBeacon />
-      {/* Tab bar */}
+      {fullscreen && (
+        <FullscreenExitHint onExit={() => setFullscreen(false)} />
+      )}
+      {/* Tab bar — hidden in full-screen UI mode */}
+      {!fullscreen && (
       <div
         className="flex items-center gap-0 border-b select-none shrink-0"
         style={{
@@ -511,12 +715,32 @@ export default function App() {
           </button>
         ))}
         <div className="flex-1" />
-        <LoginButton />
+        <RunningChip />
+        <button
+          onClick={() => {
+            setActiveTab("ui");
+            setFullscreen(true);
+          }}
+          className="flex items-center justify-center p-1.5 mr-1 rounded hover:opacity-100 transition-opacity"
+          title={`Full-screen UI (${navigator.platform.startsWith("Mac") ? "⌘⇧U" : "Ctrl⇧U"})`}
+          style={{ color: "var(--text-secondary)", opacity: 0.7 }}
+        >
+          <Maximize2 size={14} />
+        </button>
+        {/* Hide the SSO Sign-in button on any cloud-hosted workspace
+            (gateway OR BYOK). The engine returns "hosted" from
+            secrets_backend_get whenever THCLAWS_WORKSPACE_ID (or
+            THCLAWS_GATEWAY_API_KEY) is set — the visitor is already
+            authenticated at the cloud-routing layer, so a second SSO
+            flow inside the workspace is just noise. Local desktop
+            installs keep the button. */}
+        {secretsBackend !== "hosted" && <LoginButton />}
       </div>
+      )}
 
       {/* Main content */}
       <div className="flex flex-1 min-h-0">
-        <Sidebar onBrowseKms={(name) => setBrowsingKms(name)} />
+        {!fullscreen && <Sidebar onBrowseKms={(name) => setBrowsingKms(name)} />}
         <div className="flex-1 min-w-0 relative">
           {/* Keep every tab panel mounted AND full-sized via absolute+inset-0.
               Inactive panels get `invisible` + `pointer-events-none` so they
@@ -524,7 +748,7 @@ export default function App() {
               `display: none` — which zeroes xterm's grid and kills focus,
               making the terminal un-typeable after a tab switch. */}
           {TABS.map(({ id }) => {
-            const isActive = effectiveTab === id;
+            const isActive = renderTab === id;
             // M6.39.9: when KMS viewer is open, hide tabs visually
             // (they stay mounted so xterm doesn't lose state) and
             // let the viewer's absolute-positioned pane cover them.
@@ -537,6 +761,8 @@ export default function App() {
                 {id === "chat" && <ChatView active={isActive} modalOpen={modalOpen} />}
                 {id === "files" && <FilesView active={isActive} />}
                 {id === "team" && <TeamView />}
+                {id === "ui" && <UITab active={isActive} fullscreen={fullscreen} />}
+                {id === "shell" && <ShellTab active={isActive} />}
               </div>
             );
           })}
@@ -625,7 +851,8 @@ export default function App() {
         )}
       </div>
 
-      {/* Status bar */}
+      {/* Status bar — hidden in full-screen UI mode */}
+      {!fullscreen && (
       <div
         className="flex items-center gap-2 px-3 py-1.5 shrink-0 select-none border-t"
         style={{
@@ -680,6 +907,7 @@ export default function App() {
           )}
         </div>
       </div>
+      )}
 
       {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
       {showLineConnect && (

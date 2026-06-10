@@ -10,6 +10,7 @@ import {
   Users,
   MessageCircle,
   Send,
+  RotateCw,
 } from "lucide-react";
 import { useTheme, type ThemeMode } from "../hooks/useTheme";
 import { send, subscribe } from "../hooks/useIPC";
@@ -263,6 +264,29 @@ export function SettingsMenu({
       >
         Workspace
       </div>
+      <button
+        onClick={() => send({ type: "settings_reload" })}
+        className="sm-row w-full text-left px-3 py-1.5 flex items-start gap-2"
+        style={{ color: "var(--text-primary)", fontSize: "12px" }}
+        title="Re-read .thclaws/settings.json without restarting the engine"
+      >
+        <span
+          className="sm-subtle"
+          style={{ color: "var(--text-secondary)", paddingTop: "1px" }}
+        >
+          <RotateCw size={12} />
+        </span>
+        <div className="flex-1">
+          <div>Reload settings</div>
+          <div
+            className="sm-subtle"
+            style={{ color: "var(--text-secondary)", fontSize: "11px" }}
+          >
+            Pick up changes to .thclaws/settings.json (auto-applies via file
+            watcher; this button is the manual fallback)
+          </div>
+        </div>
+      </button>
       <button
         onClick={toggleTeam}
         className="sm-row w-full text-left px-3 py-1.5 flex items-start gap-2"

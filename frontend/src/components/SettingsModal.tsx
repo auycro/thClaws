@@ -66,7 +66,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   // Storage backend: null until we hear back from the backend. If the
   // backend reports `null` (user never picked), we show the chooser
   // dialog first and only render the key fields after the user picks.
-  const [backend, setBackend] = useState<"keychain" | "dotenv" | null>(null);
+  const [backend, setBackend] = useState<"keychain" | "dotenv" | "hosted" | null>(null);
   const [backendKnown, setBackendKnown] = useState(false);
 
   // Ask the backend for the stored preference first. Nothing else
@@ -75,7 +75,15 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     const unsub = subscribe((msg) => {
       if (msg.type === "secrets_backend") {
         const value = (msg.backend as string | null) ?? null;
-        setBackend(value === "keychain" || value === "dotenv" ? value : null);
+        // "hosted" is the engine's signal that this is a cloud
+        // workspace (gateway OR BYOK) — no local key storage applies.
+        // Treat it as "no chooser needed" rather than null (which
+        // would re-prompt the picker pointlessly).
+        const recognized =
+          value === "keychain" || value === "dotenv" || value === "hosted"
+            ? value
+            : null;
+        setBackend(recognized);
         setBackendKnown(true);
       }
     });
@@ -284,6 +292,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         <div className="flex flex-col gap-3">
           <GatewaySettingsSection />
           <DeployTargetSection />
+          <CloudSection />
+          <AgentIdentitySection />
           <AutoLearnSection />
 
           {llmEntries.map(([provider, row]) =>
@@ -400,7 +410,18 @@ function renderProviderCard(
 
 /// Provider names that have an upstream route on the thClaws Gateway.
 /// Must match `crate::providers::thclaws_gateway::provider_segment`.
-const GATEWAY_PROVIDERS = new Set(["openai", "anthropic", "gemini", "openrouter"]);
+const GATEWAY_PROVIDERS = new Set([
+  "openai",
+  "anthropic",
+  "gemini",
+  "openrouter",
+  "dashscope",
+  "qwen-cloud",
+  "zai",
+  "deepseek",
+  "minimax",
+  "thaillm",
+]);
 
 /// OpenRouter-only inline toggle. When on, both the model picker
 /// and the `/models` slash command hide non-free rows. Persisted
@@ -437,6 +458,13 @@ const PROVIDER_TO_GATEWAY_SEGMENT: Record<string, string> = {
   anthropic: "anthropic",
   gemini: "google",
   openrouter: "openrouter",
+  // Compat providers: frontend id == gateway segment.
+  dashscope: "dashscope",
+  "qwen-cloud": "qwen-cloud",
+  zai: "zai",
+  deepseek: "deepseek",
+  minimax: "minimax",
+  thaillm: "thaillm",
 };
 
 type GatewaySettings = {
@@ -971,6 +999,431 @@ function DeployTargetSection() {
         />
       </div>
       <FlashLine flash={flash} />
+    </div>
+  );
+}
+
+// ── thClaws.cloud (dev-plan/34) ──────────────────────────────────────
+// URL persists to settings.json::cloud.url; CLI token persists to the
+// active secrets backend (keychain or ~/.config/thclaws/.env). Same
+// shape as DeployTargetSection — the engine ipc handler pair is
+// cloud_config_get / cloud_config_set.
+interface CloudConfig {
+  url: string | null;
+  default_url: string;
+  has_token: boolean;
+  token_length: number;
+  env_var_set: boolean;
+  token_writable: boolean;
+}
+
+function CloudSection() {
+  const [cfg, setCfg] = useState<CloudConfig>({
+    url: null,
+    default_url: "https://thclaws.cloud",
+    has_token: false,
+    token_length: 0,
+    env_var_set: false,
+    token_writable: true,
+  });
+  const [urlDraft, setUrlDraft] = useState("");
+  const [tokenDraft, setTokenDraft] = useState("");
+  const [flash, setFlash] = useState<{ ok: boolean; msg: string } | undefined>(undefined);
+
+  useEffect(() => {
+    const unsub = subscribe((msg) => {
+      if (msg.type === "cloud_config") {
+        const next = msg as unknown as CloudConfig & { type: string };
+        setCfg({
+          url: next.url ?? null,
+          default_url: next.default_url ?? "https://thclaws.cloud",
+          has_token: !!next.has_token,
+          token_length: typeof next.token_length === "number" ? next.token_length : 0,
+          env_var_set: !!next.env_var_set,
+          token_writable: !!next.token_writable,
+        });
+      } else if (msg.type === "cloud_config_result") {
+        const r = msg as {
+          url_ok?: boolean;
+          url_error?: string;
+          token_ok?: boolean;
+          token_error?: string;
+        };
+        if (r.url_ok === false || r.token_ok === false) {
+          const parts: string[] = [];
+          if (r.url_ok === false) parts.push(`URL: ${r.url_error ?? "failed"}`);
+          if (r.token_ok === false) parts.push(`Token: ${r.token_error ?? "failed"}`);
+          setFlash({ ok: false, msg: parts.join(" · ") });
+        } else {
+          setFlash({ ok: true, msg: "saved" });
+          setUrlDraft("");
+          setTokenDraft("");
+          setTimeout(() => setFlash(undefined), 2500);
+        }
+        send({ type: "cloud_config_get" });
+      }
+    });
+    send({ type: "cloud_config_get" });
+    return unsub;
+  }, []);
+
+  const onSaveUrl = () => {
+    const trimmed = urlDraft.trim();
+    if (!trimmed) return;
+    send({ type: "cloud_config_set", url: trimmed });
+  };
+  const onClearUrl = () => {
+    send({ type: "cloud_config_set", url: "" });
+    setUrlDraft("");
+  };
+  const onSaveToken = () => {
+    const trimmed = tokenDraft.trim();
+    if (!trimmed || isSentinel(trimmed)) return;
+    send({ type: "cloud_config_set", token: trimmed });
+  };
+  const onClearToken = () => {
+    send({ type: "cloud_config_set", token: "" });
+    setTokenDraft("");
+  };
+
+  const urlValue = urlDraft || cfg.url || "";
+  const urlDirty = urlValue.trim() !== (cfg.url ?? "").trim() && urlValue.trim().length > 0;
+
+  const tokenSentinel = cfg.has_token
+    ? cfg.token_length > 0
+      ? sentinelFor(cfg.token_length)
+      : FALLBACK_SENTINEL
+    : "";
+  const tokenValue = tokenDraft || tokenSentinel;
+  const tokenDirty = tokenDraft.trim().length > 0 && !isSentinel(tokenDraft.trim());
+
+  return (
+    <div
+      className="rounded-lg p-3"
+      style={{ background: "var(--bg-tertiary)", border: "1px solid var(--border)" }}
+    >
+      <div className="flex items-center gap-2 mb-1">
+        <LinkIcon size={12} style={{ color: "var(--accent)" }} />
+        <span className="text-sm font-semibold" style={{ color: "var(--text-primary)" }}>
+          thClaws.cloud
+        </span>
+      </div>
+      <p className="text-xs mb-2" style={{ color: "var(--text-secondary)" }}>
+        Catalog of folder-shaped AI agents. Mint a CLI token from the
+        dashboard at
+        <span className="font-mono"> {(cfg.url ?? cfg.default_url) + "/dashboard"}</span>{" "}
+        and paste it below — every cloud action
+        (<span className="font-mono">/cloud get</span>,{" "}
+        <span className="font-mono">/cloud publish</span>,{" "}
+        <span className="font-mono">/cloud list</span>) uses it via the
+        Authorization header, no shell-env round-trip.
+      </p>
+
+      <FieldLabel
+        icon={<LinkIcon size={11} />}
+        text="Catalog URL"
+        env="cloud.url in settings.json"
+      />
+      <div className="flex gap-1.5 mb-2">
+        <input
+          type="text"
+          placeholder={cfg.default_url}
+          className="flex-1 px-2.5 py-1.5 rounded text-xs font-mono outline-none"
+          style={{
+            background: "var(--bg-primary)",
+            color: "var(--text-primary)",
+            border: "1px solid var(--border)",
+          }}
+          value={urlValue}
+          onChange={(e) => setUrlDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") onSaveUrl();
+          }}
+          autoComplete="off"
+        />
+        <SaveButton onClick={onSaveUrl} disabled={!urlDirty} />
+        <ClearButton onClick={onClearUrl} disabled={!cfg.url} title="Clear configured URL" />
+      </div>
+
+      <FieldLabel
+        icon={<KeyRound size={11} />}
+        text="CLI token"
+        env="THCLAWS_CLOUD_TOKEN"
+      />
+      <div className="flex gap-1.5">
+        <input
+          type={isSentinel(tokenValue) ? "text" : "password"}
+          placeholder="Paste token from /dashboard (starts with thc_)"
+          className="flex-1 px-2.5 py-1.5 rounded text-xs font-mono outline-none"
+          style={{
+            background: "var(--bg-primary)",
+            color: "var(--text-primary)",
+            border: "1px solid var(--border)",
+          }}
+          value={tokenValue}
+          onChange={(e) => setTokenDraft(e.target.value)}
+          onFocus={(e) => {
+            if (isSentinel(e.currentTarget.value)) e.currentTarget.select();
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") onSaveToken();
+          }}
+          autoComplete="off"
+          spellCheck={false}
+        />
+        <SaveButton onClick={onSaveToken} disabled={!tokenDirty} />
+        <ClearButton
+          onClick={onClearToken}
+          disabled={!cfg.has_token}
+          title="Clear stored token"
+        />
+      </div>
+      <FlashLine flash={flash} />
+    </div>
+  );
+}
+
+// ── Agent identity (dev-plan/34 Option A) ───────────────────────────
+// settings.json::agent — this folder's authoritative agent identity.
+// UUID is read-only (server-managed by `cloud publish`); the other
+// three are editable. Pairs with the thClaws.cloud section above.
+interface AgentConfig {
+  exists: boolean;
+  id: string | null;
+  name: string | null;
+  description: string | null;
+  uuid: string | null;
+}
+
+function AgentIdentitySection() {
+  const [cfg, setCfg] = useState<AgentConfig>({
+    exists: false,
+    id: null,
+    name: null,
+    description: null,
+    uuid: null,
+  });
+  const [idDraft, setIdDraft] = useState("");
+  const [nameDraft, setNameDraft] = useState("");
+  const [descDraft, setDescDraft] = useState("");
+  const [touched, setTouched] = useState({ id: false, name: false, description: false });
+  const [flash, setFlash] = useState<{ ok: boolean; msg: string } | undefined>(undefined);
+
+  useEffect(() => {
+    const unsub = subscribe((msg) => {
+      if (msg.type === "agent_config") {
+        const next = msg as unknown as AgentConfig & { type: string };
+        setCfg(next);
+        setIdDraft("");
+        setNameDraft("");
+        setDescDraft("");
+        setTouched({ id: false, name: false, description: false });
+      } else if (msg.type === "agent_config_result") {
+        const r = msg as { ok?: boolean; error?: string };
+        if (r.ok) {
+          setFlash({ ok: true, msg: "saved" });
+          setTimeout(() => setFlash(undefined), 2500);
+          send({ type: "agent_config_get" });
+        } else {
+          setFlash({ ok: false, msg: r.error ?? "failed" });
+        }
+      } else if (msg.type === "agent_unbind_result") {
+        const r = msg as { ok?: boolean; error?: string; had_uuid?: boolean };
+        if (r.ok) {
+          setFlash({
+            ok: true,
+            msg: r.had_uuid ? "unbound — next publish creates a new entry" : "already unbound",
+          });
+          setTimeout(() => setFlash(undefined), 3500);
+          send({ type: "agent_config_get" });
+        } else {
+          setFlash({ ok: false, msg: r.error ?? "failed" });
+        }
+      }
+    });
+    send({ type: "agent_config_get" });
+    return unsub;
+  }, []);
+
+  const idValue = touched.id ? idDraft : cfg.id ?? "";
+  const nameValue = touched.name ? nameDraft : cfg.name ?? "";
+  const descValue = touched.description ? descDraft : cfg.description ?? "";
+
+  const dirty =
+    (touched.id && idValue.trim() !== (cfg.id ?? "").trim()) ||
+    (touched.name && nameValue.trim() !== (cfg.name ?? "").trim()) ||
+    (touched.description && descValue.trim() !== (cfg.description ?? "").trim());
+
+  const onSave = () => {
+    const payload: { type: "agent_config_set"; id?: string; name?: string; description?: string } = {
+      type: "agent_config_set",
+    };
+    if (touched.id) payload.id = idValue.trim();
+    if (touched.name) payload.name = nameValue.trim();
+    if (touched.description) payload.description = descValue.trim();
+    send(payload);
+  };
+
+  const onUnbind = () => {
+    if (!cfg.uuid) return;
+    send({ type: "agent_unbind" });
+  };
+
+  const onInitialize = () => {
+    setTouched({ id: true, name: true, description: true });
+    setIdDraft("");
+    setNameDraft("");
+    setDescDraft("");
+  };
+
+  return (
+    <div
+      className="rounded-lg p-3"
+      style={{ background: "var(--bg-tertiary)", border: "1px solid var(--border)" }}
+    >
+      <div className="flex items-center gap-2 mb-1">
+        <KeyRound size={12} style={{ color: "var(--accent)" }} />
+        <span className="text-sm font-semibold" style={{ color: "var(--text-primary)" }}>
+          Agent identity
+        </span>
+      </div>
+      <p className="text-xs mb-2" style={{ color: "var(--text-secondary)" }}>
+        This folder's catalog identity, stored in{" "}
+        <span className="font-mono">./.thclaws/settings.json::agent</span>.{" "}
+        <span className="font-mono">cloud publish</span> reads from here; the UUID is set by the
+        server on first publish.
+      </p>
+
+      {!cfg.exists && !touched.id && !touched.name && !touched.description && (
+        <div className="mb-2">
+          <p className="text-xs mb-2" style={{ color: "var(--text-secondary)" }}>
+            No <span className="font-mono">agent</span> block yet — initialize one to publish this
+            folder as an agent.
+          </p>
+          <button
+            type="button"
+            className="px-2.5 py-1.5 rounded text-xs font-medium"
+            style={{
+              background: "var(--bg-primary)",
+              color: "var(--accent)",
+              border: "1px solid var(--accent)",
+            }}
+            onClick={onInitialize}
+          >
+            Initialize agent block
+          </button>
+        </div>
+      )}
+
+      {(cfg.exists || touched.id || touched.name || touched.description) && (
+        <>
+          <FieldLabel
+            icon={<KeyRound size={11} />}
+            text="Slug (id)"
+            env="settings.json::agent.id"
+          />
+          <input
+            type="text"
+            placeholder="my-agent"
+            className="w-full px-2.5 py-1.5 rounded text-xs font-mono outline-none mb-2"
+            style={{
+              background: "var(--bg-primary)",
+              color: "var(--text-primary)",
+              border: "1px solid var(--border)",
+            }}
+            value={idValue}
+            onChange={(e) => {
+              setIdDraft(e.target.value);
+              setTouched((t) => ({ ...t, id: true }));
+            }}
+            autoComplete="off"
+            spellCheck={false}
+          />
+
+          <FieldLabel
+            icon={<KeyRound size={11} />}
+            text="Display name"
+            env="settings.json::agent.name"
+          />
+          <input
+            type="text"
+            placeholder="My Agent"
+            className="w-full px-2.5 py-1.5 rounded text-xs outline-none mb-2"
+            style={{
+              background: "var(--bg-primary)",
+              color: "var(--text-primary)",
+              border: "1px solid var(--border)",
+            }}
+            value={nameValue}
+            onChange={(e) => {
+              setNameDraft(e.target.value);
+              setTouched((t) => ({ ...t, name: true }));
+            }}
+            autoComplete="off"
+          />
+
+          <FieldLabel
+            icon={<KeyRound size={11} />}
+            text="Description"
+            env="settings.json::agent.description"
+          />
+          <textarea
+            placeholder="One-line pitch shown on the catalog card."
+            rows={2}
+            className="w-full px-2.5 py-1.5 rounded text-xs outline-none mb-2 resize-none"
+            style={{
+              background: "var(--bg-primary)",
+              color: "var(--text-primary)",
+              border: "1px solid var(--border)",
+            }}
+            value={descValue}
+            onChange={(e) => {
+              setDescDraft(e.target.value);
+              setTouched((t) => ({ ...t, description: true }));
+            }}
+            autoComplete="off"
+          />
+
+          <div className="flex justify-end mb-2">
+            <SaveButton onClick={onSave} disabled={!dirty} />
+          </div>
+
+          <FieldLabel
+            icon={<LinkIcon size={11} />}
+            text="UUID (read-only — server-assigned)"
+            env="settings.json::agent.uuid"
+          />
+          <div className="flex gap-1.5 items-center">
+            <input
+              type="text"
+              readOnly
+              className="flex-1 px-2.5 py-1.5 rounded text-xs font-mono outline-none"
+              style={{
+                background: "var(--bg-primary)",
+                color: cfg.uuid ? "var(--text-primary)" : "var(--text-secondary)",
+                border: "1px solid var(--border)",
+              }}
+              value={cfg.uuid ?? "(unbound — next publish creates new entry)"}
+            />
+            <button
+              type="button"
+              className="px-2.5 py-1.5 rounded text-xs font-medium disabled:opacity-50"
+              style={{
+                background: "transparent",
+                color: "var(--danger, #e06c75)",
+                border: "1px solid var(--danger, #e06c75)",
+              }}
+              disabled={!cfg.uuid}
+              onClick={onUnbind}
+              title="Clear the UUID so the next publish creates a new catalog entry. Use when forking."
+            >
+              Unbind
+            </button>
+          </div>
+
+          <FlashLine flash={flash} />
+        </>
+      )}
     </div>
   );
 }

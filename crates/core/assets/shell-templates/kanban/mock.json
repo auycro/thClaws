@@ -1,0 +1,3 @@
+{
+  "default_response": "This is a mock agent reply. Streaming text shows up here. Customise mock.json to script different replies per prompt regex."
+}

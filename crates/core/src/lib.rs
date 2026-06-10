@@ -5,6 +5,11 @@
 //! Higher layers (providers, tools, context, agent, repl) land in later phases.
 
 pub mod agent;
+/// Process-wide agent-busy counter — RAII guard wrapping every
+/// `drive_turn_stream` so cross-cutting concerns (the cloud heartbeat,
+/// future "is anything running" UI) can ask "is the engine doing
+/// work right now?" without threading state through every call path.
+pub mod agent_activity;
 pub mod agent_defs;
 /// Workspace-scoped agent runtime builder. Used by the HTTP
 /// `/agent/run` endpoint to construct a per-request `Agent` parameterized
@@ -21,6 +26,11 @@ pub mod auto_learn;
 pub mod branding;
 pub mod cancel;
 mod cli_completer;
+/// thClaws.cloud catalog client — login/publish/get/list against the
+/// catalog backend at `thclaws.cloud`. See `dev-plan/34`. An "AI Agent"
+/// in thClaws is a working folder; this module wraps the tar/upload/
+/// download mechanics for shipping that folder to/from the catalog.
+pub mod cloud;
 /// ChatGPT/Codex OAuth token model (ported from themion).
 pub mod codex_auth;
 /// ChatGPT/Codex auth file persistence under `~/.config/thclaws/auth/`.
@@ -48,11 +58,19 @@ pub mod file_preview;
 pub mod goal_state;
 #[cfg(feature = "gui")]
 pub mod gui;
+#[cfg(feature = "gui")]
+pub mod gui_shell;
 pub mod hooks;
 pub mod instructions;
 #[cfg(feature = "gui")]
 pub mod ipc;
 pub mod kms;
+// dev-plan/36 Tier 1: BM25-ranked KMS search + native Thai segmenter.
+// Both gated behind the `kms_search_index` Cargo feature (opt-in
+// forever per D3) so users / operators without KMSes don't pay the
+// tantivy + dict binary-size cost.
+#[cfg(feature = "kms_search_index")]
+pub mod kms_search_index;
 pub mod line;
 /// ChatGPT OAuth device-code flow for the `chatgpt-codex` provider.
 pub mod login_codex;
@@ -61,6 +79,7 @@ pub mod mcp;
 pub mod memory;
 pub mod messenger;
 pub mod model_catalogue;
+pub mod multi_tenant;
 pub mod oauth;
 pub mod permissions;
 pub mod plugins;
@@ -85,6 +104,8 @@ pub mod shell_bang;
 #[cfg(feature = "gui")]
 pub mod shell_dispatch;
 #[cfg(feature = "gui")]
+pub mod shell_pty;
+#[cfg(feature = "gui")]
 pub mod side_channel;
 pub mod skills;
 pub mod skills_state;
@@ -92,6 +113,8 @@ pub mod sso;
 pub mod subagent;
 pub mod team;
 pub mod telegram;
+#[cfg(feature = "kms_search_index")]
+pub mod thai;
 pub mod theme;
 pub mod tokens;
 pub mod tool_display;
@@ -101,5 +124,6 @@ pub mod uploads;
 pub mod usage;
 pub mod util;
 pub mod version;
+pub mod workflow;
 
 pub use error::{Error, Result};

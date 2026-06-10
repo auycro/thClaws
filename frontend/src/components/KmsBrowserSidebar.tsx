@@ -106,6 +106,17 @@ export function KmsBrowserSidebar({
           setError((msg.error as string) ?? "browse failed");
           setPages([]);
         }
+      } else if (msg.type === "kms_update") {
+        // Backend fires this when a research job finishes (and when
+        // any KMS is created / activated / deactivated). The envelope
+        // carries the KMS list, not page-level deltas, so we don't
+        // know whether OUR kms gained pages — just re-fetch
+        // unconditionally. Browse is cheap (reads a directory) and
+        // this only fires on real changes. Without this, a research
+        // run finishes, the agent has clearly written pages (the LLM
+        // can reference them), but this sidebar keeps showing the
+        // stale page list from the moment it was opened.
+        send({ type: "kms_browse", name: kmsName });
       }
     });
     send({ type: "kms_browse", name: kmsName });

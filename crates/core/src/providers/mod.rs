@@ -165,7 +165,7 @@ impl ProviderKind {
             Self::Ollama => "ollama/llama3.2",
             Self::OllamaAnthropic => "oa/qwen3-coder",
             Self::OllamaCloud => "ollama-cloud/deepseek-v4-flash",
-            Self::DashScope => "qwen-max",
+            Self::DashScope => "dashscope/qwen-max",
             // Alibaba Singapore DashScope (`dashscope-intl.aliyuncs.com`).
             // Same OpenAI-compat wire protocol as DashScope, but a
             // separate region/account, so models route via the short
@@ -207,12 +207,12 @@ impl ProviderKind {
             // that yields a doubled prefix (`nvidia/nvidia/<name>`), the outer one stripped
             // by build_provider before the request. Override via NVIDIA_BASE_URL for on-prem.
             Self::Nvidia => "nvidia/nvidia/nemotron-3-super-120b-a12b",
-            // MiniMax (minimaxi.com) — Chinese AI lab, OpenAI-compatible
-            // endpoint at api.minimaxi.com/v1. MiniMax-M2 is the latest
-            // flagship reasoning model (open-weights, hosted via the same
-            // API). Models use the `minimax/<id>` prefix; the prefix is
-            // stripped before the request reaches the upstream.
-            Self::Minimax => "minimax/MiniMax-M2",
+            // MiniMax — Chinese AI lab, OpenAI-compatible endpoint at
+            // api.minimax.io/v1. MiniMax-M3 is the latest flagship model.
+            // MiniMax-M2 remains available. Models use the `minimax/<id>`
+            // prefix; the prefix is stripped before the request reaches
+            // the upstream.
+            Self::Minimax => "minimax/MiniMax-M3",
             // OpenCodeGo (opencode.ai) — OpenAI-compatible hosted inference.
             // Models use the `opencode-go/<id>` prefix (e.g.
             // `opencode-go/kimi-k2.6`); the prefix is stripped before
@@ -492,6 +492,16 @@ impl ProviderKind {
             // `qc/` prefix is stripped before the request reaches the
             // upstream so it sees the bare `qwen-*` id.
             Some(Self::QwenCloud)
+        } else if model.starts_with("dashscope/") {
+            // Alibaba Cloud mainland DashScope routing prefix. Models look
+            // like `dashscope/qwen-max`, `dashscope/deepseek-v3.2`,
+            // `dashscope/kimi-k2.6`, etc.; the `dashscope/` prefix is
+            // stripped by `build_provider` before the request reaches
+            // Alibaba's upstream so it sees the bare id. Bare `qwen-*` /
+            // `qwq-*` ids still route to DashScope below — backward
+            // compat for settings that pre-date this prefix being
+            // canonical.
+            Some(Self::DashScope)
         } else if model.starts_with("qwen") || model.starts_with("qwq-") {
             Some(Self::DashScope)
         } else if model.starts_with("deepseek-") {
@@ -978,9 +988,8 @@ pub fn kind_has_credentials(kind: Option<ProviderKind>) -> bool {
 /// timeout` against a possibly-unreachable host).
 pub async fn build_all_models_payload() -> String {
     let cat = crate::model_catalogue::EffectiveCatalogue::load();
-    let free_only_or = crate::config::AppConfig::load()
-        .map(|c| c.openrouter_free_only)
-        .unwrap_or(false);
+    let app_cfg = crate::config::AppConfig::load().unwrap_or_default();
+    let free_only_or = app_cfg.openrouter_free_only;
     let ollama_live: Vec<String> = {
         let base = std::env::var("OLLAMA_BASE_URL")
             .unwrap_or_else(|_| crate::providers::ollama::DEFAULT_BASE_URL.to_string());
@@ -1022,6 +1031,8 @@ pub async fn build_all_models_payload() -> String {
         let mut model_ids: std::collections::BTreeMap<String, Option<u32>> =
             std::collections::BTreeMap::new();
         let is_openrouter = matches!(kind, ProviderKind::OpenRouter);
+        let hide_unpriced =
+            crate::providers::thclaws_gateway::hides_unpriced_models(&app_cfg, name);
         for (id, entry) in cat.list_models_for_provider(name) {
             if entry.chat == Some(false) {
                 continue;
@@ -1029,11 +1040,13 @@ pub async fn build_all_models_payload() -> String {
             if is_openrouter && free_only_or && entry.free != Some(true) {
                 continue;
             }
-            let canonical = if ProviderKind::detect(&id) == Some(*kind) {
-                id
-            } else {
-                format!("{name}/{id}")
-            };
+            // Strictly metered via gateway → unpriced rows 400, hide them.
+            if hide_unpriced
+                && (entry.input_per_mtok.is_none() || entry.output_per_mtok.is_none())
+            {
+                continue;
+            }
+            let canonical = crate::model_catalogue::canonical_model_id(name, &id);
             model_ids.insert(canonical, entry.context);
         }
         if matches!(kind, ProviderKind::Ollama) {
@@ -1374,6 +1387,38 @@ mod tests {
         assert_eq!(ProviderKind::QwenCloud.default_model(), "qc/qwen-max");
     }
 
+    // The catalogue stores DashScope rows with a `dashscope/` routing
+    // prefix so heterogeneous Alibaba-hosted families (qwen, deepseek,
+    // glm, kimi, …) all route through one provider — the bare-id arms
+    // alone would misroute `deepseek-v3.2` to DeepSeek even though it's
+    // Alibaba-hosted on this provider. Bare `qwen-*` still routes for
+    // backward compat with pre-prefix settings.
+    #[test]
+    fn detect_dashscope_prefix_routes_to_dashscope_provider() {
+        assert_eq!(
+            ProviderKind::detect("dashscope/qwen-max"),
+            Some(ProviderKind::DashScope)
+        );
+        assert_eq!(
+            ProviderKind::detect("dashscope/deepseek-v3.2"),
+            Some(ProviderKind::DashScope),
+            "Alibaba-hosted deepseek must route to DashScope, not the bare-`deepseek-` arm",
+        );
+        assert_eq!(
+            ProviderKind::detect("dashscope/kimi-k2.6"),
+            Some(ProviderKind::DashScope)
+        );
+        assert_eq!(
+            ProviderKind::detect("qwen-max"),
+            Some(ProviderKind::DashScope),
+            "bare qwen-* still routes to DashScope for backward compat",
+        );
+        assert_eq!(
+            ProviderKind::DashScope.default_model(),
+            "dashscope/qwen-max"
+        );
+    }
+
     #[test]
     fn detect_minimax_prefix_routes_to_minimax_provider() {
         assert_eq!(
@@ -1390,7 +1435,7 @@ mod tests {
             Some("https://api.minimax.io/v1")
         );
         assert_eq!(ProviderKind::Minimax.name(), "minimax");
-        assert_eq!(ProviderKind::Minimax.default_model(), "minimax/MiniMax-M2");
+        assert_eq!(ProviderKind::Minimax.default_model(), "minimax/MiniMax-M3");
     }
 
     #[test]

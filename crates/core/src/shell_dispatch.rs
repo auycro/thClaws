@@ -12,7 +12,7 @@
 
 #![cfg(feature = "gui")]
 
-use crate::repl::{default_model_for_provider, parse_slash, render_help, SlashCommand};
+use crate::repl::{default_model_for_provider, parse_slash, render_help, CloudSlash, SlashCommand};
 use crate::session::Session;
 use crate::shared_session::{
     build_session_list, save_history, DisplayMessage, ViewEvent, WorkerState,
@@ -354,6 +354,16 @@ pub async fn dispatch(
                 rows.retain(|(_, e)| e.free == Some(true));
             }
 
+            // Gateway routing is strictly metered: unpriced models 400
+            // upstream, so don't offer them. No-op on desktop (overlay
+            // off — the user's own keys are not metered by us).
+            if crate::providers::thclaws_gateway::hides_unpriced_models(
+                &state.config,
+                provider_name,
+            ) {
+                rows.retain(|(_, e)| e.input_per_mtok.is_some() && e.output_per_mtok.is_some());
+            }
+
             // Ollama is per-machine, so the catalogue alone can't know what
             // the user has pulled — hit `/api/tags` too and union any new
             // ids (without context until `/model <id>` auto-scans them).
@@ -462,6 +472,15 @@ pub async fn dispatch(
                     if prov == "openrouter" && state.config.openrouter_free_only {
                         models.retain(|(_, e)| e.free == Some(true));
                     }
+                    // Strictly metered via gateway → hide unpriced rows.
+                    if crate::providers::thclaws_gateway::hides_unpriced_models(
+                        &state.config,
+                        prov,
+                    ) {
+                        models.retain(|(_, e)| {
+                            e.input_per_mtok.is_some() && e.output_per_mtok.is_some()
+                        });
+                    }
                     if models.len() >= 3 {
                         let _ = crate::providers::ProviderKind::detect(&state.config.model);
                         let model_rows: Vec<serde_json::Value> = models
@@ -522,6 +541,12 @@ pub async fn dispatch(
         SlashCommand::Clear => {
             state.agent.clear_history();
             state.session = Session::new(&state.config.model, state.cwd.to_string_lossy());
+            // Reset session-scoped trust + plan state too. ChangeCwd's
+            // hygiene block (shared_session.rs ~2820) is the reference;
+            // /clear used to skip these, so the previous conversation's
+            // yolo flag and plan persisted into the cleared session.
+            state.approver.reset_session_flag();
+            crate::tools::plan_state::clear();
             let _ = events_tx.send(ViewEvent::HistoryReplaced(Vec::new()));
             emit(events_tx, "(history cleared)".into());
         }
@@ -818,6 +843,11 @@ pub async fn dispatch(
                 }
                 _ => String::new(),
             };
+            // Insurance: if any mid-session mutation (folder instructions
+            // edit, ad-hoc memory file write, etc.) bypassed its own
+            // rebuild, /compact is a natural moment to resync. Cheap —
+            // just re-runs build_full_system_prompt and calls set_system.
+            state.rebuild_system_prompt();
             emit(
                 events_tx,
                 format!(
@@ -826,6 +856,14 @@ pub async fn dispatch(
                     compacted.len()
                 ),
             );
+        }
+        SlashCommand::ReloadPrompt => {
+            // GUI mirror of the CLI `/reload-prompt`. Rebuilds
+            // state.system_prompt from current state (skills / MCP /
+            // KMS / memory / AGENTS.md) and pushes it into the agent
+            // via set_system — no process re-exec, no history loss.
+            state.rebuild_system_prompt();
+            emit(events_tx, "[reload-prompt] system prompt rebuilt".into());
         }
         SlashCommand::Reload => {
             emit(
@@ -905,6 +943,9 @@ pub async fn dispatch(
             if let Some(store) = &state.session_store {
                 let _ = store.save(&mut state.session);
             }
+            // Insurance — same rationale as /compact above. Any mid-session
+            // mutation that bypassed its own rebuild gets resynced here.
+            state.rebuild_system_prompt();
             let display = crate::shared_session::DisplayMessage::from_messages(&summary_history);
             let _ = events_tx.send(crate::shared_session::ViewEvent::HistoryReplaced(display));
             let _ = events_tx.send(crate::shared_session::ViewEvent::SessionListRefresh(
@@ -2310,6 +2351,47 @@ pub async fn dispatch(
             }
             Err(e) => emit(events_tx, format!("/kms merge failed: {e}")),
         },
+        SlashCommand::KmsSearch {
+            name,
+            query,
+            is_pattern,
+        } => {
+            // dev-plan/36 follow-up: `/kms search <name|*> <query>`.
+            // Same shared helper the CLI uses so GUI + CLI behave
+            // identically.
+            let out = crate::tools::kms::run_slash_search(&name, &query, is_pattern);
+            emit(events_tx, out);
+        }
+        SlashCommand::KmsReindex(name) => {
+            // dev-plan/36 Tier 3.B: rebuild the BM25 index from
+            // pages/ on disk. Mirrors the CLI handler in repl.rs.
+            let Some(k) = crate::kms::resolve(&name) else {
+                emit(events_tx, format!("no KMS named '{name}'"));
+                return;
+            };
+            #[cfg(feature = "kms_search_index")]
+            {
+                emit(events_tx, format!("/kms reindex {name} — rebuilding…"));
+                match crate::kms_search_index::full_rebuild(&k.root) {
+                    Ok(n) => emit(
+                        events_tx,
+                        format!("/kms reindex {name} — indexed {n} page(s)"),
+                    ),
+                    Err(e) => emit(events_tx, format!("/kms reindex {name} failed: {e}")),
+                }
+            }
+            #[cfg(not(feature = "kms_search_index"))]
+            {
+                let _ = k;
+                emit(
+                    events_tx,
+                    "/kms reindex requires the kms_search_index feature; \
+                     this binary was built without it. Use the official \
+                     thClaws release (which ships with the feature on)."
+                        .to_string(),
+                );
+            }
+        }
         SlashCommand::KmsLint(name) => {
             // M6.25 BUG #3: pure-read health check.
             let Some(k) = crate::kms::resolve(&name) else {
@@ -2846,7 +2928,7 @@ pub async fn dispatch(
                     } else {
                         "      "
                     };
-                    let last = s.last_run.as_deref().unwrap_or("never");
+                    let last = crate::schedule::display_last_run(s.last_run.as_deref());
                     let exit = match s.last_exit {
                         Some(0) => "ok ",
                         Some(_) => "err",
@@ -3216,6 +3298,51 @@ pub async fn dispatch(
                 )));
             });
         }
+        SlashCommand::Cloud(sub) => {
+            let cloud_cfg = crate::config::ProjectConfig::load().and_then(|c| c.cloud.clone());
+            let events_tx_clone = events_tx.clone();
+            tokio::spawn(async move {
+                let lines = match sub {
+                    CloudSlash::Status => crate::cloud::cmd::status_lines(None, cloud_cfg.as_ref()),
+                    CloudSlash::List { mine } => {
+                        crate::cloud::cmd::list_lines(mine, None, cloud_cfg.as_ref()).await
+                    }
+                    CloudSlash::Get { slug } => {
+                        crate::cloud::cmd::get_into_cwd_lines(slug, None, cloud_cfg.as_ref()).await
+                    }
+                    CloudSlash::Publish => {
+                        crate::cloud::cmd::publish_cwd_lines(None, cloud_cfg.as_ref()).await
+                    }
+                    CloudSlash::Unbind => crate::cloud::cmd::unbind_lines(),
+                };
+                for line in lines {
+                    let _ = events_tx_clone.send(ViewEvent::SlashOutput(line));
+                }
+            });
+        }
+        SlashCommand::WorkflowRun(prompt) => {
+            dispatch_workflow_run(prompt, state, events_tx).await;
+        }
+        SlashCommand::WorkflowList => {
+            dispatch_workflow_list(events_tx);
+        }
+        SlashCommand::WorkflowInspect(prefix) => {
+            dispatch_workflow_inspect(prefix, events_tx);
+        }
+        SlashCommand::WorkflowResume(prefix) => {
+            dispatch_workflow_resume(prefix, state, events_tx).await;
+        }
+        SlashCommand::WorkflowExec(path) => {
+            dispatch_workflow_exec(path, state, events_tx).await;
+        }
+        SlashCommand::WorkflowRm(_) => {
+            emit(
+                events_tx,
+                "/workflow rm needs a stdin y/N confirm that the chat tab doesn't expose. \
+                 Run `thclaws --cli` to delete workflows, or use `rm -rf .thclaws/workflows/<id>/` directly."
+                    .to_string(),
+            );
+        }
         SlashCommand::Unknown(detail) => {
             emit(events_tx, format!("unknown command: {detail}"));
         }
@@ -3303,39 +3430,24 @@ async fn switch_model(
         }
     }
 
-    // Intra-family swap (e.g. sonnet → opus, both Anthropic) keeps the
-    // same message/tool-call schema on the wire, so the existing
-    // conversation replays cleanly against the new model. Cross-family
-    // swaps (Anthropic → OpenAI → Gemini) change the wire shape and
-    // would either hard-error or silently corrupt context — fork to a
-    // fresh session instead.
-    let old_kind = crate::providers::ProviderKind::detect(&state.config.model);
-    let new_kind = crate::providers::ProviderKind::detect(&resolved);
-    let same_family = old_kind.is_some() && old_kind == new_kind;
-
-    // Flush prior session before swapping. We always want the on-disk
-    // copy up-to-date regardless of which branch we take next.
+    // Preserve history across every model swap, intra- or cross-family.
+    // The JSONL log is the canonical conversation; whichever provider
+    // serves the next turn translates ContentBlocks to its wire format
+    // (anthropic.rs serializes blocks directly, openai.rs maps ToolUse →
+    // tool_calls, etc.). Blocks that don't map cleanly (e.g. Anthropic
+    // Thinking on a non-reasoning OpenAI model) are silently dropped per
+    // provider — accepted tradeoff for continuity. Pre-fix, cross-family
+    // swaps forked to a fresh session because mid-conversation
+    // translation was deemed risky; user reversed that on
+    // thClaws/thClaws#142.
     save_history(&state.agent, &mut state.session, &state.session_store);
 
     state.config = candidate;
-    if same_family {
-        // Preserve history across the model swap. `rebuild_agent(true)`
-        // carries the existing message list into the fresh Agent; the
-        // session itself keeps its id and accumulated messages, we just
-        // update the `model` label so the header reflects the new model.
-        if let Err(e) = state.rebuild_agent(true) {
-            emit(events_tx, format!("rebuild failed: {e}"));
-            return;
-        }
-        state.session.model = state.config.model.clone();
-    } else {
-        if let Err(e) = state.rebuild_agent(false) {
-            emit(events_tx, format!("rebuild failed: {e}"));
-            return;
-        }
-        state.agent.clear_history();
-        state.session = Session::new(&state.config.model, state.session.cwd.clone());
+    if let Err(e) = state.rebuild_agent(true) {
+        emit(events_tx, format!("rebuild failed: {e}"));
+        return;
     }
+    state.session.model = state.config.model.clone();
 
     // Persist the model choice to project settings so a restart lands
     // on the same provider/model.
@@ -3344,15 +3456,10 @@ async fn switch_model(
     let _ = project.save();
 
     let provider = state.config.detect_provider().unwrap_or("unknown");
-    let session_note = if same_family {
-        "conversation preserved".to_string()
-    } else {
-        format!("new session {}", state.session.id)
-    };
     emit(
         events_tx,
         format!(
-            "model → {} (provider: {provider}; saved to .thclaws/settings.json; {session_note})",
+            "model → {} (provider: {provider}; saved to .thclaws/settings.json; conversation preserved)",
             state.config.model
         ),
     );
@@ -3366,6 +3473,9 @@ async fn switch_model(
     let (ctx, src) =
         crate::model_catalogue::effective_context_window_with(&cat, &state.config.model);
     if !src.is_known() {
+        // Re-derive the provider kind from the now-active model — the
+        // intra/cross-family classification we used pre-#142 is gone.
+        let new_kind = crate::providers::ProviderKind::detect(&state.config.model);
         let is_ollama = matches!(
             new_kind,
             Some(crate::providers::ProviderKind::Ollama)
@@ -3430,11 +3540,9 @@ async fn switch_model(
             );
         }
     }
-    // Only reset the view's history when we actually forked. On a same-
-    // family swap the bubbles / terminal replay stays as-is.
-    if !same_family {
-        let _ = events_tx.send(ViewEvent::HistoryReplaced(Vec::new()));
-    }
+    // Never reset the view's history on a model swap — the bubbles /
+    // terminal replay stay as-is and the next turn continues the
+    // conversation under the new provider.
     let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
         &state.session_store,
         &state.session.id,
@@ -3509,6 +3617,452 @@ fn doctor_report(state: &WorkerState) -> String {
 
 fn emit(events_tx: &broadcast::Sender<ViewEvent>, text: String) {
     let _ = events_tx.send(ViewEvent::SlashOutput(text));
+}
+
+/// dev-plan/32 Tier 3 `/workflow run` for the GUI / chat surface.
+/// Author phase calls the model; review phase emits
+/// `ViewEvent::WorkflowReviewRequest` and awaits the
+/// `WorkflowApprover`'s oneshot for an Approve / Cancel / Rework
+/// decision. Rework loops back into the author phase carrying the
+/// user's revision note + a bumped revision counter so the bubble
+/// can show "Revision 2" / "Revision 3" labels.
+async fn dispatch_workflow_run(
+    prompt: String,
+    state: &mut WorkerState,
+    events_tx: &broadcast::Sender<ViewEvent>,
+) {
+    let goal = prompt.trim();
+    if goal.is_empty() {
+        emit(events_tx, "/workflow run: missing goal".to_string());
+        let _ = events_tx.send(ViewEvent::TurnDone);
+        return;
+    }
+    let provider = match crate::repl::build_provider(&state.config) {
+        Ok(p) => p,
+        Err(e) => {
+            emit(
+                events_tx,
+                format!("/workflow run: can't build provider: {e}"),
+            );
+            let _ = events_tx.send(ViewEvent::TurnDone);
+            return;
+        }
+    };
+
+    let workflow_id = crate::workflow::generate_workflow_id();
+    let mut revision_note: Option<String> = None;
+    let mut revision: u32 = 0;
+
+    loop {
+        emit(
+            events_tx,
+            format!(
+                "/workflow run: authoring script (model={}, revision {})…",
+                state.config.model,
+                revision + 1
+            ),
+        );
+        let script = match crate::workflow::author(
+            provider.as_ref(),
+            &state.config.model,
+            goal,
+            revision_note.as_deref(),
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                emit(events_tx, format!("/workflow run: author failed: {e}"));
+                let _ = events_tx.send(ViewEvent::TurnDone);
+                return;
+            }
+        };
+
+        let _ = events_tx.send(ViewEvent::WorkflowReviewRequest {
+            id: workflow_id.clone(),
+            prompt: goal.to_string(),
+            script: script.clone(),
+            model: state.config.model.clone(),
+            revision,
+        });
+
+        let decision = state.workflow_approver.request(workflow_id.clone()).await;
+        match decision {
+            crate::workflow::WorkflowDecision::Approve => {
+                run_workflow_inline(state, events_tx, goal, script, None).await;
+                // TurnDone clears the chat-tab `streaming` flag so the
+                // Stop button stops showing and Send re-enables.
+                let _ = events_tx.send(ViewEvent::TurnDone);
+                return;
+            }
+            crate::workflow::WorkflowDecision::Cancel => {
+                emit(events_tx, "/workflow run: cancelled".to_string());
+                let _ = events_tx.send(ViewEvent::TurnDone);
+                return;
+            }
+            crate::workflow::WorkflowDecision::Rework(note) => {
+                revision_note = Some(note);
+                revision += 1;
+                // Loop and re-author with the revision note.
+            }
+        }
+    }
+}
+
+async fn dispatch_workflow_resume(
+    prefix: String,
+    state: &mut WorkerState,
+    events_tx: &broadcast::Sender<ViewEvent>,
+) {
+    let cwd = match std::env::current_dir() {
+        Ok(c) => c,
+        Err(e) => {
+            emit(events_tx, format!("/workflow resume: can't read cwd: {e}"));
+            return;
+        }
+    };
+    let id = match crate::workflow::resolve_id_prefix(&cwd, &prefix) {
+        Ok(id) => id,
+        Err(e) => {
+            emit(events_tx, format!("/workflow resume: {e}"));
+            return;
+        }
+    };
+    let script = match crate::workflow::read_workflow_script(&cwd, &id) {
+        Ok(s) => s,
+        Err(e) => {
+            emit(
+                events_tx,
+                format!("/workflow resume: can't read script.js for {id}: {e}"),
+            );
+            return;
+        }
+    };
+    let cache = match crate::workflow::read_completed_workers(&cwd, &id) {
+        Ok(v) => v,
+        Err(e) => {
+            emit(events_tx, format!("/workflow resume: {e}"));
+            return;
+        }
+    };
+    emit(
+        events_tx,
+        format!(
+            "/workflow resume: id={id} — {} cached worker(s)",
+            cache.len()
+        ),
+    );
+    run_workflow_inline(state, events_tx, "(resume)", script, Some((id, cache))).await;
+    // Mirror dispatch_workflow_run: clear chat-tab streaming flag so
+    // the Stop button hides after a resumed workflow ends (or is
+    // cancelled mid-run by the user).
+    let _ = events_tx.send(ViewEvent::TurnDone);
+}
+
+/// Mid-session equivalent of `thclaws --workflow <path>`: read a
+/// pre-authored script from disk and execute it under the active
+/// session — skipping the `/workflow run` author + review phase
+/// entirely. Output streams through the chat tab via the same
+/// `run_workflow_inline` engine that powers `/workflow run` /
+/// `/workflow resume`.
+async fn dispatch_workflow_exec(
+    path: String,
+    state: &mut WorkerState,
+    events_tx: &broadcast::Sender<ViewEvent>,
+) {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        emit(events_tx, "/workflow exec: missing path".to_string());
+        return;
+    }
+    let script_path = std::path::PathBuf::from(trimmed);
+    let script = match std::fs::read_to_string(&script_path) {
+        Ok(s) => s,
+        Err(e) => {
+            emit(
+                events_tx,
+                format!(
+                    "/workflow exec: can't read '{}': {e}",
+                    script_path.display()
+                ),
+            );
+            return;
+        }
+    };
+    emit(
+        events_tx,
+        format!("/workflow exec: running {}…", script_path.display()),
+    );
+    let label = format!("(exec {})", script_path.display());
+    run_workflow_inline(state, events_tx, &label, script, None).await;
+    // Same chat-tab streaming-flag cleanup as the other two entry points.
+    let _ = events_tx.send(ViewEvent::TurnDone);
+}
+
+/// Shared spawn_blocking + thread-locals wiring used by
+/// `dispatch_workflow_run` (fresh) and `dispatch_workflow_resume`
+/// (with cache). Streams the final result + cost summary back through
+/// `emit`. Stage F/G/H/I/K behaviours all participate (logger, usage
+/// sink, replay cache); only the per-worker progress lines (Stage E)
+/// don't reach the chat surface since they print to stdout.
+async fn run_workflow_inline(
+    state: &mut WorkerState,
+    events_tx: &broadcast::Sender<ViewEvent>,
+    goal: &str,
+    script: String,
+    resume: Option<(String, Vec<(String, String)>)>,
+) {
+    let cwd_for_persist = std::env::current_dir().ok();
+    let (workflow_id, cache, is_resume) = match resume {
+        Some((id, c)) => (id, c, true),
+        None => (crate::workflow::generate_workflow_id(), Vec::new(), false),
+    };
+
+    let logger_handle: Option<crate::workflow::LoggerHandle> = match cwd_for_persist
+        .as_ref()
+        .and_then(|cwd| crate::workflow::WorkflowLogger::new(workflow_id.clone(), cwd).ok())
+    {
+        Some(mut l) => {
+            if is_resume {
+                l.set_next_worker_id(cache.len() as u32);
+            } else {
+                let _ = l.start(goal, &script);
+                if let Some(cwd) = cwd_for_persist.as_ref() {
+                    let _ = crate::workflow::write_workflow_script(cwd, &workflow_id, &script);
+                }
+            }
+            Some(std::sync::Arc::new(std::sync::Mutex::new(l)))
+        }
+        None => {
+            emit(
+                events_tx,
+                "/workflow run: state.jsonl unavailable — proceeding without checkpoint"
+                    .to_string(),
+            );
+            None
+        }
+    };
+    if !is_resume {
+        emit(events_tx, format!("/workflow run: id={workflow_id}"));
+    }
+
+    let task_tool = state.tool_registry.get(crate::subagent::TOOL_NAME);
+    let logger_for_thread = logger_handle.clone();
+    let cache_for_thread = if cache.is_empty() { None } else { Some(cache) };
+    // Tier 3 polish: pass the chat broadcast sender into the
+    // spawn_blocking thread so each thclaws.subagent host call can emit
+    // ToolCallStart/Result events, rendering worker progression in the
+    // chat tab as one-line `▸ … ✓` bubbles.
+    let events_tx_for_thread = events_tx.clone();
+    // Stop-button: clone the worker cancel token so the workflow runtime
+    // can observe `shared.cancel.cancel()` (fired by `shell_cancel` IPC)
+    // mid-worker via `tokio::select!`. Reset after the run so the next
+    // turn isn't pre-cancelled.
+    let cancel_for_thread = state.cancel.clone();
+    let include_base_for_thread = cwd_for_persist.clone();
+
+    type WfBlockingOut = (
+        std::result::Result<String, String>,
+        Vec<crate::providers::Usage>,
+        usize,
+    );
+    let started = std::time::Instant::now();
+    let outcome: std::result::Result<WfBlockingOut, tokio::task::JoinError> =
+        tokio::task::spawn_blocking(move || {
+            crate::workflow::set_task_tool(task_tool);
+            crate::workflow::set_logger(logger_for_thread);
+            crate::workflow::set_usage_sink(true);
+            crate::workflow::set_replay_cache(cache_for_thread);
+            crate::workflow::set_events_tx(Some(events_tx_for_thread));
+            crate::workflow::set_cancel(Some(cancel_for_thread));
+            crate::workflow::set_include_base(include_base_for_thread);
+            let res = (|| -> std::result::Result<String, String> {
+                let mut sandbox =
+                    crate::workflow::WorkflowSandbox::new().map_err(|e| e.to_string())?;
+                sandbox.run(&script).map_err(|e| e.to_string())
+            })();
+            let usages = crate::workflow::take_all_usages();
+            let remaining = crate::workflow::replay_remaining();
+            crate::workflow::set_task_tool(None);
+            crate::workflow::set_logger(None);
+            crate::workflow::set_usage_sink(false);
+            crate::workflow::set_replay_cache(None);
+            crate::workflow::set_events_tx(None);
+            crate::workflow::set_cancel(None);
+            crate::workflow::set_include_base(None);
+            (res, usages, remaining)
+        })
+        .await;
+
+    let (result, usages, remaining) = match outcome {
+        Ok(t) => t,
+        Err(e) => {
+            emit(
+                events_tx,
+                format!("/workflow run: worker thread panicked: {e}"),
+            );
+            return;
+        }
+    };
+
+    // Stop-button: detect a cancel triggered mid-run. Either the JS
+    // script unwound cleanly with the sentinel error, or it caught the
+    // throw and ran to completion — in the latter case the token is
+    // still set, so we treat it as cancelled regardless. Reset the
+    // shared token afterwards so the next user turn starts clean.
+    let was_cancelled = state.cancel.is_cancelled()
+        || matches!(&result, Err(e) if e.contains(crate::workflow::WORKFLOW_CANCELLED_MSG));
+    if was_cancelled {
+        state.cancel.reset();
+    }
+
+    if let Some(handle) = &logger_handle {
+        if let Ok(mut l) = handle.lock() {
+            let _ = match (&result, was_cancelled) {
+                (_, true) => l.error(crate::workflow::WORKFLOW_CANCELLED_MSG),
+                (Ok(text), _) => l.done(text),
+                (Err(e), _) => l.error(e),
+            };
+        }
+    }
+
+    let elapsed = crate::tool_display::format_duration(started.elapsed());
+    let total_in: u64 = usages.iter().map(|u| u.input_tokens as u64).sum();
+    let total_out: u64 = usages.iter().map(|u| u.output_tokens as u64).sum();
+    let diverged = if remaining > 0 {
+        format!(" — {remaining} cache unused (diverged)")
+    } else {
+        String::new()
+    };
+    let status_word = if was_cancelled { "stopped" } else { "done" };
+    emit(
+        events_tx,
+        format!(
+            "workflow {status_word} — {} workers, {elapsed}, {total_in}in / {total_out}out{diverged}",
+            usages.len()
+        ),
+    );
+
+    match (result, was_cancelled) {
+        (_, true) => emit(events_tx, "/workflow run: stopped by user".to_string()),
+        (Ok(text), _) => emit(events_tx, text),
+        (Err(e), _) => emit(events_tx, format!("/workflow run: script failed: {e}")),
+    }
+}
+
+fn dispatch_workflow_list(events_tx: &broadcast::Sender<ViewEvent>) {
+    let cwd = match std::env::current_dir() {
+        Ok(c) => c,
+        Err(e) => {
+            emit(events_tx, format!("/workflow list: can't read cwd: {e}"));
+            return;
+        }
+    };
+    match crate::workflow::list_workflows(&cwd) {
+        Ok(workflows) if workflows.is_empty() => {
+            emit(
+                events_tx,
+                "no workflows under .thclaws/workflows/".to_string(),
+            );
+        }
+        Ok(workflows) => {
+            let mut lines = Vec::new();
+            for wf in &workflows {
+                let preview = if wf.prompt.chars().count() > 60 {
+                    let head: String = wf.prompt.chars().take(60).collect();
+                    format!("{head}…")
+                } else {
+                    wf.prompt.clone()
+                };
+                let id_short: String = wf.id.chars().take(20).collect();
+                let err_suffix = if wf.workers_error > 0 {
+                    format!(" ({} err)", wf.workers_error)
+                } else {
+                    String::new()
+                };
+                lines.push(format!(
+                    "  {id_short}  {icon} {done}/{started}w{err_suffix}  {preview}",
+                    icon = wf.status.icon(),
+                    done = wf.workers_done,
+                    started = wf.workers_started,
+                ));
+            }
+            emit(events_tx, lines.join("\n"));
+        }
+        Err(e) => {
+            emit(events_tx, format!("/workflow list: {e}"));
+        }
+    }
+}
+
+fn dispatch_workflow_inspect(prefix: String, events_tx: &broadcast::Sender<ViewEvent>) {
+    let cwd = match std::env::current_dir() {
+        Ok(c) => c,
+        Err(e) => {
+            emit(events_tx, format!("/workflow inspect: can't read cwd: {e}"));
+            return;
+        }
+    };
+    let id = match crate::workflow::resolve_id_prefix(&cwd, &prefix) {
+        Ok(id) => id,
+        Err(e) => {
+            emit(events_tx, format!("/workflow inspect: {e}"));
+            return;
+        }
+    };
+    let events = match crate::workflow::read_events(&cwd, &id) {
+        Ok(e) => e,
+        Err(e) => {
+            emit(events_tx, format!("/workflow inspect: {e}"));
+            return;
+        }
+    };
+    let take_preview = |s: &str, cap: usize| -> String {
+        if s.chars().count() > cap {
+            let head: String = s.chars().take(cap).collect();
+            format!("{head}…")
+        } else {
+            s.to_string()
+        }
+    };
+    let mut lines = vec![format!("workflow {id}")];
+    for ev in &events {
+        let kind = ev.get("kind").and_then(|k| k.as_str()).unwrap_or("?");
+        let ts = ev.get("ts").and_then(|t| t.as_str()).unwrap_or("?");
+        match kind {
+            "start" => {
+                let prompt = ev.get("prompt").and_then(|p| p.as_str()).unwrap_or("");
+                lines.push(format!("  {ts}  start    {prompt}"));
+            }
+            "worker_start" => {
+                let worker = ev.get("worker").and_then(|w| w.as_str()).unwrap_or("?");
+                let prompt = ev.get("prompt").and_then(|p| p.as_str()).unwrap_or("");
+                lines.push(format!("  {ts}  {worker} →   {}", take_preview(prompt, 80)));
+            }
+            "worker_done" => {
+                let worker = ev.get("worker").and_then(|w| w.as_str()).unwrap_or("?");
+                let output = ev.get("output").and_then(|o| o.as_str()).unwrap_or("");
+                lines.push(format!("  {ts}  {worker} ✓   {}", take_preview(output, 80)));
+            }
+            "worker_error" => {
+                let worker = ev.get("worker").and_then(|w| w.as_str()).unwrap_or("?");
+                let err = ev.get("error").and_then(|e| e.as_str()).unwrap_or("");
+                lines.push(format!("  {ts}  {worker} ✗   {}", take_preview(err, 80)));
+            }
+            "done" => {
+                let result = ev.get("result").and_then(|r| r.as_str()).unwrap_or("");
+                lines.push(format!("  {ts}  done     {}", take_preview(result, 80)));
+            }
+            "error" => {
+                let err = ev.get("error").and_then(|e| e.as_str()).unwrap_or("");
+                lines.push(format!("  {ts}  error    {err}"));
+            }
+            other => {
+                lines.push(format!("  {ts}  {other}"));
+            }
+        }
+    }
+    emit(events_tx, lines.join("\n"));
 }
 
 /// When LINE is currently bridged and the user just chose `auto` or
@@ -3888,6 +4442,15 @@ async fn persist_and_register_mcp(
                     state.tool_registry.register(std::sync::Arc::new(tool));
                 }
                 state.mcp_clients.push(client);
+                // Refresh the system prompt FIRST so the new server's
+                // InitializeResult.instructions land in the
+                // `# MCP server instructions` section and the factory
+                // snapshot picks up the new tools — matches the
+                // McpReady path in shared_session.rs. Pre-fix this
+                // path only called rebuild_agent, so the new tools
+                // reached the parent but the system prompt's MCP
+                // section stayed stale until the next /reload.
+                state.rebuild_system_prompt();
                 if let Err(e) = state.rebuild_agent(true) {
                     emit(events_tx, format!("rebuild failed: {e}"));
                     return;

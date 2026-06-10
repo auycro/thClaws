@@ -143,6 +143,23 @@ pub struct ModelEntry {
     pub tier_billed: Option<bool>,
 }
 
+impl ModelEntry {
+    /// True when this row has a published price (input OR output rate),
+    /// is free, or is subscription-tier-billed. Cheap-to-call helper
+    /// for surfaces that want to badge unpriced rows or sort priced
+    /// rows first — does NOT gate listing. Listing every model the
+    /// engine knows is the policy: missing pricing should be filled
+    /// (via `scripts/refresh-model-catalogue.py` or manual edits to
+    /// `resources/model_catalogue.json`), not used to hide the row.
+    #[allow(dead_code)]
+    pub fn has_published_pricing(&self) -> bool {
+        if self.free == Some(true) || self.tier_billed == Some(true) {
+            return true;
+        }
+        self.input_per_mtok.is_some() || self.output_per_mtok.is_some()
+    }
+}
+
 /// Per-token-type usage counts for one agent run. Fed into
 /// [`Catalogue::compute_cost_usd`]. All fields default to 0 so callers
 /// can populate only what their provider surfaces (Anthropic, OpenAI's

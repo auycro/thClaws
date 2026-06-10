@@ -1,0 +1,9 @@
+{
+  "id": "kanban",
+  "name": "Kanban Board",
+  "version": "0.1.0",
+  "description": "Three-column task board with drag-and-drop and shell-scoped persistence. 'Ask agent' button feeds the board state back as context.",
+  "entry": "index.html",
+  "min_bridge_version": "1",
+  "permissions": ["agent.run", "session.read"]
+}

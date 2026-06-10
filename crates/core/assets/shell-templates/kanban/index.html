@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Kanban — thClaws Shell</title>
+  <style>
+    :root { --bg: #0b1220; --surface: #0f172a; --border: #1f2937;
+      --fg: #f8fafc; --muted: #94a3b8; --teal: #0d9488; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--fg);
+      font: 14px/1.5 system-ui, sans-serif; }
+    header { padding: 16px 24px; border-bottom: 1px solid var(--border);
+      display: flex; gap: 12px; align-items: center; }
+    header input { flex: 1; background: var(--surface); color: var(--fg);
+      border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; font: inherit; }
+    header button { background: var(--teal); color: white; border: 0;
+      border-radius: 8px; padding: 8px 18px; font-weight: 600; cursor: pointer; }
+    .board { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
+      padding: 16px 24px; align-items: start; }
+    .col { background: rgba(15, 23, 42, 0.5); border: 1px solid var(--border);
+      border-radius: 10px; padding: 12px; min-height: 200px; }
+    .col h3 { margin: 0 0 10px; font-size: 13px; color: var(--muted); text-transform: uppercase; }
+    .card { background: var(--surface); border: 1px solid var(--border);
+      border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; cursor: grab; }
+    .card.dragging { opacity: 0.4; }
+    .col.over { border-color: var(--teal); }
+  </style>
+</head>
+<body>
+  <header>
+    <input id="newTask" placeholder="Add a task… (Enter)" />
+    <button id="ask">Ask agent for next step</button>
+  </header>
+  <div class="board">
+    <div class="col" data-col="todo"><h3>To do</h3></div>
+    <div class="col" data-col="doing"><h3>In progress</h3></div>
+    <div class="col" data-col="done"><h3>Done</h3></div>
+  </div>
+  <script>
+    const cols = { todo: [], doing: [], done: [] };
+    async function load() {
+      try { Object.assign(cols, (await window.thclaws.storage.get("kanban")) || cols); }
+      catch {}
+      render();
+    }
+    async function save() { try { await window.thclaws.storage.set("kanban", cols); } catch {} }
+    function render() {
+      Object.entries(cols).forEach(([k, list]) => {
+        const colEl = document.querySelector(`[data-col="${k}"]`);
+        colEl.querySelectorAll(".card").forEach((n) => n.remove());
+        list.forEach((t, i) => {
+          const c = document.createElement("div");
+          c.className = "card"; c.textContent = t; c.draggable = true;
+          c.dataset.col = k; c.dataset.idx = i;
+          c.addEventListener("dragstart", () => c.classList.add("dragging"));
+          c.addEventListener("dragend", () => c.classList.remove("dragging"));
+          colEl.appendChild(c);
+        });
+      });
+    }
+    document.querySelectorAll(".col").forEach((col) => {
+      col.addEventListener("dragover", (e) => { e.preventDefault(); col.classList.add("over"); });
+      col.addEventListener("dragleave", () => col.classList.remove("over"));
+      col.addEventListener("drop", (e) => {
+        e.preventDefault(); col.classList.remove("over");
+        const dragging = document.querySelector(".dragging");
+        if (!dragging) return;
+        const from = dragging.dataset.col, to = col.dataset.col, idx = +dragging.dataset.idx;
+        const [task] = cols[from].splice(idx, 1);
+        cols[to].push(task);
+        save().then(render);
+      });
+    });
+    const newTask = document.getElementById("newTask");
+    newTask.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && newTask.value.trim()) {
+        cols.todo.push(newTask.value.trim()); newTask.value = "";
+        save().then(render);
+      }
+    });
+    document.getElementById("ask").onclick = async () => {
+      const summary = `Board: To do=${cols.todo.length}, doing=${cols.doing.length}, done=${cols.done.length}.
+Pending: ${cols.todo.join("; ") || "—"}`;
+      await window.thclaws.run(`${summary}\n\nWhich task should I pick next and why?`);
+    };
+    let answer = null;
+    window.thclaws.on("text", ({ delta }) => {
+      if (!answer) {
+        answer = document.createElement("div");
+        answer.style.cssText = "padding: 12px 24px; color: var(--muted); border-top: 1px solid var(--border);";
+        document.body.appendChild(answer);
+      }
+      answer.textContent += delta;
+    });
+    window.thclaws.on("done", () => { answer = null; });
+    load();
+  </script>
+</body>
+</html>

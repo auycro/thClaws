@@ -323,6 +323,7 @@ export function TerminalView({ active, modalOpen }: Props) {
             term.write("\x1b[2K\r");
             writePrompt();
             lineBuffer = "";
+            cursorPos = 0;
             recomputeSlash();
             return false;
           }
@@ -805,6 +806,7 @@ export function TerminalView({ active, modalOpen }: Props) {
         term.clear();
         writePrompt();
         lineBuffer = "";
+        cursorPos = 0;
         pendingAskId = null;
       } else if (
         msg.type === "terminal_history_replaced" &&

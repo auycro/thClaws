@@ -158,6 +158,71 @@ fn char_safe_head(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Strip tool_use/tool_result blocks that don't have a partner anywhere
+/// in `messages`. Both halves are required by every provider's wire
+/// format — an orphan tool_result (no preceding assistant tool_use
+/// with the same id) makes Anthropic, OpenAI-compat, and DashScope
+/// reject the request (e.g. DashScope code 2013 "tool call result
+/// does not follow tool call"); an orphan tool_use (no matching
+/// tool_result in any later message) makes Anthropic 400 with
+/// "tool_use ids were found without matching tool_result blocks".
+///
+/// Designed to run right before the request is sent to the provider —
+/// idempotent, in-place, and a no-op when the history is already
+/// well-formed (the common case).
+///
+/// Why this lives here: orphans surface in three failure modes —
+///   1. `/model` swap mid-session (issue #144) — history is preserved
+///      across providers; nothing was previously validating that
+///      partial-state was clean for the destination wire format.
+///   2. Mid-turn cancel / network interruption — agent.run_turn may
+///      have appended a ToolUse before the matching ToolResult got
+///      written, leaving the assistant's last message dangling.
+///   3. Session resume from a partially-flushed JSONL.
+///
+/// Drop policy:
+///   - Orphan ToolResult: drop the block. The corresponding message is
+///     dropped entirely when it had no other blocks; otherwise the
+///     other blocks (Text, Image, etc.) stay.
+///   - Orphan ToolUse: drop the block from the assistant message. The
+///     model can re-issue the call if the same intent still applies.
+///     Dropping (rather than synthesizing a fake ToolResult) keeps the
+///     wire body honest — the model never sees a result it didn't
+///     receive.
+pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
+    use std::collections::HashSet;
+
+    // Pass 1: collect every tool_use_id announced by an assistant
+    // message and every tool_use_id answered by a tool_result.
+    let mut announced: HashSet<String> = HashSet::new();
+    let mut answered: HashSet<String> = HashSet::new();
+    for msg in messages.iter() {
+        for block in &msg.content {
+            match block {
+                ContentBlock::ToolUse { id, .. } => {
+                    announced.insert(id.clone());
+                }
+                ContentBlock::ToolResult { tool_use_id, .. } => {
+                    answered.insert(tool_use_id.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Pass 2: strip orphan blocks in place. Then drop any message
+    // whose content vec emptied out (a user message that was only
+    // an orphan tool_result, for instance).
+    for msg in messages.iter_mut() {
+        msg.content.retain(|block| match block {
+            ContentBlock::ToolResult { tool_use_id, .. } => announced.contains(tool_use_id),
+            ContentBlock::ToolUse { id, .. } => answered.contains(id),
+            _ => true,
+        });
+    }
+    messages.retain(|m| !m.content.is_empty());
+}
+
 /// Summarize older messages into a compact text block, then keep only
 /// the summary + recent messages. Returns the compacted message list.
 ///
@@ -610,6 +675,90 @@ mod tests {
         let rendered = render_for_summary(&msgs);
         assert!(rendered.contains("User: hello"));
         assert!(rendered.contains("Assistant: hi there"));
+    }
+
+    // ── Tool-pair sanitization (issue #144) ──────────────────────────
+
+    fn user_text(s: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::text(s)],
+        }
+    }
+
+    fn assistant_text(s: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::text(s)],
+        }
+    }
+
+    #[test]
+    fn sanitize_drops_orphan_tool_result_keeps_rest() {
+        // Simulates issue #144: history has a stray tool_result whose
+        // tool_use was never seen (e.g. mid-turn cancel before the
+        // assistant message persisted). Provider would reject; sanitize
+        // strips it before the wire.
+        let mut msgs = vec![
+            user_text("hi"),
+            assistant_text("hello"),
+            user_with_tool_result("orphan_id", "stale tool output"),
+            user_text("ok now do X"),
+        ];
+        super::sanitize_tool_pairs(&mut msgs);
+        assert_eq!(msgs.len(), 3, "orphan tool_result message dropped");
+        assert!(matches!(msgs[2].role, Role::User));
+    }
+
+    #[test]
+    fn sanitize_drops_orphan_tool_use_keeps_text() {
+        // Assistant announced a tool_use that never got a tool_result —
+        // Anthropic 400s on this. Drop the tool_use, keep any text the
+        // assistant said alongside it.
+        let mut msgs = vec![
+            user_text("run X please"),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::text("sure, running it now"),
+                    ContentBlock::ToolUse {
+                        id: "dangling".into(),
+                        name: "bash".into(),
+                        input: serde_json::json!({}),
+                        thought_signature: None,
+                    },
+                ],
+            },
+            user_text("never mind, do Y instead"),
+        ];
+        super::sanitize_tool_pairs(&mut msgs);
+        assert_eq!(msgs.len(), 3);
+        // The assistant message keeps its text block but loses the
+        // orphan tool_use.
+        assert_eq!(msgs[1].content.len(), 1);
+        assert!(matches!(msgs[1].content[0], ContentBlock::Text { .. }));
+    }
+
+    #[test]
+    fn sanitize_preserves_matched_pair() {
+        // Common case — assistant tool_use + matching tool_result.
+        // Must survive sanitization intact.
+        let mut msgs = vec![
+            user_text("run X"),
+            assistant_with_tool_use("call_1", "bash"),
+            user_with_tool_result("call_1", "ok"),
+        ];
+        let before = msgs.clone();
+        super::sanitize_tool_pairs(&mut msgs);
+        assert_eq!(msgs, before, "well-formed history is untouched");
+    }
+
+    #[test]
+    fn sanitize_is_idempotent() {
+        let mut msgs = vec![user_with_tool_result("x", "y")];
+        super::sanitize_tool_pairs(&mut msgs);
+        super::sanitize_tool_pairs(&mut msgs);
+        assert!(msgs.is_empty());
     }
 
     // ── M6.2 step-boundary compaction tests ────────────────────────────

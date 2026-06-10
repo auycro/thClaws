@@ -1,0 +1,9 @@
+{
+  "id": "document",
+  "name": "Document Editor",
+  "version": "0.1.0",
+  "description": "Contenteditable document + Extend/Rewrite/Critique modes. Auto-saves to shell.storage. Markdown export.",
+  "entry": "index.html",
+  "min_bridge_version": "1",
+  "permissions": ["agent.run", "session.read"]
+}

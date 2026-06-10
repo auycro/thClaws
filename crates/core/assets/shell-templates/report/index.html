@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Report — thClaws Shell</title>
+  <style>
+    :root { --bg: #0b1220; --surface: #0f172a; --border: #1f2937;
+      --fg: #f8fafc; --muted: #94a3b8; --teal: #0d9488; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--fg);
+      font: 15px/1.7 system-ui, sans-serif; }
+    .layout { display: grid; grid-template-columns: 240px 1fr; min-height: 100vh; }
+    aside { background: var(--surface); border-right: 1px solid var(--border);
+      padding: 16px; overflow-y: auto; }
+    aside h2 { font-size: 12px; color: var(--muted); text-transform: uppercase; margin-top: 0; }
+    aside .item { padding: 8px 10px; border-radius: 6px; cursor: pointer; }
+    aside .item:hover { background: var(--bg); }
+    aside .item.active { background: rgba(13, 148, 136, 0.18); color: var(--teal); }
+    main { padding: 32px 48px; max-width: 880px; }
+    main h1 { margin-top: 0; }
+    main pre { background: var(--surface); padding: 12px; border-radius: 6px;
+      overflow-x: auto; font-size: 13px; }
+    main blockquote { border-left: 3px solid var(--teal); margin: 0; padding: 4px 16px; color: var(--muted); }
+    main code { background: var(--surface); padding: 1px 6px; border-radius: 4px; font-size: 90%; }
+    .toolbar { padding: 12px 24px; border-bottom: 1px solid var(--border);
+      display: flex; gap: 8px; align-items: center; }
+    .toolbar input { flex: 1; background: var(--surface); color: var(--fg);
+      border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; font: inherit; }
+    .toolbar button { background: var(--teal); color: white; border: 0;
+      border-radius: 6px; padding: 8px 14px; font-weight: 600; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <input id="topic" placeholder="Research topic (e.g. 'Q1 EV market in Thailand')" />
+    <button id="go">Generate</button>
+  </div>
+  <div class="layout">
+    <aside id="toc"><h2>Sections</h2></aside>
+    <main id="content"><h1>Report</h1><p style="color:var(--muted)">Run a topic above and the agent will fill this view. Sections appear in the sidebar as headings stream in.</p></main>
+  </div>
+  <script>
+    const topic = document.getElementById("topic");
+    const go = document.getElementById("go");
+    const toc = document.getElementById("toc");
+    const content = document.getElementById("content");
+    let buf = "";
+    function renderMarkdownLite(md) {
+      // Tiny inline renderer — sufficient for the report use case. Authors
+      // can swap in marked / commonmark later.
+      const lines = md.split("\n");
+      let html = ""; let inCode = false;
+      lines.forEach((l) => {
+        if (l.startsWith("```")) { html += inCode ? "</pre>" : "<pre>"; inCode = !inCode; return; }
+        if (inCode) { html += escape(l) + "\n"; return; }
+        if (l.startsWith("# ")) html += `<h1>${escape(l.slice(2))}</h1>`;
+        else if (l.startsWith("## ")) html += `<h2 id="h-${slug(l.slice(3))}">${escape(l.slice(3))}</h2>`;
+        else if (l.startsWith("### ")) html += `<h3>${escape(l.slice(4))}</h3>`;
+        else if (l.startsWith("> ")) html += `<blockquote>${escape(l.slice(2))}</blockquote>`;
+        else if (l.startsWith("- ")) html += `<ul><li>${escape(l.slice(2))}</li></ul>`;
+        else html += `<p>${escape(l)}</p>`;
+      });
+      return html;
+    }
+    function escape(s) { return s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+    function slug(s) { return s.toLowerCase().replace(/[^a-z0-9]+/g, "-"); }
+    function rebuildToc() {
+      const headings = content.querySelectorAll("h2");
+      toc.innerHTML = '<h2>Sections</h2>';
+      headings.forEach((h) => {
+        const a = document.createElement("a");
+        a.href = `#h-${slug(h.textContent)}`; a.className = "item";
+        a.textContent = h.textContent;
+        toc.appendChild(a);
+      });
+    }
+    go.onclick = async () => {
+      if (!topic.value.trim()) return;
+      buf = ""; content.innerHTML = "<h1>" + escape(topic.value) + "</h1><p style='color:var(--muted)'>Researching…</p>";
+      await window.thclaws.run(`Write a thorough multi-section markdown report on: ${topic.value}.
+Use ## headings for each section. Cite sources at the end.`);
+    };
+    window.thclaws.on("text", ({ delta }) => {
+      buf += delta;
+      content.innerHTML = renderMarkdownLite(buf);
+      rebuildToc();
+    });
+  </script>
+</body>
+</html>

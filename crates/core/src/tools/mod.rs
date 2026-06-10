@@ -18,6 +18,7 @@ pub mod docx_create;
 pub mod docx_edit;
 pub mod docx_read;
 pub mod edit;
+pub mod gemini_image;
 pub mod glob;
 pub mod grep;
 pub mod hal;
@@ -31,6 +32,7 @@ pub mod plan_state;
 pub mod pptx_create;
 pub mod pptx_edit;
 pub mod pptx_read;
+pub mod quiz_render;
 pub mod read;
 pub mod search;
 pub mod session_rename;
@@ -39,6 +41,7 @@ pub mod todo;
 pub mod todo_state;
 pub mod update_goal;
 pub mod web;
+pub mod workflow_run;
 pub mod write;
 pub mod xlsx_create;
 pub mod xlsx_edit;
@@ -50,6 +53,7 @@ pub use docx_create::DocxCreateTool;
 pub use docx_edit::DocxEditTool;
 pub use docx_read::DocxReadTool;
 pub use edit::EditTool;
+pub use gemini_image::{ImageToImageTool, TextToImageTool};
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use hal::{WebScrapeTool, YouTubeTranscriptTool};
@@ -64,12 +68,14 @@ pub use plan::{EnterPlanModeTool, ExitPlanModeTool, SubmitPlanTool, UpdatePlanSt
 pub use pptx_create::PptxCreateTool;
 pub use pptx_edit::PptxEditTool;
 pub use pptx_read::PptxReadTool;
+pub use quiz_render::QuizRenderTool;
 pub use read::ReadTool;
 pub use search::WebSearchTool;
 pub use session_rename::SessionRenameTool;
 pub use todo::TodoWriteTool;
 pub use update_goal::{MarkGoalBlockedTool, MarkGoalCompleteTool, RecordGoalProgressTool};
 pub use web::WebFetchTool;
+pub use workflow_run::WorkflowRunTool;
 pub use write::WriteTool;
 pub use xlsx_create::XlsxCreateTool;
 pub use xlsx_edit::XlsxEditTool;
@@ -122,14 +128,53 @@ pub trait Tool: Send + Sync {
     }
 }
 
+/// True when the engine runs in hosted gateway mode — the runner routes
+/// LLM + keyed-service traffic through the cloud gateway with a
+/// `gw_v1_…` bearer instead of holding raw upstream keys.
+pub(crate) fn gateway_mode() -> bool {
+    std::env::var("THCLAWS_USES_GATEWAY").ok().as_deref() == Some("1")
+}
+
+/// Resolved cloud-gateway route (base URL + bearer). `Some` only in
+/// gateway mode with both envs present. Tools that proxy a keyed
+/// upstream (HAL, web search) use this to reach `{base}/<svc>/…` with
+/// the bearer; the gateway injects the real credential.
+pub(crate) struct GatewayRoute {
+    pub base: String,
+    pub token: String,
+}
+
+pub(crate) fn gateway_route() -> Option<GatewayRoute> {
+    if !gateway_mode() {
+        return None;
+    }
+    let base = std::env::var("THCLAWS_GATEWAY_BASE_URL")
+        .ok()?
+        .trim_end_matches('/')
+        .to_string();
+    let token = std::env::var("THCLAWS_GATEWAY_API_KEY").ok()?;
+    if base.is_empty() || token.is_empty() {
+        return None;
+    }
+    Some(GatewayRoute { base, token })
+}
+
+/// Env vars whose backing service the cloud gateway fronts. In gateway
+/// mode the runner holds no raw key for these (the gateway injects it),
+/// so a tool that `requires_env` one of them is still available.
+pub(crate) const GATEWAY_SERVED_ENVS: &[&str] = &["HAL_API_KEY"];
+
 /// Whether a tool's env-var requirements are currently satisfied.
 /// Reads `std::env` so live changes (`api_key_set` / `api_key_clear`
 /// followed by a `rebuild_agent`) take effect on the next turn
-/// without reconstructing the registry.
+/// without reconstructing the registry. In gateway mode a requirement
+/// on a gateway-served key counts as satisfied even with no local key.
 fn tool_is_available(t: &dyn Tool) -> bool {
-    t.requires_env()
-        .iter()
-        .all(|v| std::env::var(v).map(|val| !val.is_empty()).unwrap_or(false))
+    let gw = gateway_mode();
+    t.requires_env().iter().all(|v| {
+        std::env::var(v).map(|val| !val.is_empty()).unwrap_or(false)
+            || (gw && GATEWAY_SERVED_ENVS.contains(v))
+    })
 }
 
 /// A resolved MCP-Apps UI resource ready to be mounted in an iframe.
@@ -201,6 +246,7 @@ impl ToolRegistry {
         r.register(Arc::new(WebScrapeTool::new()));
         r.register(Arc::new(AskUserTool));
         r.register(Arc::new(TodoWriteTool));
+        r.register(Arc::new(QuizRenderTool::new()));
         r.register(Arc::new(EnterPlanModeTool));
         r.register(Arc::new(ExitPlanModeTool));
         r.register(Arc::new(SubmitPlanTool));
@@ -400,6 +446,7 @@ mod tests {
                 "PptxCreate",
                 "PptxEdit",
                 "PptxRead",
+                "QuizRender",
                 "Read",
                 "SubmitPlan",
                 "TodoWrite",

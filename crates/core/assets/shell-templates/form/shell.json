@@ -1,0 +1,9 @@
+{
+  "id": "form",
+  "name": "Structured Form",
+  "version": "0.1.0",
+  "description": "Form fields → composed prompt → streaming output. Edit the field list to match what your agent needs.",
+  "entry": "index.html",
+  "min_bridge_version": "1",
+  "permissions": ["agent.run", "session.read"]
+}

@@ -361,15 +361,30 @@ fn maybe_wrap_with_venv(cmd: &str, cwd: &std::path::Path) -> String {
     }
 }
 
-/// Does this command need a Python venv? Any python/pip command should use
-/// the project venv if one exists, plus specific tool commands.
+/// Does this command need a Python venv? Trigger ONLY on commands that
+/// actually install or run framework servers — pip/pipx/poetry/uv,
+/// long-running server runners (uvicorn/gunicorn/flask), and the
+/// pytest/celery toolchains.
+///
+/// Plain `python3 script.py` does NOT trigger here. The previous
+/// heuristic fired on every `python3 ` prefix, which:
+///   - Wrapped agent-shipped stdlib scripts (e.g. image-generator's
+///     batch.py) in `python3 -m venv && source && python3 script.py`,
+///   - Printed `[creating .venv and activating before pip]` +
+///     `⚠ destructive command detected` warnings the model then
+///     mis-attributed to the script itself,
+///   - Created a `.venv/` directory inside agent workspaces that had
+///     no business owning one.
+/// If a user actually needs venv-bound python, they call `pip` or
+/// activate the venv themselves; both still get auto-handled here.
 fn needs_venv(cmd: &str) -> bool {
     let lower = cmd.to_lowercase();
-    // Any python/pip invocation should use the venv.
-    lower.starts_with("python ")
-        || lower.starts_with("python3 ")
-        || lower.contains("pip install")
+    lower.contains("pip install")
         || lower.contains("pip3 install")
+        || lower.contains("pipx ")
+        || lower.contains("poetry install")
+        || lower.contains("poetry add")
+        || lower.contains("uv pip ")
         || lower.contains("uvicorn ")
         || lower.contains("gunicorn ")
         || lower.contains("hypercorn ")
@@ -519,24 +534,27 @@ fn has_destructive_signal(cmd: &str) -> bool {
 /// command (`;`, newline, `&&`, `||`, `|`, `&`). Coarse but enough to
 /// isolate each verb for prefix-stripping.
 fn split_shell_segments(cmd: &str) -> Vec<String> {
+    // `char_indices()` yields (byte_pos, char) tuples where every
+    // `byte_pos` is on a UTF-8 char boundary, so `cmd[pos..]` is
+    // always a valid slice. The previous byte-arithmetic version
+    // panicked on any multi-byte UTF-8 (em-dash etc.) that LLM-
+    // generated commands inadvertently include — see issue #141.
+    //
+    // Order matters: check the two-char operators `&&` / `||` BEFORE
+    // the single-char `&` / `|` branch, else the single-char arm
+    // steals the first byte of the pair and `cur` ends up with a
+    // stray `&` between two segments.
     let mut segs = Vec::new();
     let mut cur = String::new();
-    let bytes = cmd.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        if c == ';' || c == '\n' {
+    let mut chars = cmd.char_indices().peekable();
+    while let Some((pos, c)) = chars.next() {
+        if cmd[pos..].starts_with("&&") || cmd[pos..].starts_with("||") {
             segs.push(std::mem::take(&mut cur));
-            i += 1;
-        } else if cmd[i..].starts_with("&&") || cmd[i..].starts_with("||") {
+            chars.next(); // consume the second char of the pair
+        } else if c == ';' || c == '\n' || c == '|' || c == '&' {
             segs.push(std::mem::take(&mut cur));
-            i += 2;
-        } else if c == '|' || c == '&' {
-            segs.push(std::mem::take(&mut cur));
-            i += 1;
         } else {
             cur.push(c);
-            i += 1;
         }
     }
     segs.push(cur);
@@ -1132,6 +1150,55 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[test]
+    fn split_shell_segments_handles_multibyte_utf8() {
+        // Regression for issue #141: the old byte-arithmetic version
+        // panicked here because `i += 1` walks into the middle of the
+        // 3-byte em-dash (U+2014, E2 80 94).
+        let cmd = "echo hello — world; ls";
+        let segs = split_shell_segments(cmd);
+        assert_eq!(
+            segs,
+            vec!["echo hello — world".to_string(), " ls".to_string()]
+        );
+
+        // And a few more exotic Unicode points to be sure: a 4-byte
+        // emoji (😀, U+1F600, F0 9F 98 80) right next to an operator.
+        let cmd = "echo 😀 | grep .";
+        let segs = split_shell_segments(cmd);
+        assert_eq!(segs, vec!["echo 😀 ".to_string(), " grep .".to_string()]);
+
+        // Mixed: Thai script (3-byte each) split by `&&`.
+        let cmd = "echo สวัสดี && echo world";
+        let segs = split_shell_segments(cmd);
+        assert_eq!(
+            segs,
+            vec!["echo สวัสดี ".to_string(), " echo world".to_string()]
+        );
+    }
+
+    #[test]
+    fn split_shell_segments_distinguishes_double_and_single_operators() {
+        // && and || vs single & and | — make sure the two-char check
+        // wins so neither operator gets corrupted.
+        assert_eq!(
+            split_shell_segments("a && b"),
+            vec!["a ".to_string(), " b".to_string()]
+        );
+        assert_eq!(
+            split_shell_segments("a || b"),
+            vec!["a ".to_string(), " b".to_string()]
+        );
+        assert_eq!(
+            split_shell_segments("a & b"),
+            vec!["a ".to_string(), " b".to_string()]
+        );
+        assert_eq!(
+            split_shell_segments("a | b"),
+            vec!["a ".to_string(), " b".to_string()]
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn echoes_stdout() {
@@ -1500,15 +1567,24 @@ mod tests {
     }
 
     #[test]
-    fn needs_venv_detects_pip_and_python_tools() {
+    fn needs_venv_detects_pip_and_server_tools() {
+        // v0.35.4 tightened needs_venv: only pip/poetry/uv installs +
+        // long-running server runners + pytest. Plain `python script.py`
+        // does NOT trigger venv auto-wrap (was producing spurious
+        // `[creating .venv]` warnings around agent-shipped stdlib
+        // scripts; the agent then mis-attributed them to the script).
         assert!(needs_venv("pip install fastapi"));
         assert!(needs_venv("pip3 install uvicorn"));
         assert!(needs_venv("uvicorn main:app --port 8000"));
         assert!(needs_venv("gunicorn app:app"));
         assert!(needs_venv("pytest tests/"));
         assert!(needs_venv("flask run"));
-        assert!(needs_venv("python app.py"));
-        assert!(needs_venv("python3 main.py"));
+        assert!(needs_venv("poetry install"));
+        assert!(needs_venv("uv pip install requests"));
+        // Plain python invocations — explicitly NOT venv-wrapped.
+        assert!(!needs_venv("python app.py"));
+        assert!(!needs_venv("python3 main.py"));
+        assert!(!needs_venv("python3 .thclaws/scripts/batch.py"));
         assert!(!needs_venv("echo hello"));
         assert!(!needs_venv("cargo build"));
         assert!(!needs_venv("npm install express"));

@@ -5,6 +5,7 @@
 //! `--print`: non-interactive single-prompt mode (implies --cli).
 
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 use thclaws_core::config::AppConfig;
 use thclaws_core::dotenv::load_dotenv;
 use thclaws_core::repl::{run_print_mode, run_repl};
@@ -117,6 +118,72 @@ struct Cli {
     #[arg(long, default_value = "127.0.0.1")]
     bind: String,
 
+    /// dev-plan/33 Tier 2 Mode B: bind a GUI Shell as the served
+    /// frontend. When set, `--serve` mounts the shell at `/t/<token>/`
+    /// instead of the React app at `/`. Without this flag, `--serve`
+    /// keeps its existing behaviour (React frontend). Falls back to
+    /// `settings.json::guiShell.serveDefault` (or shorthand) when
+    /// omitted; if neither is set, serves React.
+    #[arg(long, value_name = "SHELL_ID")]
+    gui_shell: Option<String>,
+
+    /// Pin the per-shell auth token (16+ chars). Without this flag,
+    /// `--serve --gui-shell <id>` generates and persists a token in
+    /// ~/.config/thclaws/gui-shell-tokens.json so the URL is stable
+    /// across restarts. Use this for reproducible deployments
+    /// (k8s manifests, systemd units) where the URL must not change.
+    #[arg(long, value_name = "TOKEN", requires = "gui_shell")]
+    gui_shell_token: Option<String>,
+
+    /// Override the persisted token TTL (e.g. "30d", "12h", "never").
+    /// Default 30 days. Tokens past their TTL get regenerated on next
+    /// launch — the old URL stops working.
+    #[arg(long, value_name = "DURATION", requires = "gui_shell")]
+    gui_shell_token_ttl: Option<String>,
+
+    /// Serve the shell without the /t/<token>/ token prefix — routes
+    /// mount at /. Refuses non-loopback binds unless
+    /// --gui-shell-no-auth-allow-public is also passed. Loud stdout
+    /// warning. Same guardrail pattern as
+    /// --dangerously-skip-permissions.
+    #[arg(long, requires = "gui_shell")]
+    gui_shell_no_auth: bool,
+
+    /// Permit --gui-shell-no-auth on non-loopback addresses. Required
+    /// in addition to --gui-shell-no-auth to override the safety
+    /// check. Use behind your own auth proxy (Cloudflare Access,
+    /// OAuth2 proxy, mTLS, etc.).
+    #[arg(long, requires = "gui_shell_no_auth")]
+    gui_shell_no_auth_allow_public: bool,
+
+    /// dev-plan/35 Tier 1: enable multi-tenant `--serve` mode. The
+    /// pod accepts HMAC-signed X-Thclaws-User headers from a trusted
+    /// routing layer (typically dev-plan/34 thClaws.cloud) and routes
+    /// each request to a per-user SharedSessionHandle. Without this
+    /// flag, `--serve` is single-tenant (today's behaviour).
+    #[arg(long, requires = "serve")]
+    multi_tenant: bool,
+
+    /// HMAC-SHA256 secret for verifying X-Thclaws-User-Proof. Must
+    /// match the secret the cloud routing layer signs with. Falls
+    /// back to env `THCLAWS_CLOUD_HMAC_SECRET`. Required when
+    /// --multi-tenant is set (or panic at startup — fail loud, not
+    /// silently allow forged identities).
+    #[arg(long, value_name = "SECRET", requires = "multi_tenant")]
+    multi_tenant_secret: Option<String>,
+
+    /// Cap on concurrent resident user sessions per pod. LRU evicts
+    /// past this. Default 1000 — at ~2-5MB per session that's 2-5GB
+    /// pod RAM in the worst case, which matches typical HPA targets.
+    #[arg(long, default_value_t = 1000, requires = "multi_tenant")]
+    multi_tenant_max_users: usize,
+
+    /// Idle timeout per user — sessions checkpoint + evict after no
+    /// activity for this duration. Parsed via parse_ttl_secs ("30m",
+    /// "2h", "never"). Default 30 minutes.
+    #[arg(long, value_name = "DURATION", requires = "multi_tenant")]
+    multi_tenant_idle_timeout: Option<String>,
+
     /// Open the desktop GUI window. GUI is the implicit default when no
     /// other surface flag is set, so this flag's main use is composing
     /// with `--serve` (`--serve --gui`): the desktop window and any
@@ -147,6 +214,16 @@ struct Cli {
     /// dev-plan/31.
     #[arg(long)]
     messenger: bool,
+
+    /// Run a pre-authored workflow script headlessly (dev-plan/32
+    /// Stage L). Skips the `/workflow run` author + review phase
+    /// entirely — the file is expected to be vetted by the operator.
+    /// Pair with --resume <id> to continue an interrupted run.
+    /// Writes the workflow id + done-summary to stderr; the script's
+    /// final value goes to stdout. Exit 0 on success, 1 on script
+    /// failure.
+    #[arg(long, value_name = "FILE")]
+    workflow: Option<PathBuf>,
 
     /// Prompt (positional args joined with spaces)
     prompt: Vec<String>,
@@ -215,6 +292,135 @@ enum Command {
         #[command(subcommand)]
         cmd: MessengerCmd,
     },
+    /// thClaws.cloud catalog client (dev-plan/34) — RETIRED FROM THE
+    /// SHELL. Every cloud operation now happens inside a thclaws
+    /// session as a slash command, so the catalog token never
+    /// passes through shell argv, env, or terminal history. Every
+    /// subcommand below prints the corresponding /cloud … or GUI
+    /// pointer and exits non-zero:
+    ///   login/logout → Settings → thClaws.cloud panel in the GUI
+    ///   status       → /cloud status
+    ///   list         → /cloud list [--mine]
+    ///   get          → /cloud get <slug>
+    ///   publish      → /cloud publish
+    ///   unbind       → /cloud unbind
+    Cloud {
+        #[command(subcommand)]
+        cmd: CloudCmd,
+        /// Override the catalog URL for this invocation. Usually
+        /// unnecessary — the URL is persisted to settings.json on
+        /// first `cloud login` (or from the GUI Settings → thClaws.cloud
+        /// panel). Precedence: this flag > `THCLAWS_CLOUD_URL` env >
+        /// `settings.json::cloud.url` > default `https://thclaws.cloud`.
+        #[arg(long, global = true, value_name = "URL")]
+        cloud_url: Option<String>,
+    },
+    /// GUI Shell authoring (dev-plan/39 Tier 2) — scaffold a new shell
+    /// from a vendored template, preview locally with hot-reload, lint
+    /// the manifest, or pack into a single-file HTML for publish.
+    #[cfg(feature = "gui")]
+    Shell {
+        #[command(subcommand)]
+        cmd: ShellCmd,
+    },
+}
+
+#[cfg(feature = "gui")]
+#[derive(Subcommand)]
+enum ShellCmd {
+    /// Scaffold a new shell from a starter template.
+    /// Templates: chat-enhanced / grid / form / dashboard / kanban /
+    /// document / report.
+    New {
+        /// Template id (see `thclaws shell new --help` for the list).
+        template: String,
+        /// Destination folder. Created if missing; refused if non-empty
+        /// without --force.
+        dest: std::path::PathBuf,
+        /// Overwrite a non-empty destination.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Run the shell against a mock agent, with hot-reload on save.
+    /// Opens at http://localhost:<port>/ by default.
+    Preview {
+        /// Path to the shell folder (must contain shell.json).
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+        /// Port to bind. 0 = pick a free one.
+        #[arg(long, default_value_t = 8088)]
+        port: u16,
+    },
+    /// Lint a shell folder. Emits errors + warnings; exits 1 on any
+    /// error.
+    Check {
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+    },
+    /// Bundle a shell folder into a single-file HTML (inlines sibling
+    /// style.css and script.js if present).
+    Pack {
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+        /// Output file. Defaults to <path>/dist/index.html.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CloudCmd {
+    /// REMOVED — open thclaws and paste your CLI token in
+    /// Settings → thClaws.cloud. The shell subcommand exits with a
+    /// pointer so the token never has to pass through shell argv.
+    Login {
+        /// Provide the token inline instead of prompting.
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// REMOVED — open thclaws and clear the CLI token in
+    /// Settings → thClaws.cloud.
+    Logout,
+    /// REMOVED — use `/cloud publish` from inside a thclaws session.
+    /// The shell subcommand printed (and now refuses with a pointer
+    /// to the slash flow) so the catalog token doesn't have to live
+    /// in shell env / terminal history.
+    Publish {
+        /// Path to the agent folder. Defaults to cwd.
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+        /// Show what would be uploaded without sending.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// REMOVED — use `/cloud get <slug>` from inside a thclaws session.
+    /// The shell subcommand refuses with a pointer to the slash flow
+    /// so the catalog token doesn't have to live in shell env /
+    /// terminal history.
+    Get {
+        /// Catalog slug (`manifest.id`).
+        slug: String,
+        /// Target directory. Defaults to ./<slug>/. Refuses to overwrite
+        /// non-empty dirs unless --force.
+        #[arg(default_value = "")]
+        target: String,
+        /// Specific version to download. Defaults to latest.
+        #[arg(long)]
+        version: Option<String>,
+        /// Allow extracting into a non-empty directory.
+        #[arg(long)]
+        force: bool,
+    },
+    /// REMOVED — use `/cloud list [--mine]` from inside a thclaws session.
+    List {
+        #[arg(long)]
+        mine: bool,
+    },
+    /// REMOVED — use `/cloud status` from inside a thclaws session.
+    Status,
+    /// REMOVED — use `/cloud unbind` from inside a thclaws session in
+    /// the agent folder you want to fork.
+    Unbind,
 }
 
 #[derive(Subcommand)]
@@ -323,6 +529,30 @@ fn detach_console_for_gui() {
 #[cfg(not(windows))]
 fn detach_console_for_gui() {}
 
+/// Parse a TTL string like "30d" / "12h" / "60m" / "120s" / "never"
+/// into seconds. Used by `--gui-shell-token-ttl`. Returns `None` for
+/// "never" (no expiry) or any unparseable input — the caller falls
+/// back to the manifest / launcher default.
+fn parse_ttl_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("never") || s.is_empty() {
+        return None;
+    }
+    let (num, unit) = match s.chars().last() {
+        Some(c) if c.is_ascii_alphabetic() => (&s[..s.len() - 1], c.to_ascii_lowercase()),
+        _ => (s, 's'),
+    };
+    let n: u64 = num.parse().ok()?;
+    Some(match unit {
+        's' => n,
+        'm' => n * 60,
+        'h' => n * 60 * 60,
+        'd' => n * 60 * 60 * 24,
+        'w' => n * 60 * 60 * 24 * 7,
+        _ => return None,
+    })
+}
+
 /// Windows-only: when about to launch the GUI from a console (cmd.exe /
 /// PowerShell), respawn ourselves as a detached child and exit the parent
 /// so the shell prompt returns immediately. Issue #109.
@@ -355,7 +585,7 @@ fn respawn_detached_for_gui_if_needed(cli: &Cli) {
     // Only respawn when the dispatch is actually GUI: not --cli/--print/
     // --telegram/--messenger, and either plain GUI (no --serve) or the
     // --serve --gui combo.
-    let use_cli = cli.cli || cli.print || cli.telegram || cli.messenger;
+    let use_cli = cli.cli || cli.print || cli.telegram || cli.messenger || cli.workflow.is_some();
     let is_gui_dispatch = !use_cli && (!cli.serve || cli.gui);
     if !is_gui_dispatch {
         return;
@@ -466,10 +696,19 @@ async fn main() {
             let code = run_messenger_subcommand(cmd);
             std::process::exit(code);
         }
+        Some(Command::Cloud { cmd, cloud_url }) => {
+            let code = run_cloud_subcommand(cmd, cloud_url).await;
+            std::process::exit(code);
+        }
+        #[cfg(feature = "gui")]
+        Some(Command::Shell { cmd }) => {
+            let code = run_shell_subcommand(cmd).await;
+            std::process::exit(code);
+        }
         None => {}
     }
 
-    let use_cli = cli.cli || cli.print || cli.telegram || cli.messenger;
+    let use_cli = cli.cli || cli.print || cli.telegram || cli.messenger || cli.workflow.is_some();
 
     // Issue #109: on Windows, respawn detached so cmd.exe / PowerShell
     // return the prompt instead of waiting on the GUI window. Runs
@@ -564,8 +803,59 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
+            // dev-plan/33 Tier 2 Mode B + dev-plan/39 Tier 1: resolve
+            // the bound shell from (a) explicit --gui-shell flag,
+            // (b) settings.json::guiShell.serveDefault, (c)
+            // manifest.json::default_shell at the working directory.
+            // None of those means "serve React frontend as before".
+            let settings_default = thclaws_core::config::AppConfig::load().ok().and_then(|c| {
+                c.gui_shell
+                    .and_then(|s| s.serve_default().map(str::to_string))
+            });
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let resolved_shell_id = thclaws_core::gui_shell::resolve_default_shell(
+                cli.gui_shell.as_deref(),
+                settings_default.as_deref(),
+                &cwd,
+            );
+            let gui_shell_mode =
+                resolved_shell_id.map(|shell_id| thclaws_core::server::ShellServeMode {
+                    shell_id,
+                    pinned_token: cli.gui_shell_token.clone(),
+                    token_ttl_secs: cli.gui_shell_token_ttl.as_deref().and_then(parse_ttl_secs),
+                    no_auth: cli.gui_shell_no_auth,
+                    no_auth_allow_public: cli.gui_shell_no_auth_allow_public,
+                });
+            // dev-plan/35 Tier 1: multi-tenant mode.
+            let multi_tenant_mode = if cli.multi_tenant {
+                let secret = cli
+                    .multi_tenant_secret
+                    .clone()
+                    .or_else(|| std::env::var("THCLAWS_CLOUD_HMAC_SECRET").ok())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
+                        eprintln!(
+                            "\x1b[31m--multi-tenant requires --multi-tenant-secret or THCLAWS_CLOUD_HMAC_SECRET\x1b[0m"
+                        );
+                        std::process::exit(1);
+                    });
+                let idle_timeout_secs = cli
+                    .multi_tenant_idle_timeout
+                    .as_deref()
+                    .and_then(parse_ttl_secs)
+                    .unwrap_or(30 * 60);
+                Some(thclaws_core::server::MultiTenantMode {
+                    hmac_secret: secret.into_bytes(),
+                    max_users: cli.multi_tenant_max_users,
+                    idle_timeout: std::time::Duration::from_secs(idle_timeout_secs),
+                })
+            } else {
+                None
+            };
             let serve_config = thclaws_core::server::ServeConfig {
                 bind: std::net::SocketAddr::new(bind_ip, cli.port),
+                gui_shell: gui_shell_mode,
+                multi_tenant: multi_tenant_mode,
                 ..Default::default()
             };
             if cli.gui {
@@ -577,6 +867,20 @@ async fn main() {
                 thclaws_core::gui::run_gui_with_serve(serve_config);
                 return;
             }
+            // --serve panic hook: any panic in a tokio task unwinds
+            // that task but leaves the runtime (and the bound port)
+            // alive — systemd `Restart=on-failure` then sits on a
+            // never-failing parent and the user has to `kill -9` to
+            // recover the port. Chain the default hook so the
+            // traceback still hits stderr, then abort() so the OS
+            // releases the listening socket immediately and systemd
+            // can restart on a clean port (#151).
+            let default_hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                default_hook(info);
+                eprintln!("\x1b[31m[--serve] panic — aborting so the port is released\x1b[0m");
+                std::process::abort();
+            }));
             if let Err(e) = thclaws_core::server::run(serve_config).await {
                 eprintln!("\n\x1b[31mserve error: {e}\x1b[0m");
                 std::process::exit(1);
@@ -646,7 +950,18 @@ async fn main() {
         std::env::set_var("THCLAWS_TEAM_DIR", team_dir);
     }
 
-    if cli.telegram {
+    if let Some(script_path) = cli.workflow {
+        // Headless workflow — pre-authored JS file, no review phase.
+        // dev-plan/32 Stage L. --resume <id> combines with --workflow
+        // to replay completed workers from state.jsonl.
+        match thclaws_core::workflow::headless::run(config, script_path, cli.resume.clone()).await {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("\n\x1b[31m[workflow] error: {e}\x1b[0m");
+                std::process::exit(1);
+            }
+        }
+    } else if cli.telegram {
         // Headless Telegram bot — its own agent loop (the GUI worker is
         // gui-gated). Runs until Ctrl-C. dev-plan/29 Tier 1.
         if let Err(e) = thclaws_core::telegram::headless::run(config).await {
@@ -788,6 +1103,86 @@ fn run_messenger_subcommand(cmd: MessengerCmd) -> i32 {
     }
 }
 
+async fn run_cloud_subcommand(cmd: CloudCmd, _cloud_url: Option<String>) -> i32 {
+    // Every `thclaws cloud …` subcommand now redirects to the
+    // in-session slash equivalent (or the GUI Settings panel for
+    // login/logout). The clap subcommand structure stays so users
+    // who paste an old command get the targeted "use /cloud X"
+    // message rather than "unknown subcommand". No more catalog
+    // network calls from the shell — that's the whole point.
+    let result: Result<(), String> = match cmd {
+        // login + logout moved to the GUI Settings → thClaws.cloud
+        // panel (and the equivalent IPC `cloud_config_set` for
+        // headless). Same reason as publish/get below: no token
+        // through shell argv or env.
+        CloudCmd::Login { .. } => Err("`thclaws cloud login` was removed. Open thclaws, go to \
+                 Settings → thClaws.cloud, paste your CLI token from the \
+                 dashboard (https://thclaws.cloud/dashboard). The token \
+                 is stored in the OS keychain and used via the \
+                 Authorization header — never through shell argv."
+            .to_string()),
+        CloudCmd::Logout => Err("`thclaws cloud logout` was removed. Open thclaws, go to \
+                 Settings → thClaws.cloud, click the clear button next to \
+                 the CLI token field."
+            .to_string()),
+        // Publish + Get were moved into the in-session slash surface so
+        // the catalog token never has to be threaded through a shell
+        // env (which made it leak into terminal histories, dotenv
+        // tooling, and stray `ps` output). Both subcommands now refuse
+        // to run and tell the user the new flow.
+        CloudCmd::Publish { .. } => Err(
+            "`thclaws cloud publish` was removed. From inside a thclaws \
+                 session in the agent folder, run:\n  \
+                     /cloud publish\n\
+                 The slash command uses the session's stored token via the \
+                 Authorization header — no shell-env leak."
+                .to_string(),
+        ),
+        CloudCmd::Get { slug, .. } => {
+            let slug_display = if slug.is_empty() {
+                "<slug>".to_string()
+            } else {
+                slug
+            };
+            Err(format!(
+                "`thclaws cloud get` was removed. From inside a thclaws session \
+                 in the folder you want to install into, run:\n  \
+                     /cloud get {slug_display}\n\
+                 The slash command uses the session's stored token via the \
+                 Authorization header — no shell-env leak."
+            ))
+        }
+        // status / list / unbind also moved to /cloud … slash for
+        // consistency — every cloud op now happens inside a thclaws
+        // session, so there's exactly one surface to teach.
+        CloudCmd::List { .. } => Err(
+            "`thclaws cloud list` was removed. From inside a thclaws session, run:\n  \
+                     /cloud list           (full catalog)\n  \
+                     /cloud list --mine    (just yours)"
+                .to_string(),
+        ),
+        CloudCmd::Status => Err(
+            "`thclaws cloud status` was removed. From inside a thclaws session, run:\n  \
+                     /cloud status"
+                .to_string(),
+        ),
+        CloudCmd::Unbind => Err(
+            "`thclaws cloud unbind` was removed. From inside a thclaws session in the \
+                 agent folder you want to fork, run:\n  \
+                     /cloud unbind"
+                .to_string(),
+        ),
+    };
+
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("\x1b[31merror:\x1b[0m {}", e);
+            1
+        }
+    }
+}
+
 fn run_schedule_subcommand(cmd: ScheduleCmd) -> i32 {
     match cmd {
         ScheduleCmd::Add {
@@ -904,7 +1299,7 @@ fn run_schedule_subcommand(cmd: ScheduleCmd) -> i32 {
                 } else {
                     "      "
                 };
-                let last = s.last_run.as_deref().unwrap_or("never");
+                let last = schedule::display_last_run(s.last_run.as_deref());
                 let exit = match s.last_exit {
                     Some(0) => " ok ",
                     Some(_) => " err",
@@ -1156,4 +1551,85 @@ fn warn_about_stale_binaries() {
         "\x1b[33m[thclaws] only the first one on PATH is invoked when you type `thclaws`. The other copies still take ~17 MB each.\nTo clean up:  {}\x1b[0m",
         RM_HINT
     );
+}
+
+#[cfg(feature = "gui")]
+async fn run_shell_subcommand(cmd: ShellCmd) -> i32 {
+    use thclaws_core::gui_shell::shell_cli;
+    match cmd {
+        ShellCmd::New {
+            template,
+            dest,
+            force,
+        } => match shell_cli::shell_new(&template, &dest, force) {
+            Ok(files) => {
+                eprintln!(
+                    "\x1b[32m✓ scaffolded {} into {}\x1b[0m",
+                    template,
+                    dest.display(),
+                );
+                for f in files {
+                    eprintln!("  + {}", f.display());
+                }
+                eprintln!(
+                    "\n   next: cd {} && thclaws shell preview .",
+                    dest.display()
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("\x1b[31m✗ {e}\x1b[0m");
+                1
+            }
+        },
+        ShellCmd::Check { path } => match shell_cli::shell_check(&path) {
+            Ok(findings) => {
+                let mut errors = 0;
+                for (sev, msg) in &findings {
+                    let color = match sev {
+                        shell_cli::Severity::Error => "\x1b[31m",
+                        shell_cli::Severity::Warning => "\x1b[33m",
+                    };
+                    eprintln!("{}{:8}{}\x1b[0m {msg}", color, sev.label(), "");
+                    if *sev == shell_cli::Severity::Error {
+                        errors += 1;
+                    }
+                }
+                if findings.is_empty() {
+                    eprintln!("\x1b[32m✓ shell.json clean\x1b[0m");
+                }
+                if errors > 0 {
+                    1
+                } else {
+                    0
+                }
+            }
+            Err(e) => {
+                eprintln!("\x1b[31m✗ {e}\x1b[0m");
+                1
+            }
+        },
+        ShellCmd::Pack { path, out } => {
+            let out = out.unwrap_or_else(|| path.join("dist/index.html"));
+            match shell_cli::shell_pack(&path, &out) {
+                Ok(_) => {
+                    eprintln!("\x1b[32m✓ packed → {}\x1b[0m", out.display());
+                    0
+                }
+                Err(e) => {
+                    eprintln!("\x1b[31m✗ {e}\x1b[0m");
+                    1
+                }
+            }
+        }
+        ShellCmd::Preview { path, port } => {
+            match thclaws_core::gui_shell::shell_preview::run_preview(&path, port).await {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("\x1b[31m✗ preview: {e}\x1b[0m");
+                    1
+                }
+            }
+        }
+    }
 }

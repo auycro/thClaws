@@ -1,7 +1,8 @@
 //! Ollama Cloud provider — `/api/chat` via `https://ollama.com` with API key auth.
 //!
 //! Wire format notes (vs local Ollama):
-//! - Endpoint: `https://ollama.com/api/chat` (fixed, not configurable)
+//! - Endpoint: `https://ollama.com/api/chat` (host swappable via
+//!   `with_base_url` for the thClaws Gateway overlay)
 //! - Auth: Bearer token via `Authorization: Bearer <OLLAMA_CLOUD_API_KEY>` env var (REQUIRED)
 //! - Stream is **NDJSON**, identical to local Ollama: one complete JSON object per line
 //! - Messages shape identical to local Ollama provider
@@ -23,6 +24,7 @@ use serde_json::{json, Value};
 pub struct OllamaCloudProvider {
     client: Client,
     api_key: String,
+    base_url: String,
 }
 
 impl OllamaCloudProvider {
@@ -30,7 +32,15 @@ impl OllamaCloudProvider {
         Self {
             client: Client::new(),
             api_key,
+            base_url: "https://ollama.com".to_string(),
         }
+    }
+
+    /// Point at a different host (the thClaws Gateway overlay). Paths
+    /// (`/api/chat`, `/v1/models`) are appended to this base.
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into().trim_end_matches('/').to_string();
+        self
     }
 
     fn model_name(req_model: &str) -> &str {
@@ -171,10 +181,10 @@ impl Default for OllamaCloudProvider {
 #[async_trait]
 impl Provider for OllamaCloudProvider {
     async fn list_models(&self) -> Result<Vec<ModelInfo>> {
-        let url = "https://ollama.com/v1/models";
+        let url = format!("{}/v1/models", self.base_url);
         let resp = self
             .client
-            .get(url)
+            .get(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .send()
             .await
@@ -217,7 +227,7 @@ impl Provider for OllamaCloudProvider {
         let body = Self::build_body(&req);
         let resp = self
             .client
-            .post("https://ollama.com/api/chat")
+            .post(format!("{}/api/chat", self.base_url))
             .header("content-type", "application/json")
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&body)

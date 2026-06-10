@@ -357,3 +357,15 @@ html, body, #root {
 .kms-viewer-prose a[href*="../sources/"][href$=".md"]:hover {
   background: color-mix(in srgb, var(--accent) 25%, transparent);
 }
+
+/* dev-plan/36 — Running chip pulse. The chip is rendered by
+   RunningChip.tsx when the engine reports a user-facing turn in
+   flight. Pulse fades the dot's opacity to make the "live work"
+   state visible without animating layout. */
+@keyframes running-chip-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.35; }
+}
+.running-chip .running-chip-dot {
+  animation: running-chip-pulse 1.6s ease-in-out infinite;
+}

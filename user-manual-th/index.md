@@ -32,11 +32,20 @@ deploy โปรเจกต์จริง ไม่ว่าจะเป็น
 | 22 | [Paperclip adapter](ch22-paperclip-adapter.md) |
 | 23 | [Telegram bot](ch23-telegram.md) |
 | 24 | [Facebook Page Messenger bot](ch24-messenger.md) |
+| 25 | [Workflows (`/workflow run`)](ch25-workflows.md) |
+| 26 | [GUI Shells](ch26-gui-shells.md) |
+| 27 | [thClaws.cloud (catalog + hosted + gateway)](ch27-thclaws-cloud.md) |
 
-> **ส่วนที่ 2 — กรณีศึกษา (บทที่ 25–28)** — walkthrough สำหรับสร้าง
+> **ส่วนที่ 2 — กรณีศึกษา (บทที่ 28–30)** — walkthrough สำหรับสร้าง
 > โปรเจกต์จริงด้วย thClaws (เว็บ static, Node.js app, AI agent, การ
 > deploy ขึ้น Agentic Press) ยังอยู่ระหว่างพัฒนา จะถูกเพิ่มเข้ามาในคู่มือ
 > เมื่อรีวิวและพร้อมเผยแพร่ทีละบท
+
+## ภาคผนวก
+
+| # | ภาคผนวก |
+|---|---|
+| A | [Provider, โมเดล และราคา (thClaws.cloud gateway)](appendix-a-providers-models-prices.md) |
 
 ## ข้อกำหนดการเขียนที่ใช้ในคู่มือเล่มนี้
 

@@ -206,6 +206,17 @@ pub struct AppConfig {
     #[serde(default)]
     pub openrouter_free_only: bool,
 
+    /// Opt-in flag for the native Gemini image-generation tools
+    /// (`TextToImage`, `ImageToImage`). Off by default because the
+    /// tools call paid Google APIs on the user's own key and write
+    /// PNG files into the workspace — both reasons to require an
+    /// explicit "yes" before they appear in the model's tool list.
+    /// Requires `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) in env too;
+    /// `requires_env()` hides the tools when neither is set even
+    /// with this flag flipped on.
+    #[serde(default)]
+    pub image_tools_enabled: bool,
+
     /// Per-provider gateway routing. Each entry is a provider name
     /// (lowercase, matches the gateway path segment): `openai`,
     /// `anthropic`, `google`, `openrouter`. When the active model's
@@ -248,6 +259,57 @@ pub struct AppConfig {
     /// sensitive (URL only) — token sits in the keychain.
     #[serde(default, alias = "remoteAgentUrl")]
     pub remote_agent_url: Option<String>,
+
+    /// GUI Shell defaults (dev-plan/33 Tier 2). Two forms accepted:
+    ///
+    /// - **Shorthand** — `"guiShell": "session-explorer"` applies to
+    ///   both the GUI Shell tab default and the `--serve --gui-shell`
+    ///   fallback.
+    /// - **Long form** — `"guiShell": { "tabDefault": "session-explorer",
+    ///   "serveDefault": "image-generator" }` lets the two differ.
+    ///
+    /// `tabDefault` (when set) causes the Shell tab to auto-open that
+    /// shell instead of showing the picker. `serveDefault` is read by
+    /// `--serve` when no `--gui-shell` CLI flag is passed (Tier 2
+    /// Task 14 wiring).
+    #[serde(default, alias = "guiShell")]
+    pub gui_shell: Option<GuiShellSetting>,
+}
+
+/// Accepts both the string shorthand and the structured long form so
+/// `settings.json` stays terse for users who don't need to split tab
+/// vs serve defaults.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum GuiShellSetting {
+    /// `"guiShell": "session-explorer"` — same id used for both modes.
+    Shorthand(String),
+    /// Long form with separate per-mode defaults.
+    Long {
+        #[serde(default, alias = "tabDefault")]
+        tab_default: Option<String>,
+        #[serde(default, alias = "serveDefault")]
+        serve_default: Option<String>,
+    },
+}
+
+impl GuiShellSetting {
+    /// Shell id to auto-open in the GUI Shell tab (`None` → show picker).
+    pub fn tab_default(&self) -> Option<&str> {
+        match self {
+            GuiShellSetting::Shorthand(s) => Some(s.as_str()),
+            GuiShellSetting::Long { tab_default, .. } => tab_default.as_deref(),
+        }
+    }
+
+    /// Shell id to fall back to when `--serve` is launched without
+    /// `--gui-shell` (Task 14 consumer).
+    pub fn serve_default(&self) -> Option<&str> {
+        match self {
+            GuiShellSetting::Shorthand(s) => Some(s.as_str()),
+            GuiShellSetting::Long { serve_default, .. } => serve_default.as_deref(),
+        }
+    }
 }
 
 /// Default stream-chunk idle timeout. Used by `serde(default = ...)`
@@ -301,10 +363,12 @@ impl Default for AppConfig {
             auto_learn_reconcile_hours: default_auto_learn_reconcile_hours(),
             claude_md_compat: false,
             openrouter_free_only: false,
+            image_tools_enabled: false,
             gateway_use_for: Vec::new(),
             extract_save_skill_models: None,
             translator_subagent_model: None,
             remote_agent_url: None,
+            gui_shell: None,
         }
     }
 }
@@ -466,6 +530,19 @@ pub struct ProjectConfig {
         deserialize_with = "null_team_enabled_is_false"
     )]
     pub team_enabled: Option<bool>,
+    /// Opt-in flag for the GUI's PTY-backed `Shell` tab. Default off
+    /// because the tab gives the user an unsandboxed live shell with
+    /// no agent-side permission gating — fine for power users, easy
+    /// to footgun for someone new to the tool. Flip to `true` to
+    /// surface the tab; the agent-rendered `Terminal` tab and the
+    /// iframe-based `UI` tab are always available regardless.
+    #[serde(rename = "shellTabEnabled")]
+    pub shell_tab_enabled: Option<bool>,
+    /// Opt-in flag for the native Gemini image-generation tools
+    /// (`TextToImage`, `ImageToImage`). See `AppConfig::
+    /// image_tools_enabled` for the design.
+    #[serde(rename = "imageToolsEnabled")]
+    pub image_tools_enabled: Option<bool>,
     /// Print the assistant's raw text to stderr after each turn (dim, fenced
     /// block). Same effect as `THCLAWS_SHOW_RAW=1`. The env var wins if set.
     /// Useful when debugging model output / formatting issues.
@@ -511,6 +588,56 @@ pub struct ProjectConfig {
     /// `~/.config/thclaws/telegram.json` is the GUI's source of truth;
     /// this project layer is read at load for headless / shipped setups.
     pub telegram: Option<crate::telegram::TelegramConfig>,
+    /// thClaws.cloud catalog client binding (dev-plan/34). When set,
+    /// `thclaws cloud {login, publish, get, list}` talks to this URL
+    /// instead of the public `https://thclaws.cloud` default. Override
+    /// at runtime with `--cloud-url` or `THCLAWS_CLOUD_URL`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloud: Option<crate::cloud::CloudConfig>,
+    /// Agent identity (dev-plan/34 Option A). This folder's
+    /// authoritative `{id, name, description, uuid}`. The UUID is
+    /// server-assigned on first `cloud publish` and written back here so
+    /// subsequent publishes update the same catalog entry. The engine
+    /// surfaces `agent.name` in the GUI title bar / CLI prompt so the
+    /// user always knows which agent they're running.
+    ///
+    /// Identity moved out of `manifest.json` to a single source of
+    /// truth — `manifest.json` keeps version, pricing, requires,
+    /// permissions, etc. CLI fuses both at publish time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentConfig>,
+    /// dev-plan/33 Tier 2 — pin a default GUI Shell for the UI tab
+    /// (`tabDefault`) and/or `--serve` (`serveDefault`). See
+    /// [`AppConfig::gui_shell`] for the parsed shape. Without this
+    /// field on ProjectConfig, serde silently drops the JSON block on
+    /// deserialize, so `guiShell.tabDefault` in `.thclaws/settings.json`
+    /// never reaches the picker.
+    #[serde(rename = "guiShell", skip_serializing_if = "Option::is_none")]
+    pub gui_shell: Option<GuiShellSetting>,
+}
+
+/// On-disk shape of the `agent` block in `./.thclaws/settings.json`.
+/// See [`crate::config::ProjectConfig::agent`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AgentConfig {
+    /// URL-safe slug used as the catalog path component
+    /// (`/a/<id>` on thclaws.cloud) and as the folder's stable name.
+    /// User-chosen; lowercase letters/digits/hyphens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Display name shown in the catalog grid + GUI title bar.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Short pitch (≤500 chars). Shown on the agent detail page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Server-assigned UUID. Empty/absent on a fresh local agent.
+    /// `cloud publish` populates it from the server's response and
+    /// reads it on subsequent publishes to identify the same agent
+    /// (even if the folder is renamed). `cloud unbind` clears it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
 }
 
 fn null_team_enabled_is_false<'de, D>(d: D) -> std::result::Result<Option<bool>, D::Error>
@@ -539,6 +666,8 @@ impl Default for ProjectConfig {
             window_height: None,
             gui_scale: None,
             team_enabled: Some(false),
+            shell_tab_enabled: Some(false),
+            image_tools_enabled: Some(false),
             show_raw_response: None,
             kms: None,
             auto_learn: None,
@@ -548,6 +677,9 @@ impl Default for ProjectConfig {
             gateway_use_for: None,
             remote_agent_url: None,
             telegram: None,
+            cloud: None,
+            agent: None,
+            gui_shell: None,
         }
     }
 }
@@ -560,6 +692,51 @@ pub struct KmsSettings {
     /// every name in the list gets its `index.md` spliced into the
     /// system prompt.
     pub active: Vec<String>,
+}
+
+/// Shallow-overlay merge for `save()`'s non-destructive write. Two
+/// preservation rules:
+///
+///   - Keys in `target` but absent from `overlay` stay untouched
+///     (`_doc` comments, unknown shorthand aliases like `guiShell`
+///     that serde's `alias` only handles on deserialize, etc.).
+///   - Keys in `overlay` whose value is JSON null are skipped.
+///     ProjectConfig is field-heavy with `Option<T>` serialising
+///     to null when unset; without this rule every save() would
+///     balloon settings.json with a `"feature": null` line per
+///     unset field, drowning the keys the user actually cares about.
+///
+/// Non-object inputs at the top level are ignored (settings.json is
+/// always an object at root by convention).
+fn overlay_object(target: &mut serde_json::Value, overlay: &serde_json::Value) {
+    let (Some(t), Some(o)) = (target.as_object_mut(), overlay.as_object()) else {
+        return;
+    };
+    for (k, v) in o {
+        if v.is_null() {
+            continue;
+        }
+        t.insert(k.clone(), v.clone());
+    }
+}
+
+/// Parse a settings.json into ProjectConfig; on serde failure log a
+/// one-line warning to stderr (with file path + serde's column/line
+/// hint) and return None. Without this, a single trailing comma or
+/// missing brace silently defaults every opt-in feature to off and
+/// the user sees "I enabled `shellTabEnabled`/`teamEnabled`/… but
+/// nothing happened." Observed in the wild 2026-06-03.
+fn parse_or_warn(contents: &str, path: &std::path::Path) -> Option<ProjectConfig> {
+    match serde_json::from_str::<ProjectConfig>(contents) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!(
+                "[thclaws] {} parse failed: {e} — falling back to defaults. Every opt-in flag (teamEnabled, shellTabEnabled, …) will read as `false` until the file is valid JSON.",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 impl ProjectConfig {
@@ -587,23 +764,56 @@ impl ProjectConfig {
         let json_path = Self::path();
         if json_path.exists() {
             let contents = std::fs::read_to_string(&json_path).ok()?;
-            return serde_json::from_str(&contents).ok();
+            return parse_or_warn(&contents, &json_path);
         }
         // Try .claude/settings.json (Claude Code compat).
         let claude_path = std::env::current_dir().ok()?.join(".claude/settings.json");
         if claude_path.exists() {
             let contents = std::fs::read_to_string(&claude_path).ok()?;
-            return serde_json::from_str(&contents).ok();
+            return parse_or_warn(&contents, &claude_path);
         }
         None
     }
 
+    /// Persist this config to `.thclaws/settings.json`. Non-destructive
+    /// when the file already exists: merges this struct's keys into the
+    /// on-disk JSON via a top-level object overlay rather than writing
+    /// the serialised `ProjectConfig` verbatim. Preserves:
+    ///
+    ///   - `_doc` and any other user comments at the top level
+    ///   - Unknown keys (e.g. `guiShell` shorthand the model only sees
+    ///     via the `alias` attribute on deserialize — without merge,
+    ///     a `save()` after `load()` would drop it because serde
+    ///     serialises by field name, not alias)
+    ///   - The file's existing key ordering for known keys (we only
+    ///     overwrite values)
+    ///
+    /// First-time save (no existing file) writes the struct verbatim.
     pub fn save(&self) -> Result<()> {
         let path = Self::path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let s = serde_json::to_string_pretty(self)?;
+
+        let new_value = serde_json::to_value(self)?;
+        let mut base = if path.exists() {
+            let raw = std::fs::read(&path)?;
+            // Unparseable existing file → start from empty {} rather
+            // than fail outright (parse_or_warn already logs the
+            // warning on the read side). Better to write a clean
+            // overlay than to bail and leave bad JSON on disk.
+            serde_json::from_slice::<serde_json::Value>(&raw)
+                .unwrap_or_else(|_| serde_json::json!({}))
+        } else {
+            // Fresh file (e.g. `cloud get` extracting into a new
+            // folder): start from empty so the overlay's null-skipping
+            // produces a minimal settings.json with only the keys
+            // the caller actually set.
+            serde_json::json!({})
+        };
+        overlay_object(&mut base, &new_value);
+
+        let s = serde_json::to_string_pretty(&base)?;
         std::fs::write(&path, s)?;
         Ok(())
     }
@@ -645,6 +855,7 @@ impl ProjectConfig {
   "planContextStrategy": "compact",
   "skillsListingStrategy": "full",
   "teamEnabled": false,
+  "shellTabEnabled": false,
   "showRawResponse": false,
   "allowedTools": null,
   "disallowedTools": null,
@@ -757,6 +968,9 @@ impl ProjectConfig {
         if let Some(b) = self.openrouter_free_only {
             config.openrouter_free_only = b;
         }
+        if let Some(b) = self.image_tools_enabled {
+            config.image_tools_enabled = b;
+        }
         if let Some(ref providers) = self.gateway_use_for {
             config.gateway_use_for = providers
                 .iter()
@@ -770,6 +984,9 @@ impl ProjectConfig {
                 config.remote_agent_url = Some(trimmed.to_string());
             }
         }
+        if let Some(ref gs) = self.gui_shell {
+            config.gui_shell = Some(gs.clone());
+        }
     }
 
     pub fn set_model(&mut self, model: &str) {
@@ -781,6 +998,57 @@ impl ProjectConfig {
     /// [`crate::secrets`]) for the bearer token.
     pub fn set_remote_agent_url(&mut self, url: Option<&str>) {
         self.remote_agent_url = url.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    }
+
+    /// Merge an [`AgentConfig`] block into project settings. Fields
+    /// passed as `Some` overwrite; `None` leaves existing values
+    /// untouched (so a partial update — e.g. just `uuid` — preserves
+    /// name/description).
+    pub fn merge_agent(&mut self, updates: AgentConfig) {
+        let mut current = self.agent.clone().unwrap_or_default();
+        if updates.id.is_some() {
+            current.id = updates.id;
+        }
+        if updates.name.is_some() {
+            current.name = updates.name;
+        }
+        if updates.description.is_some() {
+            current.description = updates.description;
+        }
+        if updates.uuid.is_some() {
+            current.uuid = updates.uuid;
+        }
+        let empty = current.id.is_none()
+            && current.name.is_none()
+            && current.description.is_none()
+            && current.uuid.is_none();
+        self.agent = if empty { None } else { Some(current) };
+    }
+
+    /// Drop just the server-assigned UUID — used by `cloud unbind`
+    /// when the user wants to fork a copy into a fresh catalog entry.
+    /// Leaves id / name / description in place.
+    pub fn clear_agent_uuid(&mut self) {
+        if let Some(agent) = self.agent.as_mut() {
+            agent.uuid = None;
+        }
+    }
+
+    /// Persist the thClaws.cloud catalog URL (dev-plan/34). Pair with
+    /// the `cloud-token` keychain entry (managed by [`crate::cloud`])
+    /// for the bearer token.
+    pub fn set_cloud_url(&mut self, url: Option<&str>) {
+        let normalized = url
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty());
+        self.cloud = match (self.cloud.take(), normalized) {
+            (Some(mut existing), v) => {
+                existing.url = v;
+                Some(existing)
+            }
+            (None, Some(v)) => Some(crate::cloud::CloudConfig { url: Some(v) }),
+            (None, None) => None,
+        };
     }
 
     /// Persist the GUI zoom factor. Clamped to a sane range so a
@@ -1169,6 +1437,26 @@ impl AppConfig {
     /// Returns `None` when neither source has a key (providers without
     /// auth, like ollama, are OK either way).
     pub fn api_key_from_env(&self) -> Option<String> {
+        // Trim whitespace and one pair of wrapping "…" / '…' quotes.
+        // Defensive against env / keychain values that picked up a
+        // copy-paste artefact (issue #145 — wrapping double quotes
+        // turn `Bearer X` into `Bearer "X"`, which OpenRouter parses
+        // as no bearer at all → `Missing Authentication header`).
+        // Inlined so this helper has no other call sites and the
+        // intent stays next to where it's used.
+        fn sanitize_api_key(raw: &str) -> String {
+            let trimmed = raw.trim();
+            let b = trimmed.as_bytes();
+            if b.len() >= 2
+                && ((b[0] == b'"' && b[b.len() - 1] == b'"')
+                    || (b[0] == b'\'' && b[b.len() - 1] == b'\''))
+            {
+                trimmed[1..trimmed.len() - 1].to_string()
+            } else {
+                trimmed.to_string()
+            }
+        }
+        // Body proper:
         let kind = self.detect_provider_kind().ok()?;
         let var = kind.api_key_env()?;
         // Treat an exported-but-empty env var ("ANTHROPIC_API_KEY=") as
@@ -1177,7 +1465,8 @@ impl AppConfig {
         // returning Some("") from here would produce an empty bearer
         // token and a confusing 401 on every request.
         if let Ok(value) = std::env::var(var) {
-            if !value.trim().is_empty() {
+            let normalized = sanitize_api_key(&value);
+            if !normalized.is_empty() {
                 if std::env::var("THCLAWS_KEYCHAIN_TRACE").is_ok() {
                     eprintln!(
                         "\x1b[35m[keychain pid={}] api_key_from_env({}) → from env {}\x1b[0m",
@@ -1186,7 +1475,7 @@ impl AppConfig {
                         var
                     );
                 }
-                return Some(value);
+                return Some(normalized);
             }
         }
         if std::env::var("THCLAWS_KEYCHAIN_TRACE").is_ok() {
@@ -1196,7 +1485,19 @@ impl AppConfig {
             );
         }
         // Fall back to the keychain under the provider's short name.
-        crate::secrets::get(kind.name())
+        // Sanitize the keychain value too — entries written before the
+        // `api_key_set` normalisation fix (issue #145) may still have
+        // wrapping quotes / leading-trailing whitespace from the
+        // original paste. `None` for empty-after-sanitize so callers
+        // surface the friendlier "no API key found" rather than 401.
+        crate::secrets::get(kind.name()).and_then(|raw| {
+            let s = sanitize_api_key(&raw);
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        })
     }
 }
 
@@ -1257,20 +1558,57 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use tempfile::tempdir;
 
-    /// Serializes tests that mutate process-global env vars
-    /// (`THCLAWS_PROJECT_ROOT`, `THCLAWS_CONFIG`, etc.). Without this,
-    /// cargo's default parallel runner lets one test's `remove_var`
-    /// race with another's mid-flight `read_to_string`.
-    static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Env-mutating tests in this module use `crate::kms::test_env_lock`
+    // (the crate-wide lock) rather than a local one, so they don't race
+    // against tests in kms/plugins/context/agent that also flip cwd /
+    // HOME / THCLAWS_PROJECT_ROOT.
 
     #[test]
     fn default_config_is_anthropic_sonnet() {
         let c = AppConfig::default();
         assert_eq!(c.model, "claude-sonnet-4-6");
         assert_eq!(c.detect_provider().unwrap(), "anthropic");
+    }
+
+    // dev-plan/33 Tier 2 — guiShell config parses both shapes.
+    #[test]
+    fn gui_shell_setting_parses_string_shorthand() {
+        let json = r#"{ "guiShell": "session-explorer" }"#;
+        let c: AppConfig = serde_json::from_str(json).unwrap();
+        let s = c.gui_shell.unwrap();
+        assert_eq!(s.tab_default(), Some("session-explorer"));
+        assert_eq!(s.serve_default(), Some("session-explorer"));
+    }
+
+    #[test]
+    fn gui_shell_setting_parses_long_form() {
+        let json = r#"{
+            "guiShell": {
+                "tabDefault": "session-explorer",
+                "serveDefault": "image-generator"
+            }
+        }"#;
+        let c: AppConfig = serde_json::from_str(json).unwrap();
+        let s = c.gui_shell.unwrap();
+        assert_eq!(s.tab_default(), Some("session-explorer"));
+        assert_eq!(s.serve_default(), Some("image-generator"));
+    }
+
+    #[test]
+    fn gui_shell_setting_long_form_partial_is_ok() {
+        let json = r#"{ "guiShell": { "tabDefault": "session-explorer" } }"#;
+        let c: AppConfig = serde_json::from_str(json).unwrap();
+        let s = c.gui_shell.unwrap();
+        assert_eq!(s.tab_default(), Some("session-explorer"));
+        assert_eq!(s.serve_default(), None);
+    }
+
+    #[test]
+    fn gui_shell_setting_absent_by_default() {
+        let c = AppConfig::default();
+        assert!(c.gui_shell.is_none());
     }
 
     #[test]
@@ -1527,7 +1865,7 @@ mod tests {
     /// assertion fails otherwise.
     #[test]
     fn ensure_default_exists_writes_full_template_then_is_idempotent() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::kms::test_env_lock();
         let dir = tempdir().unwrap();
         std::env::set_var("THCLAWS_PROJECT_ROOT", dir.path());
 
@@ -1637,7 +1975,7 @@ mod tests {
     /// `posix_spawn` race described above.
     #[test]
     fn cli_model_override_set_get_clear() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::kms::test_env_lock();
         clear_cli_model_override();
         assert_eq!(cli_model_override(), None);
         set_cli_model_override("cli-override-model".into());

@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Document — thClaws Shell</title>
+  <style>
+    :root { --bg: #0b1220; --surface: #0f172a; --border: #1f2937;
+      --fg: #f8fafc; --muted: #94a3b8; --teal: #0d9488; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--fg);
+      font: 15px/1.6 system-ui, sans-serif; display: grid;
+      grid-template-rows: auto 1fr; height: 100vh; }
+    header { padding: 12px 24px; border-bottom: 1px solid var(--border);
+      display: flex; gap: 8px; align-items: center; }
+    header input { flex: 1; background: transparent; color: var(--fg);
+      border: 0; font: inherit; font-size: 16px; font-weight: 600; }
+    header input:focus { outline: none; }
+    header button { background: var(--teal); color: white; border: 0;
+      border-radius: 6px; padding: 6px 14px; font-weight: 600; cursor: pointer; }
+    header .save { color: var(--muted); font-size: 12px; }
+    .editor { padding: 24px 32px; overflow-y: auto; }
+    .editor [contenteditable] { min-height: 60vh; outline: none; }
+    .editor [contenteditable]:empty::before {
+      content: "Start writing — drop a prompt below to ask the agent to extend / rewrite / critique."; color: var(--muted);
+    }
+    .ask { border-top: 1px solid var(--border); padding: 12px 24px;
+      display: flex; gap: 8px; }
+    .ask input { flex: 1; background: var(--surface); color: var(--fg);
+      border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; font: inherit; }
+    .ask select { background: var(--surface); color: var(--fg);
+      border: 1px solid var(--border); border-radius: 8px; padding: 8px; font: inherit; }
+  </style>
+</head>
+<body>
+  <header>
+    <input id="title" placeholder="Untitled document" />
+    <span class="save" id="save">unsaved</span>
+    <button id="export">Export</button>
+  </header>
+  <div class="editor"><div id="body" contenteditable="true"></div></div>
+  <div class="ask">
+    <select id="mode">
+      <option value="extend">Extend</option>
+      <option value="rewrite">Rewrite</option>
+      <option value="critique">Critique</option>
+      <option value="summarise">Summarise</option>
+    </select>
+    <input id="ask" placeholder="What should I do with the document?" />
+  </div>
+  <script>
+    const title = document.getElementById("title");
+    const body = document.getElementById("body");
+    const saveEl = document.getElementById("save");
+    const ask = document.getElementById("ask");
+    const mode = document.getElementById("mode");
+    async function load() {
+      const d = (await window.thclaws.storage.get("doc")) || {};
+      title.value = d.title || ""; body.innerText = d.body || "";
+    }
+    let t;
+    function dirty() {
+      saveEl.textContent = "saving…";
+      clearTimeout(t);
+      t = setTimeout(async () => {
+        try { await window.thclaws.storage.set("doc", { title: title.value, body: body.innerText }); }
+        catch {}
+        saveEl.textContent = `saved ${new Date().toLocaleTimeString()}`;
+      }, 400);
+    }
+    title.oninput = dirty; body.oninput = dirty;
+    document.getElementById("export").onclick = () => {
+      const blob = new Blob([`# ${title.value}\n\n${body.innerText}`], { type: "text/markdown" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `${(title.value || "document").replace(/[^a-z0-9-]+/gi, "_")}.md`;
+      a.click(); URL.revokeObjectURL(a.href);
+    };
+    ask.addEventListener("keydown", async (e) => {
+      if (e.key !== "Enter" || !ask.value.trim()) return;
+      const prompt = `${mode.value.toUpperCase()} the following document.
+Title: ${title.value || "(untitled)"}
+---
+${body.innerText}
+---
+Instruction: ${ask.value.trim()}`;
+      ask.value = "";
+      const marker = document.createTextNode("\n\n");
+      body.appendChild(marker);
+      const span = document.createElement("span");
+      span.style.color = "var(--teal)";
+      body.appendChild(span);
+      const unsub = window.thclaws.on("text", ({ delta }) => { span.textContent += delta; dirty(); });
+      const unsubDone = window.thclaws.on("done", () => { unsub(); unsubDone(); });
+      await window.thclaws.run(prompt);
+    });
+    load();
+  </script>
+</body>
+</html>

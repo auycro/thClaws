@@ -225,11 +225,18 @@ pub async fn run(config: AppConfig) -> Result<()> {
     // agent. Clone the inputs the factory needs before they move into the
     // default agent below.
     let agent_defs = AgentDefsConfig::load();
+    // Telegram headless doesn't currently mutate system/tools
+    // mid-run — Arc is owned solely by the factory. If we add
+    // mid-run mutators later, hoist this clone next to the worker
+    // state the way GUI/CLI do.
+    let factory_snapshot = Arc::new(std::sync::RwLock::new(crate::subagent::FactorySnapshot {
+        system: system.clone(),
+        tools: tools.clone(),
+    }));
     let factory = Arc::new(ProductionAgentFactory {
         provider: provider.clone(),
-        base_tools: tools.clone(),
+        snapshot: factory_snapshot,
         model: config.model.clone(),
-        system: system.clone(),
         max_iterations: config.max_iterations,
         max_depth: crate::subagent::DEFAULT_MAX_DEPTH,
         max_tokens: config.max_tokens,

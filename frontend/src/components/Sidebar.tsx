@@ -73,7 +73,52 @@ interface SidebarProps {
   onBrowseKms?: (name: string) => void;
 }
 
+const SIDEBAR_WIDTH_KEY = "thclaws_sidebar_width";
+const SIDEBAR_WIDTH_MIN = 160;
+const SIDEBAR_WIDTH_MAX = 480;
+const SIDEBAR_WIDTH_DEFAULT = 192; // matches the original Tailwind `w-48`
+
 export function Sidebar({ onBrowseKms }: SidebarProps = {}) {
+  // Persisted, user-resizable width. Replaces the previous `w-48`
+  // hard-cap because model/session titles longer than ~16 chars got
+  // clipped (#150). Drag the 3px gutter on the right edge to resize;
+  // double-click resets to default.
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
+    if (typeof window === "undefined") return SIDEBAR_WIDTH_DEFAULT;
+    const raw = localStorage.getItem(SIDEBAR_WIDTH_KEY);
+    const n = raw ? Number(raw) : NaN;
+    if (!Number.isFinite(n) || n < SIDEBAR_WIDTH_MIN || n > SIDEBAR_WIDTH_MAX) {
+      return SIDEBAR_WIDTH_DEFAULT;
+    }
+    return Math.round(n);
+  });
+  const [resizing, setResizing] = useState(false);
+  useEffect(() => {
+    if (!resizing) return;
+    const onMove = (e: MouseEvent) => {
+      // Width = pointer X relative to the viewport's left edge (the
+      // sidebar starts there). Clamp + round so we don't write
+      // sub-pixel values that fight CSS rounding.
+      const w = Math.max(
+        SIDEBAR_WIDTH_MIN,
+        Math.min(SIDEBAR_WIDTH_MAX, Math.round(e.clientX)),
+      );
+      setSidebarWidth(w);
+    };
+    const onUp = () => setResizing(false);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [resizing]);
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarWidth));
+    }
+  }, [sidebarWidth]);
+
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState<string>("");
   const [activeProvider, setActiveProvider] = useState("anthropic");
@@ -178,6 +223,12 @@ export function Sidebar({ onBrowseKms }: SidebarProps = {}) {
     // (SSO state is fetched by the navbar LoginButton.)
     send({ type: "line_status" });
     send({ type: "telegram_status" });
+    // The Sidebar unmounts in fullscreen (gui-shell tabs like
+    // book-studio) and remounts with empty state — `initial_state`'s
+    // session snapshot is long gone by then, so the history list
+    // rendered blank until some worker push refired sessions_list.
+    // Ask for a fresh list on every mount.
+    send({ type: "sessions_request" });
     return unsub;
   }, []);
 
@@ -215,12 +266,18 @@ export function Sidebar({ onBrowseKms }: SidebarProps = {}) {
 
   return (
     <div
-      className="w-48 border-r overflow-y-auto shrink-0 text-xs select-none"
+      className="border-r shrink-0 text-xs select-none relative flex"
       style={{
         background: "var(--bg-secondary)",
         borderColor: "var(--border)",
+        width: sidebarWidth,
+        // Disable pointer events inside the sidebar while dragging so
+        // mid-drag mouseover doesn't accidentally fire button hovers /
+        // selection — feels noticeably crisper on a fast drag.
+        cursor: resizing ? "col-resize" : undefined,
       }}
     >
+      <div className="flex-1 min-w-0 overflow-y-auto">
       {/* Provider */}
       <Section title="Provider">
         <div className="px-2 py-1 relative">
@@ -732,6 +789,36 @@ export function Sidebar({ onBrowseKms }: SidebarProps = {}) {
       {kmsModal && (
         <KmsCreateModal mode={kmsModal} onClose={() => setKmsModal(null)} />
       )}
+      </div>
+      {/* Drag handle — thin gutter on the right edge. col-resize cursor
+          + hover hint. Double-click resets to default width so the
+          user can recover from accidentally squishing too small. */}
+      <div
+        onMouseDown={(e) => {
+          e.preventDefault();
+          setResizing(true);
+        }}
+        onDoubleClick={() => setSidebarWidth(SIDEBAR_WIDTH_DEFAULT)}
+        title="Drag to resize · double-click to reset"
+        style={{
+          width: 3,
+          cursor: "col-resize",
+          background: resizing ? "var(--accent)" : "transparent",
+          flexShrink: 0,
+          transition: resizing ? undefined : "background 0.15s",
+        }}
+        onMouseEnter={(e) => {
+          if (!resizing) {
+            (e.currentTarget as HTMLDivElement).style.background =
+              "var(--border-strong, var(--border))";
+          }
+        }}
+        onMouseLeave={(e) => {
+          if (!resizing) {
+            (e.currentTarget as HTMLDivElement).style.background = "transparent";
+          }
+        }}
+      />
     </div>
   );
 }

@@ -1,0 +1,9 @@
+{
+  "id": "grid",
+  "name": "Asset Grid",
+  "version": "0.1.0",
+  "description": "Image/asset gallery with persisted history via shell.storage. Wire up to your image-gen tool by matching the regex in the response handler.",
+  "entry": "index.html",
+  "min_bridge_version": "1",
+  "permissions": ["agent.run", "session.read"]
+}

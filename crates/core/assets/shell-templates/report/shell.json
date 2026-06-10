@@ -1,0 +1,9 @@
+{
+  "id": "report",
+  "name": "Report Viewer",
+  "version": "0.1.0",
+  "description": "Multi-section markdown report with auto-generated TOC. Streams headings as the agent writes.",
+  "entry": "index.html",
+  "min_bridge_version": "1",
+  "permissions": ["agent.run", "session.read"]
+}

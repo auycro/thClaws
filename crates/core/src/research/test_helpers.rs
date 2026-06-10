@@ -1,23 +1,20 @@
 //! Shared test scaffolding for the `research` module's tests.
 //!
 //! `kms_writer::tests` and `pipeline::tests` both touch `HOME` /
-//! `USERPROFILE` / cwd to run against a fresh tempdir. Each module
-//! having its own process-wide `Mutex` doesn't help when the tests
-//! are scheduled in parallel across both modules — they race. This
-//! file owns the *one* shared lock + RAII guard everyone uses.
+//! `USERPROFILE` / cwd to run against a fresh tempdir. We serialise
+//! against `kms::test_env_lock` — the crate-wide env lock — instead
+//! of a research-local one, so a parallel test in repl/prompts/etc
+//! that reads `current_dir()` or `$HOME` (e.g. the system-prompt
+//! builder) can't see our tempdir leak across its own measurement.
+//! A local lock here only blocked siblings inside `research::*`.
 
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard, OnceLock};
-
-fn shared_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
+use std::sync::MutexGuard;
 
 /// Acquire exclusive access to the process env + cwd, set HOME to a
 /// fresh tempdir, switch cwd into it. Restored on drop.
 pub(crate) fn scoped_home() -> ScopedHome {
-    let guard = shared_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let guard = crate::kms::test_env_lock();
     let prev_home = std::env::var("HOME").ok();
     let prev_userprofile = std::env::var("USERPROFILE").ok();
     let prev_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));

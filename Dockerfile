@@ -84,7 +84,34 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         curl \
         ripgrep \
+        # Media tooling — ffmpeg covers transcode / thumbnail / clip /
+        # audio extract / animated WebP. ~100 MB with deps; users
+        # creating media (the bulk of agent work alongside coding) get
+        # it built-in instead of failing on `command not found`.
+        ffmpeg \
+        # Python for any agent that runs `python3 …` from Bash — most
+        # AI agents lean on it for one-off scripts (data shaping,
+        # plotting, quick HTTP). `python3-venv` so users can spin
+        # their own venv under /workspace without sudo.
+        python3 \
+        python3-pip \
+        python3-venv \
+        # Node.js — pulled in by Playwright below, but exposing it
+        # directly lets users `node …` / `npm …` for non-browser
+        # tasks too (TypeScript scripts, bundlers, the usual).
+        nodejs \
+        npm \
     && rm -rf /var/lib/apt/lists/*
+
+# Playwright + chromium for browser automation (e2e tests, web
+# scraping that needs JS rendering, screenshot generation). `npm i -g`
+# puts the cli at /usr/local/bin; `playwright install --with-deps`
+# pulls chromium + every system .so it needs (libnss3, libatk-*,
+# libcups2, libdrm2, … — ~100 MB of apt packages on top of the ~200
+# MB chromium download). Total runtime image grows ~300 MB.
+RUN npm install -g playwright \
+    && npx playwright install --with-deps chromium \
+    && rm -rf /root/.npm /tmp/npm-* /var/lib/apt/lists/*
 
 # Create group + user matching host UID/GID
 RUN groupadd --gid ${USER_GID} ${USERNAME} \

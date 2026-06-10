@@ -907,6 +907,16 @@ impl Agent {
         self.system = text.into();
     }
 
+    /// Read-only view of the captured system prompt. Used by
+    /// regression tests that verify `set_system` / `append_system`
+    /// land what they claim — particularly the
+    /// `refresh_repl_system_prompt` addendum-preservation path,
+    /// where wiping the team-role addenda would be a silent failure
+    /// otherwise.
+    pub fn system_text(&self) -> &str {
+        &self.system
+    }
+
     pub fn history_snapshot(&self) -> Vec<Message> {
         self.history.lock().expect("history lock").clone()
     }
@@ -1058,7 +1068,7 @@ impl Agent {
                             );
                         }
                     }
-                    let compacted = compact(&h, messages_budget);
+                    let mut compacted = compact(&h, messages_budget);
                     if will_compact {
                         if let Some(hk) = &hooks {
                             let post_tokens =
@@ -1071,6 +1081,19 @@ impl Agent {
                             );
                         }
                     }
+                    // Issue #144: defensive last-mile sanitization.
+                    // Compaction's no-op path (history fits budget) skips
+                    // the orphan-tool-result protection in compact(),
+                    // and `/model` swap preserves history across
+                    // providers — so the destination wire format can
+                    // see partial-state blocks (tool_use without
+                    // matching tool_result, or vice versa). Every
+                    // provider rejects those (DashScope code 2013,
+                    // Anthropic "tool_use ids without matching
+                    // tool_result", OpenAI "tool_call_ids did not
+                    // have response messages"). Strip just before
+                    // the request leaves the engine.
+                    crate::compaction::sanitize_tool_pairs(&mut compacted);
                     compacted
                 };
                 let tool_defs = tools.tool_defs();
@@ -2549,12 +2572,13 @@ mod tests {
     /// agent::tests so cwd contention is bounded; if this becomes a
     /// hot spot, we'd add a Mutex like plan_state's test_lock.
     fn with_cwd<R>(dir: &std::path::Path, f: impl FnOnce() -> R) -> R {
-        // Synchronise cwd-touching tests in this module so they don't
-        // race when cargo runs them in parallel — `set_current_dir`
-        // is process-global and the previous tests in the file don't
-        // touch cwd, so a Mutex inside agent::tests is enough.
-        static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Serialise via the crate-wide env lock (kms::test_env_lock) so
+        // we don't race against kms/plugins/context/config tests that
+        // mutate the same process-global cwd/HOME. A local Mutex here
+        // wouldn't coordinate with those modules and the prompt-builder
+        // tests would intermittently read whichever cwd happened to be
+        // active when their two refresh calls fired.
+        let _g = crate::kms::test_env_lock();
         let prior = std::env::current_dir().expect("cwd readable");
         std::env::set_current_dir(dir).expect("cwd to test dir");
         let out = f();
